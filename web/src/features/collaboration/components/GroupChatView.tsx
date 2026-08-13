@@ -5,7 +5,7 @@ import type { Employee } from "@/lib/api";
 import type { CollaborationApi } from "../api";
 import { collaborationReducer } from "../reducer";
 import { defaultMentionSelection } from "../mentions";
-import { initialCollaborationState, type CollaborationApprovalChoice, type CollaborationEmployeeIdentity } from "../types";
+import { initialCollaborationState, type CollaborationEmployeeIdentity } from "../types";
 import { GroupComposer, type GroupComposerSubmit } from "./GroupComposer";
 import { GroupConversation } from "./GroupConversation";
 import { MemberManager } from "./MemberManager";
@@ -112,17 +112,6 @@ export function GroupChatView({ api, connection, employees, groupId, onArchive, 
     }
   };
 
-  const respondToApproval = (approvalId: string, choice: CollaborationApprovalChoice) => {
-    void api.respondToApproval(approvalId, choice).then((response) => {
-      dispatch({ type: "event", event: { type: "collaboration.approval.changed", payload: response.approval } });
-    }).catch((cause) => dispatch({ type: "error", message: cause instanceof Error ? cause.message : String(cause) }));
-  };
-  const stopTarget = (targetId: string) => {
-    void api.interruptTarget(targetId).then((response) => {
-      dispatch({ type: "event", event: { type: "collaboration.target.changed", payload: { group_id: groupId, ...response.target } } });
-    }).catch((cause) => dispatch({ type: "error", message: cause instanceof Error ? cause.message : String(cause) }));
-  };
-
   return (
     <div className="flex min-h-0 flex-1 flex-col">
       {memberManagerOpen ? (
@@ -148,7 +137,7 @@ export function GroupChatView({ api, connection, employees, groupId, onArchive, 
         ) : null}
       </div>
       {state.error ? <div className="gui-chat-notice gui-chat-notice-error">{state.error}</div> : null}
-      <GroupConversation employees={identities} onApproval={respondToApproval} onStop={stopTarget} state={state} />
+      <GroupConversation employees={identities} state={state} />
       <GroupComposer
         employeeName={employeeName}
         archived={state.group?.status === "archived"}

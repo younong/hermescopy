@@ -1,22 +1,18 @@
 import { Spinner } from "@nous-research/ui/ui/components/spinner";
-import { AlertCircle, CheckCircle2, CircleStop, Clock3, FileText, LoaderCircle, ShieldAlert, UsersRound, XCircle } from "lucide-react";
+import { AlertCircle, CheckCircle2, FileText, UsersRound } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { Markdown } from "@/components/Markdown";
 import { guiChatTranslations, useI18n } from "@/i18n";
-import type { GuiChatTranslations } from "@/i18n";
 import { withHermesAssetAuth } from "@/lib/api";
-import { isTerminalTarget } from "../reducer";
 import { mentionLabel } from "../mentions";
-import type { CollaborationApprovalChoice, CollaborationEmployeeIdentity, CollaborationState, CollaborationTarget } from "../types";
+import type { CollaborationEmployeeIdentity, CollaborationState } from "../types";
 
 interface GroupConversationProps {
   employees: CollaborationEmployeeIdentity[];
-  onApproval(approvalId: string, choice: CollaborationApprovalChoice): void;
-  onStop(targetId: string): void;
   state: CollaborationState;
 }
 
-export function GroupConversation({ employees, onApproval, onStop, state }: GroupConversationProps) {
+export function GroupConversation({ employees, state }: GroupConversationProps) {
   const { t } = useI18n();
   const copy = guiChatTranslations(t).collaboration;
   const endRef = useRef<HTMLDivElement>(null);
@@ -43,19 +39,9 @@ export function GroupConversation({ employees, onApproval, onStop, state }: Grou
     }
     return result;
   }, [state]);
-  const targetsByEvent = useMemo(() => {
-    const result = new Map<string, CollaborationTarget[]>();
-    for (const target of Object.values(state.targetsById)) {
-      const eventId = state.turnsById[target.turn_id]?.event_id;
-      if (!eventId) continue;
-      result.set(eventId, [...(result.get(eventId) ?? []), target]);
-    }
-    return result;
-  }, [state.targetsById, state.turnsById]);
-
   useEffect(() => {
     endRef.current?.scrollIntoView({ block: "end" });
-  }, [events.length, state.executionsById]);
+  }, [events.length]);
 
   if (state.loading) {
     return <div className="flex flex-1 items-center justify-center gap-2 text-xs text-[#777c84]"><Spinner /> {copy.loadingGroup}</div>;
@@ -112,7 +98,6 @@ export function GroupConversation({ employees, onApproval, onStop, state }: Grou
             membershipIds: event.body.mentions ?? [],
           }, state.membershipsById, employeeName, { mentionAll: copy.mentionAll }) : "";
           const attachments = attachmentsByEvent.get(event.event_id) ?? [];
-          const targets = targetsByEvent.get(event.event_id) ?? [];
           const speaker = owner ? copy.you : employeeName(event.actor_employee_id);
           return (
             <article className={owner ? "ml-auto max-w-[85%]" : "max-w-[92%]"} key={event.event_id}>
@@ -130,28 +115,6 @@ export function GroupConversation({ employees, onApproval, onStop, state }: Grou
                   </div>
                 ) : null}
               </div>
-              {targets.length > 0 ? (
-                <div className={`${owner ? "mt-3" : "ml-8 mt-3"} grid gap-2 sm:grid-cols-2`}>
-                  {targets.map((target) => (
-                    <TargetCard copy={copy} employeeIdentity={employeeIdentity} key={target.target_id} onStop={onStop} state={state} target={target} />
-                  ))}
-                </div>
-              ) : null}
-              {Object.values(state.approvalsById)
-                .filter((approval) => targets.some((target) => target.target_id === approval.target_id))
-                .map((approval) => (
-                  <div className={`${owner ? "mt-2" : "ml-8 mt-2"} rounded-xl border border-[#f1d6a8] bg-[#fffaf0] p-3`} key={approval.approval_id}>
-                    <div className="flex gap-2"><ShieldAlert className="mt-0.5 h-4 w-4 shrink-0 text-[#a15c00]" /><div><p className="text-xs font-semibold text-[#704100]">{approval.request?.summary || copy.approvalRequired}</p>{approval.request?.tool_name ? <p className="mt-1 text-[10px] text-[#956300]">{copy.toolLabel.replace("{name}", approval.request.tool_name)}</p> : null}</div></div>
-                    {approval.status === "pending" ? (
-                      <div className="mt-3 flex flex-wrap gap-1.5">
-                        <ApprovalButton label={copy.allowOnce} onClick={() => onApproval(approval.approval_id, "once")} />
-                        <ApprovalButton label={copy.allowSession} onClick={() => onApproval(approval.approval_id, "session")} />
-                        {approval.request?.allow_permanent ? <ApprovalButton label={copy.alwaysAllow} onClick={() => onApproval(approval.approval_id, "always")} /> : null}
-                        <ApprovalButton destructive label={copy.deny} onClick={() => onApproval(approval.approval_id, "deny")} />
-                      </div>
-                    ) : <p className="mt-2 text-[10px] font-medium uppercase tracking-wide text-[#956300]">{approval.status === "approved" ? copy.status.completed : approval.status === "denied" ? copy.deny : approval.status}</p>}
-                  </div>
-                ))}
             </article>
           );
         })}
@@ -161,36 +124,10 @@ export function GroupConversation({ employees, onApproval, onStop, state }: Grou
   );
 }
 
-function TargetCard({ copy, employeeIdentity, onStop, state, target }: { copy: GuiChatTranslations["collaboration"]; employeeIdentity(employeeId: string): CollaborationEmployeeIdentity; onStop(targetId: string): void; state: CollaborationState; target: CollaborationTarget }) {
-  const streamed = state.executionsById[target.execution_id] ?? "";
-  const finalText = targetResultText(target);
-  const status = targetStatus(target.status);
-  const Icon = status.icon;
-  const employee = employeeIdentity(target.employee_id);
-  return (
-    <div className="rounded-xl border border-[#e4e6ea] bg-[#fafbfc] p-3">
-      <div className="flex items-center justify-between gap-2">
-        <div className="flex min-w-0 items-center gap-2"><SpeakerAvatar employee={employee} small /><span className="truncate text-[11px] font-semibold">{employee.name}</span></div>
-        <span className={`inline-flex items-center gap-1 text-[9px] font-semibold uppercase tracking-wide ${status.className}`}><Icon className={`h-3 w-3 ${target.status === "running" ? "animate-spin" : ""}`} />{targetStatusLabel(target.status, copy)}</span>
-      </div>
-      {(streamed || finalText) ? <div className="mt-2 max-h-40 overflow-auto text-xs leading-5 text-[#44484f]"><Markdown content={streamed || finalText} /></div> : null}
-      {target.error ? <p className="mt-2 text-[10px] text-[#b42318]">{target.error}</p> : null}
-      {!isTerminalTarget(target.status) ? <button className="mt-2 inline-flex items-center gap-1 text-[10px] font-medium text-[#777c84] hover:text-[#b42318]" onClick={() => onStop(target.target_id)} type="button"><CircleStop className="h-3 w-3" /> {copy.stopEmployee}</button> : null}
-    </div>
-  );
-}
-
-function targetResultText(target: CollaborationTarget): string {
-  if (typeof target.result?.text === "string") return target.result.text;
-  if (typeof target.result?.content === "string") return target.result.content;
-  if (typeof target.result?.message === "string") return target.result.message;
-  return "";
-}
-
-function SpeakerAvatar({ employee, small = false }: { employee: CollaborationEmployeeIdentity; small?: boolean }) {
+function SpeakerAvatar({ employee }: { employee: CollaborationEmployeeIdentity }) {
   const [failed, setFailed] = useState(false);
   useEffect(() => setFailed(false), [employee.avatarUrl]);
-  const classes = small ? "h-5 w-5 text-[9px]" : "h-6 w-6 text-[10px]";
+  const classes = "h-6 w-6 text-[10px]";
   return employee.avatarUrl && !failed
     ? <img alt="" className={`shrink-0 rounded-full object-cover ${classes}`} onError={() => setFailed(true)} src={withHermesAssetAuth(employee.avatarUrl)} />
     : <span className={`inline-flex shrink-0 items-center justify-center rounded-full bg-[#e6ebf9] font-semibold text-[#4665bb] ${classes}`}>{employee.name.trim().charAt(0).toUpperCase() || "E"}</span>;
@@ -198,27 +135,6 @@ function SpeakerAvatar({ employee, small = false }: { employee: CollaborationEmp
 
 function AttachmentChip({ name, size }: { name: string; size: number }) {
   return <span className="inline-flex items-center gap-1 rounded-full bg-white/80 px-2 py-1 text-[10px]"><FileText className="h-3 w-3" />{name}<span className="text-[#969aa1]">{formatSize(size)}</span></span>;
-}
-
-function ApprovalButton({ destructive = false, label, onClick }: { destructive?: boolean; label: string; onClick(): void }) {
-  return <button className={`rounded-md border px-2 py-1 text-[10px] font-medium ${destructive ? "border-[#efc7c2] text-[#b42318] hover:bg-[#fff1ef]" : "border-[#e7c987] text-[#815100] hover:bg-[#fff3d7]"}`} onClick={onClick} type="button">{label}</button>;
-}
-
-function targetStatusLabel(status: CollaborationTarget["status"], copy: GuiChatTranslations["collaboration"]): string {
-  if (status === "completed") return copy.status.completed;
-  if (status === "running") return copy.status.running;
-  if (status === "queued") return copy.status.queued;
-  if (status === "waiting_approval") return copy.status.waitingApproval;
-  if (status === "cancelled") return copy.status.cancelled;
-  return status;
-}
-
-function targetStatus(status: CollaborationTarget["status"]): { className: string; icon: typeof Clock3 } {
-  if (status === "completed") return { className: "text-[#238148]", icon: CheckCircle2 };
-  if (status === "running") return { className: "text-[#3867ed]", icon: LoaderCircle };
-  if (status === "queued" || status === "waiting_approval") return { className: "text-[#a15c00]", icon: Clock3 };
-  if (status === "cancelled") return { className: "text-[#777c84]", icon: CircleStop };
-  return { className: "text-[#b42318]", icon: XCircle };
 }
 
 function formatTime(value: number): string {
