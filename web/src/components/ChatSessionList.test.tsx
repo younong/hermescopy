@@ -9,6 +9,7 @@ import type { SessionInfo } from "@/lib/api";
 import { ChatSessionList } from "./ChatSessionList";
 
 const mocks = vi.hoisted(() => ({
+  archiveSession: vi.fn(),
   getSessions: vi.fn(),
   renameSession: vi.fn(),
 }));
@@ -19,6 +20,7 @@ vi.mock("@/lib/api", async (importOriginal) => {
     ...actual,
     api: {
       ...actual.api,
+      archiveSession: mocks.archiveSession,
       getSessions: mocks.getSessions,
       renameSession: mocks.renameSession,
     },
@@ -26,10 +28,13 @@ vi.mock("@/lib/api", async (importOriginal) => {
 });
 
 vi.mock("@/i18n", () => ({
+  sessionSoftDeleteMessage: () =>
+    "This removes the conversation from the list while keeping all stored messages.",
   useI18n: () => ({
     t: {
       common: {
         cancel: "Cancel",
+        delete: "Delete",
         loading: "Loading",
         msgs: "msgs",
         refresh: "Refresh",
@@ -38,6 +43,9 @@ vi.mock("@/i18n", () => ({
         saving: "Saving",
       },
       sessions: {
+        confirmDeleteTitle: "Delete session?",
+        deleteSession: "Delete session",
+        failedToDelete: "Failed to delete session",
         failedToRename: "Failed to rename session",
         newChat: "New chat",
         noMatch: "No match",
@@ -56,6 +64,7 @@ let root: Root | null = null;
 beforeEach(() => {
   (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT: boolean })
     .IS_REACT_ACT_ENVIRONMENT = true;
+  mocks.archiveSession.mockReset();
   mocks.getSessions.mockReset();
   mocks.renameSession.mockReset();
   document.body.innerHTML = "";
@@ -205,6 +214,53 @@ describe("ChatSessionList", () => {
     expect(container.textContent).not.toContain("Stale list title");
   });
 
+  it("soft deletes a listed session and keeps physical deletion unused", async () => {
+    mocks.getSessions.mockResolvedValue(sessionList([
+      session("alpha", "Release notes", "Published"),
+      session("beta", "Design notes", "Explored"),
+    ]));
+    mocks.archiveSession.mockResolvedValue({ archived: true, ok: true, title: "Release notes" });
+    const container = mount();
+
+    await render(
+      <MemoryRouter initialEntries={["/chat?resume=beta"]}>
+        <ChatSessionList activeSessionId="beta" sessionPath="/chat" variant="compact" />
+        <LocationProbe />
+      </MemoryRouter>,
+    );
+    await click(deleteButton(container, "Release notes"));
+
+    expect(document.body.textContent).toContain("keeping all stored messages");
+    await click(buttonWithText(document.body, "Delete"));
+
+    expect(mocks.archiveSession).toHaveBeenCalledWith("alpha");
+    expect(container.textContent).not.toContain("Release notes");
+    expect(container.textContent).toContain("Design notes");
+    expect(container.querySelector("[data-location]")?.getAttribute("data-location"))
+      .toBe("/chat?resume=beta");
+  });
+
+  it("starts a fresh chat after soft deleting the active session", async () => {
+    mocks.getSessions.mockResolvedValue(sessionList([
+      session("alpha", "Release notes", "Published"),
+    ]));
+    mocks.archiveSession.mockResolvedValue({ archived: true, ok: true, title: "Release notes" });
+    const onNewChat = vi.fn();
+    const container = mount();
+
+    await render(
+      <MemoryRouter>
+        <ChatSessionList activeSessionId="alpha" onNewChat={onNewChat} variant="compact" />
+      </MemoryRouter>,
+    );
+    await click(deleteButton(container, "Release notes"));
+    await click(buttonWithText(document.body, "Delete"));
+
+    expect(mocks.archiveSession).toHaveBeenCalledWith("alpha");
+    expect(onNewChat).toHaveBeenCalledTimes(1);
+    expect(container.textContent).toContain("No sessions");
+  });
+
   it("supports keyboard save and cancel without submitting empty, unchanged, or composing input", async () => {
     mocks.getSessions.mockResolvedValue(sessionList([
       session("alpha", "Release notes", "Published"),
@@ -339,6 +395,10 @@ function buttonWithText(container: HTMLElement, text: string): HTMLButtonElement
     .find((candidate) => candidate.textContent?.includes(text));
   if (!button) throw new Error(`Missing button containing: ${text}`);
   return button;
+}
+
+function deleteButton(container: HTMLElement, title: string): HTMLButtonElement {
+  return buttonByLabel(container, `Delete session: ${title}`);
 }
 
 function renameButton(container: HTMLElement, title: string): HTMLButtonElement {

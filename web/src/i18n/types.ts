@@ -719,6 +719,7 @@ export interface Translations {
     renameSession?: string;
     sessionTitlePlaceholder?: string;
     failedToRename?: string;
+    softDeleteMessage?: string;
     previousPage: string;
     nextPage: string;
     composition?: SessionCompositionTranslations;

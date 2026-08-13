@@ -12,20 +12,22 @@
  * Best-effort, like ChatSidebar: a failed fetch surfaces a small inline
  * error with a retry affordance and the active chat pane keeps working.
  *
- * This stays a focused navigation surface: users can select, create, and
- * rename conversations here, while delete, export, and bulk actions remain on
- * the Sessions page.
+ * This stays a focused navigation surface: users can select, create, rename,
+ * and remove conversations from the list. Removal archives the stored session,
+ * preserving its messages instead of physically deleting data.
  */
 
 import { Button } from "@nous-research/ui/ui/components/button";
 import { Input } from "@nous-research/ui/ui/components/input";
 import { ListItem } from "@nous-research/ui/ui/components/list-item";
 import { Spinner } from "@nous-research/ui/ui/components/spinner";
-import { AlertCircle, Check, MessageSquarePlus, Pencil, RefreshCw, X } from "lucide-react";
+import { useConfirmDelete } from "@nous-research/ui/hooks/use-confirm-delete";
+import { AlertCircle, Check, MessageSquarePlus, Pencil, RefreshCw, Trash2, X } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useNavigate, useSearchParams } from "react-router-dom";
 
-import { useI18n } from "@/i18n";
+import { DeleteConfirmDialog } from "@/components/DeleteConfirmDialog";
+import { sessionSoftDeleteMessage, useI18n } from "@/i18n";
 import { api, type SessionInfo } from "@/lib/api";
 import { cn, timeAgo } from "@/lib/utils";
 
@@ -96,6 +98,7 @@ export function ChatSessionList({
   const [sessions, setSessions] = useState<SessionInfo[] | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [deleteError, setDeleteError] = useState<string | null>(null);
   const [rename, setRename] = useState<RenameState>(EMPTY_RENAME);
   // Bumped to force a refetch (after switching, on Refresh, on mount).
   const [reloadNonce, setReloadNonce] = useState(0);
@@ -235,7 +238,7 @@ export function ChatSessionList({
   // "New chat" prefers the owning chat surface's robust handler (clears resume
   // + forces a fresh connection even from an already-fresh session). Fallback:
   // clear the resume param ourselves, which starts a fresh session whenever one
-  // was being resumed. Delete/export/bulk management remains on Sessions.
+  // was being resumed.
   const startNew = useCallback(() => {
     onPicked?.();
     if (onNewChat) {
@@ -251,6 +254,35 @@ export function ChatSessionList({
       { replace: false },
     );
   }, [onNewChat, onPicked, setSearchParams]);
+
+  const {
+    cancel: cancelDelete,
+    confirm: confirmDelete,
+    isDeleting,
+    isOpen: deleteOpen,
+    pendingId: pendingDeleteId,
+    requestDelete,
+  } = useConfirmDelete({
+    onDelete: useCallback(
+      async (id: string) => {
+        setDeleteError(null);
+        try {
+          await api.archiveSession(id);
+          reqRef.current += 1;
+          setSessions((current) => current?.filter((session) => session.id !== id) ?? null);
+          if (id === activeSessionId) startNew();
+        } catch (cause) {
+          setDeleteError(
+            cause instanceof Error && cause.message
+              ? cause.message
+              : t.sessions.failedToDelete,
+          );
+          throw cause;
+        }
+      },
+      [activeSessionId, startNew, t.sessions.failedToDelete],
+    ),
+  });
 
   const content = useMemo(() => {
     if (loading && sessions === null) {
@@ -385,10 +417,10 @@ export function ChatSessionList({
                 onClick={() => pick(s.id)}
                 aria-current={isActive ? "true" : undefined}
                 className={cn(
-                  "flex-col items-start pr-10 normal-case tracking-normal",
+                  "flex-col items-start pr-[4.25rem] normal-case tracking-normal",
                   variant === "compact"
-                    ? "min-h-9 gap-0 rounded-[10px] px-2 py-[7px] pr-10 text-[#1f1f1f]"
-                    : "gap-0.5 rounded px-2 py-1.5 pr-10",
+                    ? "min-h-9 gap-0 rounded-[10px] px-2 py-[7px] text-[#1f1f1f]"
+                    : "gap-0.5 rounded px-2 py-1.5",
                   variant === "compact"
                     ? isActive
                       ? "bg-white text-black"
@@ -419,23 +451,41 @@ export function ChatSessionList({
                   </span>
                 ) : null}
               </ListItem>
-              <Button
-                ghost
-                size="icon"
+              <div
                 className={cn(
-                  "absolute right-1 top-1/2 h-7 w-7 -translate-y-1/2 opacity-0 transition-opacity",
-                  "text-text-secondary hover:text-foreground focus:opacity-100 group-hover:opacity-100",
+                  "absolute right-1 top-1/2 flex -translate-y-1/2 opacity-0 transition-opacity",
+                  "focus-within:opacity-100 group-hover:opacity-100",
                   isActive && "opacity-100",
                 )}
-                aria-label={`${renameLabel}: ${label}`}
-                title={renameLabel}
-                onClick={(event) => {
-                  event.stopPropagation();
-                  beginRename(s);
-                }}
               >
-                <Pencil />
-              </Button>
+                <Button
+                  ghost
+                  size="icon"
+                  className="h-7 w-7 text-text-secondary hover:text-foreground"
+                  aria-label={`${renameLabel}: ${label}`}
+                  title={renameLabel}
+                  onClick={(event) => {
+                    event.stopPropagation();
+                    beginRename(s);
+                  }}
+                >
+                  <Pencil />
+                </Button>
+                <Button
+                  ghost
+                  size="icon"
+                  className="h-7 w-7 text-text-secondary hover:text-destructive"
+                  aria-label={`${t.sessions.deleteSession}: ${label}`}
+                  title={t.sessions.deleteSession}
+                  onClick={(event) => {
+                    event.stopPropagation();
+                    setDeleteError(null);
+                    requestDelete(s.id);
+                  }}
+                >
+                  <Trash2 />
+                </Button>
+              </div>
             </div>
           );
         })}
@@ -451,52 +501,69 @@ export function ChatSessionList({
     pick,
     reload,
     rename,
+    requestDelete,
     sessions,
     submitRename,
     t,
     variant,
   ]);
 
+  const pendingDelete = sessions?.find((session) => session.id === pendingDeleteId) ?? null;
+  const softDeleteMessage = sessionSoftDeleteMessage(t);
+  const deleteDescription = pendingDelete
+    ? `${rowLabel(pendingDelete, t.sessions.untitledSession)} — ${softDeleteMessage}`
+    : softDeleteMessage;
+
   return (
-    <aside
-      className={cn(
-        "flex h-full w-full min-w-0 shrink-0 flex-col overflow-hidden",
-        className,
-      )}
-    >
-      {variant === "default" ? (
-        <>
-          <div className="flex items-center justify-between gap-2 px-2 pb-2">
-            <span className="text-display text-xs tracking-wider text-text-tertiary">
-              {t.sessions.title}
-            </span>
+    <>
+      <DeleteConfirmDialog
+        open={deleteOpen}
+        onCancel={cancelDelete}
+        onConfirm={() => void confirmDelete()}
+        title={t.sessions.confirmDeleteTitle}
+        description={deleteError ?? deleteDescription}
+        loading={isDeleting}
+      />
+      <aside
+        className={cn(
+          "flex h-full w-full min-w-0 shrink-0 flex-col overflow-hidden",
+          className,
+        )}
+      >
+        {variant === "default" ? (
+          <>
+            <div className="flex items-center justify-between gap-2 px-2 pb-2">
+              <span className="text-display text-xs tracking-wider text-text-tertiary">
+                {t.sessions.title}
+              </span>
+              <Button
+                ghost
+                size="icon"
+                onClick={reload}
+                aria-label={t.common.refresh}
+                title={t.common.refresh}
+                className="text-text-secondary hover:text-foreground"
+              >
+                <RefreshCw className={cn(loading && "animate-spin")} />
+              </Button>
+            </div>
+
             <Button
-              ghost
-              size="icon"
-              onClick={reload}
-              aria-label={t.common.refresh}
-              title={t.common.refresh}
-              className="text-text-secondary hover:text-foreground"
+              outlined
+              size="sm"
+              onClick={startNew}
+              prefix={<MessageSquarePlus />}
+              className="mx-2 mb-2 justify-center"
             >
-              <RefreshCw className={cn(loading && "animate-spin")} />
+              {t.sessions.newChat}
             </Button>
-          </div>
+          </>
+        ) : null}
 
-          <Button
-            outlined
-            size="sm"
-            onClick={startNew}
-            prefix={<MessageSquarePlus />}
-            className="mx-2 mb-2 justify-center"
-          >
-            {t.sessions.newChat}
-          </Button>
-        </>
-      ) : null}
-
-      <div className={cn("min-h-0 flex-1 overflow-y-auto overflow-x-hidden pb-1", variant === "default" ? "px-1" : "px-0.5")}>
-        {content}
-      </div>
-    </aside>
+        <div className={cn("min-h-0 flex-1 overflow-y-auto overflow-x-hidden pb-1", variant === "default" ? "px-1" : "px-0.5")}>
+          {content}
+        </div>
+      </aside>
+    </>
   );
 }
