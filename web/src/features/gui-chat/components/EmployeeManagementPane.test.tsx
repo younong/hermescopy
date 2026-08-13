@@ -15,7 +15,7 @@ vi.mock("@/lib/api", async (importOriginal) => ({
 const catalog: EmployeeCatalog = {
   knowledge_roots: [],
   mcp_servers: [],
-  model_registrations: [{ id: "model-a", name: "Model A" }],
+  model_registrations: [{ id: "model-a", model: "claude-opus-4-8", name: "Anthropic" }],
   skills: [{ description: "Research", name: "research" }],
   toolsets: [{ description: "Terminal", name: "terminal" }],
   workspace: { default: "default", root: "" },
@@ -86,6 +86,9 @@ describe("EmployeeManagementPane", () => {
 
     const dialog = document.querySelector('[role="dialog"]');
     expect(dialog?.textContent).toContain("Add employee");
+    expect(dialog?.querySelector<HTMLSelectElement>("select")?.selectedOptions[0]?.textContent)
+      .toBe("claude-opus-4-8");
+    expect(dialog?.textContent).not.toContain("Anthropic");
     expect(dialog?.textContent).not.toContain("App secret");
     const inputs = Array.from(dialog?.querySelectorAll<HTMLInputElement>("input") ?? [])
       .filter((input) => input.type === "text");
