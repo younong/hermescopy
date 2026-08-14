@@ -428,6 +428,17 @@ class TestGetModelCapabilities:
                 "high", "xhigh", "max",
             )
 
+    def test_selectable_reasoning_levels_can_skip_network(self):
+        from agent.models_dev import get_selectable_reasoning_levels
+
+        with patch("agent.models_dev.fetch_models_dev", return_value={}) as fetch:
+            assert get_selectable_reasoning_levels(
+                "openai",
+                "uncatalogued",
+                allow_network=False,
+            ) == ("high", "xhigh", "max")
+        fetch.assert_called_once_with(allow_network=False)
+
     def test_model_not_found_returns_none(self):
         """Unknown model should return None."""
         with patch("agent.models_dev.fetch_models_dev", return_value=CAPS_REGISTRY):

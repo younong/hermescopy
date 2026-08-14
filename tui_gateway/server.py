@@ -3104,6 +3104,12 @@ def _display_mouse_tracking(display: dict) -> str:
     return "all"
 
 
+def _employee_reasoning_config(employee_policy: dict[str, Any]) -> dict | None:
+    from hermes_constants import parse_reasoning_effort
+
+    return parse_reasoning_effort(employee_policy.get("reasoning_effort"))
+
+
 def _load_reasoning_config() -> dict | None:
     from hermes_constants import parse_reasoning_effort
 
@@ -5227,7 +5233,11 @@ def _make_agent(
         reasoning_config=(
             reasoning_config_override
             if reasoning_config_override is not None
-            else _load_reasoning_config()
+            else (
+                _employee_reasoning_config(employee_policy)
+                if employee_policy is not None
+                else _load_reasoning_config()
+            )
         ),
         service_tier=(
             service_tier_override

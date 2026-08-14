@@ -194,6 +194,7 @@ class CollaborationEmployeeResolver:
             "knowledge_relative_paths": source_policy["knowledge_relative_paths"],
             "max_iterations": source_policy["max_iterations"],
             "max_tokens": source_policy["max_tokens"],
+            "reasoning_effort": source_policy.get("reasoning_effort", ""),
         }
         employee_policy, _ = canonical_employee_snapshot(snapshot)
         return ResolvedCollaborationEmployee(

@@ -979,6 +979,8 @@ export const zh: Translations = {
       role: "角色",
       model: "模型",
       selectModel: "选择模型",
+      reasoningEffort: "思考强度",
+      reasoningDefault: "默认",
       systemPrompt: "系统提示词",
       skills: "技能",
       noSkills: "暂无可用技能。",

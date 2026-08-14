@@ -27,6 +27,7 @@ def _policy(name="Researcher"):
         "workspace_relative_path": "employees/researcher",
         "knowledge_relative_paths": [],
         "max_iterations": 20,
+        "reasoning_effort": "high",
     }
 
 
@@ -122,6 +123,18 @@ def test_create_without_channel_and_list_detail_are_owner_scoped(authenticated_c
     )
     assert client.get(f"/api/employees/{hidden.employee_id}").status_code == 404
     assert [item["employee_id"] for item in client.get("/api/employees").json()["employees"]] == [employee_id]
+
+
+def test_create_rejects_invalid_reasoning_effort(authenticated_client):
+    client, _session = authenticated_client
+
+    response = client.post(
+        "/api/employees",
+        json={"profile": {**_policy(), "reasoning_effort": "extreme"}},
+    )
+
+    assert response.status_code == 400
+    assert response.json() == {"detail": "reasoning_effort is invalid"}
 
 
 def test_profile_policy_and_lifecycle_are_generic_employee_routes(authenticated_client):

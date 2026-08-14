@@ -483,6 +483,8 @@ export interface GuiChatTranslations {
     role: string;
     model: string;
     selectModel: string;
+    reasoningEffort: string;
+    reasoningDefault: string;
     systemPrompt: string;
     skills: string;
     noSkills: string;

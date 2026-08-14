@@ -15,7 +15,19 @@ vi.mock("@/lib/api", async (importOriginal) => ({
 const catalog: EmployeeCatalog = {
   knowledge_roots: [],
   mcp_servers: [],
-  model_registrations: [{ id: "model-a", model: "claude-opus-4-8", name: "Anthropic" }],
+  model_registrations: [{
+    credential_configured: true,
+    id: "model-a",
+    kind: "chat",
+    model: "claude-opus-4-8",
+    mutable: true,
+    name: "Anthropic",
+    provider: "anthropic",
+    reasoning_levels: ["high", "xhigh", "max"],
+    scope: "user",
+    source: "catalog",
+    use_gateway: false,
+  }],
   skills: [{ description: "Research", name: "research" }],
   toolsets: [{ description: "Terminal", name: "terminal" }],
   workspace: { default: "default", root: "" },
@@ -86,13 +98,21 @@ describe("EmployeeManagementPane", () => {
 
     const dialog = document.querySelector('[role="dialog"]');
     expect(dialog?.textContent).toContain("Add employee");
-    expect(dialog?.querySelector<HTMLSelectElement>("select")?.selectedOptions[0]?.textContent)
-      .toBe("claude-opus-4-8");
+    const selects = Array.from(dialog?.querySelectorAll<HTMLSelectElement>("select") ?? []);
+    expect(selects[0]?.selectedOptions[0]?.textContent).toBe("claude-opus-4-8");
+    expect(selects[1]?.selectedOptions[0]?.textContent).toBe("Default");
+    expect(Array.from(selects[1]?.options ?? []).map((option) => option.textContent))
+      .toEqual(["Default", "High", "XHigh", "Max"]);
     expect(dialog?.textContent).not.toContain("Anthropic");
     expect(dialog?.textContent).not.toContain("App secret");
     const inputs = Array.from(dialog?.querySelectorAll<HTMLInputElement>("input") ?? [])
       .filter((input) => input.type === "text");
     changeValue(inputs[0] ?? null, "Researcher");
+    act(() => {
+      const setter = Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype, "value")?.set;
+      setter?.call(selects[1], "max");
+      selects[1]?.dispatchEvent(new Event("change", { bubbles: true }));
+    });
     changeValue(dialog?.querySelector("textarea") ?? null, "Research carefully.");
     const save = Array.from(dialog?.querySelectorAll<HTMLButtonElement>("button") ?? [])
       .find((button) => button.textContent === "Save");
@@ -107,10 +127,30 @@ describe("EmployeeManagementPane", () => {
       profile: expect.objectContaining({
         model_registration_id: "model-a",
         name: "Researcher",
+        reasoning_effort: "max",
         system_prompt: "Research carefully.",
         toolsets: ["terminal"],
       }),
     });
+  });
+
+  it("hides reasoning levels when the selected model does not support them", async () => {
+    vi.spyOn(api, "getEmployees").mockResolvedValue({ employees: [] });
+    vi.spyOn(api, "getEmployeeCatalog").mockResolvedValue({
+      ...catalog,
+      model_registrations: [{
+        ...catalog.model_registrations[0],
+        model: "claude-3-haiku",
+        reasoning_levels: [],
+      }],
+    });
+
+    await renderPane();
+    await act(async () => document.querySelector<HTMLButtonElement>("button.gui-chat-workspace-primary-button")?.click());
+
+    const dialog = document.querySelector('[role="dialog"]');
+    expect(dialog?.textContent).not.toContain("Reasoning level");
+    expect(dialog?.querySelectorAll("select")).toHaveLength(1);
   });
 
   it("edits profile, collaboration, lifecycle, rollover, and optional binding independently", async () => {
@@ -259,6 +299,7 @@ function employee(channels: Employee["channels"] = {}): Employee {
       mcp_servers: [],
       model_registration_id: "model-a",
       name: "Researcher",
+      reasoning_effort: "high",
       role: "Analyst",
       schema_version: 1,
       skills: [],
