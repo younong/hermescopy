@@ -87,6 +87,7 @@ def save_employee_avatar(
     employee_id: str,
     data: bytes,
 ) -> Path:
+    _reject_builtin_avatar_mutation(store, employee_id)
     normalized = normalize_employee_avatar(data)
     target = employee_avatar_path(store, employee_id)
     fd, temporary_name = tempfile.mkstemp(prefix=".avatar-", dir=target.parent)
@@ -106,7 +107,22 @@ def save_employee_avatar(
     return target
 
 
+def _reject_builtin_avatar_mutation(
+    store: ChannelIdentityStore, employee_id: str
+) -> None:
+    with store.read() as conn:
+        row = conn.execute(
+            "SELECT employee_kind FROM employees WHERE employee_id=?",
+            (employee_id,),
+        ).fetchone()
+    if row is not None and row["employee_kind"] == "builtin_assistant":
+        from .employees import BuiltinEmployeeProtected
+
+        raise BuiltinEmployeeProtected("built-in assistant employee is protected")
+
+
 def delete_employee_avatar(store: ChannelIdentityStore, employee_id: str) -> bool:
+    _reject_builtin_avatar_mutation(store, employee_id)
     target = employee_avatar_path(store, employee_id)
     if target.is_symlink():
         raise RuntimeError("employee avatar must be a regular file")

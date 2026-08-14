@@ -442,6 +442,113 @@ def test_web_direct_employee_selection_is_server_resolved_and_context_bound(
     ]
 
 
+def test_builtin_web_direct_policy_pins_tool_snapshot_and_rechecks_authority(
+    owner_gateway, monkeypatch
+):
+    _db, runtime, _workspace_root = owner_gateway
+    from hermes_cli.collaboration.models import CollaborationMemberProfile
+    from hermes_cli.collaboration.resolver import ResolvedCollaborationEmployee
+
+    base_policy = {
+        "schema_version": 1,
+        "employee_id": "builtin-a",
+        "profile_revision": 1,
+        "source_profile_fingerprint": "builtin-assistant-v1",
+        "system_prompt": "Built-in prompt",
+        "model": {"provider": "openai", "model": "test-model"},
+        "toolsets": [],
+        "skills": [],
+        "mcp_servers": [],
+        "workspace_relative_path": "",
+        "knowledge_relative_paths": [],
+        "max_iterations": 90,
+        "max_tokens": None,
+        "builtin_assistant": True,
+    }
+
+    class _Resolver:
+        may_manage_employees = True
+
+        def resolve_current(self, employee_id):
+            assert employee_id == "builtin-a"
+            return ResolvedCollaborationEmployee(
+                member=CollaborationMemberProfile(
+                    "builtin-a", 1, "builtin-assistant-v1"
+                ),
+                employee_policy=base_policy,
+                may_participate=True,
+                may_create_groups=True,
+                may_manage_employees=self.may_manage_employees,
+                invite_quota=None,
+            )
+
+    class _Service:
+        resolver = _Resolver()
+
+        def source_agent_context(self, **kwargs):
+            from hermes_cli.collaboration.agent_tools import CollaborationAgentContext
+
+            resolved = self.resolver.resolve_current(kwargs["creator_employee_id"])
+            return CollaborationAgentContext(
+                service=self,
+                creator_employee_id=resolved.member.employee_id,
+                source_kind=kwargs["source_kind"],
+                source_conversation_id=kwargs["source_conversation_id"],
+                may_create_authorized=resolved.may_create_groups,
+                may_manage_employees=resolved.may_manage_employees,
+            )
+
+    class _DashboardTransport:
+        def begin_dashboard_attach(self, _generation, **_kwargs):
+            return None
+
+        def commit_dashboard_attach(self, _generation, _sid, *, on_commit):
+            return on_commit()
+
+        def write(self, _payload):
+            return None
+
+    service = _Service()
+    server.bind_collaboration_service(runtime, service)
+    monkeypatch.setattr(
+        server, "_dashboard_attach_transport", lambda: _DashboardTransport()
+    )
+    monkeypatch.setattr(
+        server, "_load_enabled_toolsets", lambda: ["terminal", "project"]
+    )
+
+    response = _call(
+        runtime,
+        "session.create",
+        {
+            "source": "dashboard-gui",
+            "employee_id": "builtin-a",
+            "switch_generation": 1,
+        },
+    )
+
+    assert "error" not in response
+    session = runtime.mutable_state.sessions[response["result"]["session_id"]]
+    pinned_policy = session["employee_policy"]
+    assert pinned_policy["runtime_toolsets"] == ["terminal", "project"]
+    assert pinned_policy["system_prompt"] == "Built-in prompt"
+    server._ensure_session_db_row(session)
+    row = _db.get_session(response["result"]["stored_session_id"])
+    with server.owner_worker_gateway_runtime(runtime):
+        restored = server._stored_session_runtime_overrides(row)
+    assert restored["employee_policy"] == pinned_policy
+    assert restored["employee_policy"]["runtime_toolsets"] == [
+        "terminal",
+        "project",
+    ]
+    assert restored["collaboration_context"].may_manage_employees is True
+
+    service.resolver.may_manage_employees = False
+    with server.owner_worker_gateway_runtime(runtime):
+        with pytest.raises(RuntimeError, match="authority is unavailable"):
+            server._stored_session_runtime_overrides(row)
+
+
 def test_feishu_direct_context_requires_exact_managed_origin_and_group_gets_no_tool(
     owner_gateway,
 ):

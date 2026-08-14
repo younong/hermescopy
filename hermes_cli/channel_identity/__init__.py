@@ -2,6 +2,7 @@
 
 from .crypto import ChannelCrypto, Keyring
 from .employees import (
+    BuiltinEmployeeProtected,
     EmployeeProfileRevisionConflict,
     FeishuCredentialRevisionConflict,
     create_employee,
@@ -9,6 +10,7 @@ from .employees import (
     ensure_employee_feishu_conversation_binding,
     list_employees,
     register_employee_feishu_binding,
+    reject_builtin_employee_mutation,
     resolve_employee,
     rollover_employee_sessions,
     resolve_employee_collaboration_policy,
@@ -45,6 +47,7 @@ __all__ = [
     "ChannelCrypto",
     "ChannelIdentityOwnershipConflict",
     "ChannelIdentityStore",
+    "BuiltinEmployeeProtected",
     "Employee",
     "EmployeeChannelBinding",
     "EmployeeCollaborationPolicy",
@@ -63,6 +66,7 @@ __all__ = [
     "list_employees",
     "register_connector_binding_for_owner",
     "register_employee_feishu_binding",
+    "reject_builtin_employee_mutation",
     "register_weixin_identity",
     "register_weixin_identity_for_owner",
     "resolve_binding",

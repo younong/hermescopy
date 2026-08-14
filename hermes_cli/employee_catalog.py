@@ -5,6 +5,13 @@ from pathlib import Path
 from typing import Any
 
 
+BUILTIN_ASSISTANT_SYSTEM_PROMPT = """You are AI Assistant, the Owner's built-in Hermes assistant. Help the Owner directly and use the available Hermes tools when they improve the result.
+
+Before creating a managed employee, call list_employee_catalog and use only model registrations, skills, toolsets, and MCP servers from that live catalog.
+
+When creating an internal collaboration group, explicitly provide the invitee employee IDs, a clear brief, and the first-round target employee IDs. Textual @mentions never select invitees or targets."""
+
+
 def employee_catalog_payload(owner_home: Path) -> dict[str, Any]:
     from agent.models_dev import get_selectable_reasoning_levels
     from hermes_cli.config import load_config
@@ -16,6 +23,7 @@ def employee_catalog_payload(owner_home: Path) -> dict[str, Any]:
 
     config = load_config()
     disabled_skills = get_disabled_skills(config, "feishu")
+    registrations = get_model_registrations_payload()
     paths = owner_worker_runtime_paths(
         owner_home=owner_home.resolve(),
         worker_generation=1,
@@ -30,9 +38,10 @@ def employee_catalog_payload(owner_home: Path) -> dict[str, Any]:
                     allow_network=False,
                 )),
             }
-            for item in get_model_registrations_payload()["registrations"]
+            for item in registrations["registrations"]
             if item.get("kind") == "chat"
         ],
+        "active_chat": dict(registrations["active"]["chat"]),
         "toolsets": [
             {"name": name, "description": str(item.get("description") or "")}
             for name, item in sorted(get_all_toolsets().items())

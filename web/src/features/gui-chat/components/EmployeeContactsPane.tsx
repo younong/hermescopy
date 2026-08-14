@@ -1,5 +1,5 @@
 import { memo, useCallback, useEffect, useMemo, useState } from "react";
-import { AlertCircle, Bot, Link2, Plus, Search, Settings } from "lucide-react";
+import { AlertCircle, Link2, Plus, Search, Settings } from "lucide-react";
 import { Button } from "@nous-research/ui/ui/components/button";
 import { Input } from "@nous-research/ui/ui/components/input";
 import { Label } from "@nous-research/ui/ui/components/label";
@@ -45,6 +45,18 @@ function lifecycleLabel(status: EmployeeLifecycleStatus, text: EmployeeText) {
 function bindingRuntimeLabel(runtimeState: string, text: EmployeeText) {
   const normalized = runtimeState.toLowerCase() as keyof EmployeeText["runtime"];
   return text.runtime[normalized] ?? text.runtime.unknown;
+}
+
+function employeeName(employee: Employee, text: EmployeeText) {
+  return employee.employee_kind === "builtin_assistant"
+    ? text.aiAssistant
+    : employee.profile?.name || text.unnamed;
+}
+
+function employeeRole(employee: Employee, text: EmployeeText) {
+  return employee.employee_kind === "builtin_assistant"
+    ? text.builtinDescription
+    : employee.profile?.role || text.aiEmployee;
 }
 
 function allToolsets(catalog: EmployeeCatalog | null) {
@@ -144,13 +156,13 @@ export const EmployeeContactsPane = memo(function EmployeeContactsPane({
     const normalizedQuery = query.trim().toLocaleLowerCase();
     if (!normalizedQuery) return employees;
     return employees.filter((employee) =>
-      [employee.profile?.name, employee.profile?.role]
+      [employeeName(employee, text), employeeRole(employee, text)]
         .filter(Boolean)
         .join("\n")
         .toLocaleLowerCase()
         .includes(normalizedQuery),
     );
-  }, [employees, query]);
+  }, [employees, query, text]);
 
   const resetAvatar = (preview: string | null = null) => {
     setAvatarFile(null);
@@ -367,13 +379,7 @@ export const EmployeeContactsPane = memo(function EmployeeContactsPane({
             <span className="text-[#777c84]">{text.loadFailed.replace("{error}", "").replace(/[:：]\s*$/, "")}</span>
             <Button onClick={() => void onRefresh()} outlined size="sm">{common.retry}</Button>
           </div>
-        ) : employees.length === 0 ? (
-          <div className="px-4 py-10 text-center text-xs text-[#85888e]">
-            <Bot className="mx-auto mb-2 h-5 w-5" />
-            <strong className="block font-medium text-[#4d5055]">{text.none}</strong>
-            <span className="mt-1 block">{text.emptyHint}</span>
-          </div>
-        ) : visibleEmployees.length === 0 ? (
+        ) : employees.length === 0 ? null : visibleEmployees.length === 0 ? (
           <div className="px-4 py-10 text-center text-xs text-[#85888e]">{common.noResults}</div>
         ) : (
           <ul aria-label={text.listLabel} className="flex flex-col gap-1" role="list">
@@ -394,9 +400,9 @@ export const EmployeeContactsPane = memo(function EmployeeContactsPane({
       {managedEmployee ? (
         <GuiChatWorkspaceDialog
           busy={busy !== null}
-          description={text.manageDescription}
+          description={managedEmployee.protected ? text.builtinDescription : text.manageDescription}
           onClose={closeManagement}
-          title={managedEmployee.profile?.name || text.unnamed}
+          title={employeeName(managedEmployee, text)}
           wide
         >
           <div className="max-h-[72vh] overflow-y-auto">
@@ -575,8 +581,8 @@ function EmployeeContactRow({
   selected: boolean;
   text: EmployeeText;
 }) {
-  const unavailable = employee.lifecycle_status !== "active";
-  const name = employee.profile?.name || text.unnamed;
+  const unavailable = !employee.chat_eligible;
+  const name = employeeName(employee, text);
   return (
     <li className="group relative" role="listitem">
       <button
@@ -594,9 +600,12 @@ function EmployeeContactRow({
       >
         <EmployeeAvatar employee={employee} />
         <span className="min-w-0 flex-1">
-          <span className="block truncate text-[14px] font-medium leading-5">{name}</span>
+          <span className="flex items-center gap-1.5">
+            <span className="block min-w-0 truncate text-[14px] font-medium leading-5">{name}</span>
+            {employee.protected ? <span className="shrink-0 rounded-full bg-[#eef2ff] px-2 py-0.5 text-[10px] font-medium text-[#4d5f9e]">{text.builtin}</span> : null}
+          </span>
           <span className="flex items-center gap-1.5 truncate text-[11px] leading-4 text-[#85888e]">
-            <span className="truncate">{employee.profile?.role || text.aiEmployee}</span>
+            <span className="truncate">{employeeRole(employee, text)}</span>
             {unavailable ? <StatusPill status={employee.lifecycle_status} text={text} /> : null}
           </span>
         </span>
@@ -651,43 +660,51 @@ function EmployeeManagementDetails({
         <div className="flex min-w-0 items-center gap-3">
           <EmployeeAvatar employee={employee} />
           <div className="min-w-0">
-            <div className="flex flex-wrap items-center gap-2"><h3 className="truncate text-sm font-semibold">{employee.profile?.name || text.unnamed}</h3><StatusPill status={employee.lifecycle_status} text={text} /></div>
-            <p className="truncate text-[11px] text-[#969aa1]">{employee.profile?.role || text.aiEmployee} · {text.profileRevision.replace("{revision}", String(employee.profile_revision ?? "—"))}</p>
+            <div className="flex flex-wrap items-center gap-2"><h3 className="truncate text-sm font-semibold">{employeeName(employee, text)}</h3>{employee.protected ? <span className="rounded-full bg-[#eef2ff] px-2 py-0.5 text-[10px] font-medium text-[#4d5f9e]">{text.builtin}</span> : null}<StatusPill status={employee.lifecycle_status} text={text} /></div>
+            <p className="truncate text-[11px] text-[#969aa1]">{employeeRole(employee, text)}{employee.profile_revision !== null ? ` · ${text.profileRevision.replace("{revision}", String(employee.profile_revision))}` : null}</p>
           </div>
         </div>
-        <div className="flex flex-wrap gap-1.5">
-          <Button disabled={disabled || employee.lifecycle_status === "revoked"} ghost onClick={onProfile} size="sm">{text.editProfile}</Button>
-          <Button disabled={disabled || employee.lifecycle_status !== "active"} ghost onClick={() => onEmployeeAction("rollover")} size="sm">{text.refreshSessions}</Button>
-          {employee.lifecycle_status === "active" ? <Button disabled={disabled} ghost onClick={() => onEmployeeAction("suspended")} size="sm">{text.suspend}</Button> : employee.lifecycle_status === "suspended" ? <Button disabled={disabled} ghost onClick={() => onEmployeeAction("active")} size="sm">{text.resume}</Button> : null}
-          <Button disabled={disabled || employee.lifecycle_status === "revoked"} ghost onClick={() => onEmployeeAction("revoked")} size="sm">{text.revoke}</Button>
-        </div>
+        {!employee.protected ? (
+          <div className="flex flex-wrap gap-1.5">
+            <Button disabled={disabled || employee.lifecycle_status === "revoked"} ghost onClick={onProfile} size="sm">{text.editProfile}</Button>
+            <Button disabled={disabled || employee.lifecycle_status !== "active"} ghost onClick={() => onEmployeeAction("rollover")} size="sm">{text.refreshSessions}</Button>
+            {employee.lifecycle_status === "active" ? <Button disabled={disabled} ghost onClick={() => onEmployeeAction("suspended")} size="sm">{text.suspend}</Button> : employee.lifecycle_status === "suspended" ? <Button disabled={disabled} ghost onClick={() => onEmployeeAction("active")} size="sm">{text.resume}</Button> : null}
+            <Button disabled={disabled || employee.lifecycle_status === "revoked"} ghost onClick={() => onEmployeeAction("revoked")} size="sm">{text.revoke}</Button>
+          </div>
+        ) : null}
       </div>
 
-      <div className="mt-4 grid gap-3 border-l-2 border-[#e8eaed] pl-3 sm:grid-cols-2">
-        <label className="flex items-center justify-between gap-3 text-xs"><span><span className="block font-medium">{text.allowCollaboration}</span><span className="text-[#969aa1]">{text.allowCollaborationHint}</span></span><Switch checked={collaborationPolicy.may_participate} className="gui-chat-skill-switch" onCheckedChange={(checked) => onCollaborationChange({ ...collaborationPolicy, may_participate: checked })} /></label>
-        <label className="flex items-center justify-between gap-3 text-xs"><span><span className="block font-medium">{text.allowCreateGroups}</span><span className="text-[#969aa1]">{text.allowCreateGroupsHint}</span></span><Switch checked={collaborationPolicy.may_create_groups} className="gui-chat-skill-switch" onCheckedChange={(checked) => onCollaborationChange({ ...collaborationPolicy, may_create_groups: checked })} /></label>
-        <Field label={text.inviteQuota}><Input aria-label={text.inviteQuotaFor.replace("{name}", employee.profile?.name || employee.employee_id)} disabled={unlimited} min={0} onChange={(event) => onCollaborationChange({ ...collaborationPolicy, invite_quota: Math.max(0, Number(event.target.value) || 0) })} type="number" value={collaborationPolicy.invite_quota ?? ""} /></Field>
-        <div className="flex items-end justify-between gap-3"><label className="flex items-center gap-2 pb-2 text-xs"><input checked={unlimited} onChange={(event) => onCollaborationChange({ ...collaborationPolicy, invite_quota: event.target.checked ? null : 5 })} type="checkbox" />{text.unlimited}</label><Button disabled={disabled} onClick={onCollaborationSave} size="sm">{busy === `${employee.employee_id}:collaboration` ? savingLabel : text.savePermissions}</Button></div>
-      </div>
+      {!employee.protected ? (
+        <>
+          <div className="mt-4 grid gap-3 border-l-2 border-[#e8eaed] pl-3 sm:grid-cols-2">
+            <label className="flex items-center justify-between gap-3 text-xs"><span><span className="block font-medium">{text.allowCollaboration}</span><span className="text-[#969aa1]">{text.allowCollaborationHint}</span></span><Switch checked={collaborationPolicy.may_participate} className="gui-chat-skill-switch" onCheckedChange={(checked) => onCollaborationChange({ ...collaborationPolicy, may_participate: checked })} /></label>
+            <label className="flex items-center justify-between gap-3 text-xs"><span><span className="block font-medium">{text.allowCreateGroups}</span><span className="text-[#969aa1]">{text.allowCreateGroupsHint}</span></span><Switch checked={collaborationPolicy.may_create_groups} className="gui-chat-skill-switch" onCheckedChange={(checked) => onCollaborationChange({ ...collaborationPolicy, may_create_groups: checked })} /></label>
+            <Field label={text.inviteQuota}><Input aria-label={text.inviteQuotaFor.replace("{name}", employeeName(employee, text))} disabled={unlimited} min={0} onChange={(event) => onCollaborationChange({ ...collaborationPolicy, invite_quota: Math.max(0, Number(event.target.value) || 0) })} type="number" value={collaborationPolicy.invite_quota ?? ""} /></Field>
+            <div className="flex items-end justify-between gap-3"><label className="flex items-center gap-2 pb-2 text-xs"><input checked={unlimited} onChange={(event) => onCollaborationChange({ ...collaborationPolicy, invite_quota: event.target.checked ? null : 5 })} type="checkbox" />{text.unlimited}</label><Button disabled={disabled} onClick={onCollaborationSave} size="sm">{busy === `${employee.employee_id}:collaboration` ? savingLabel : text.savePermissions}</Button></div>
+          </div>
 
-      <div className="mt-3 flex flex-wrap items-center justify-between gap-3 border-t border-[#ebecef] pt-3">
-        <div className="flex items-center gap-2 text-xs"><Link2 className="h-3.5 w-3.5 text-[#777c84]" /><span className="font-medium">{text.channel}</span>{binding ? <><StatusPill status={binding.lifecycle_status} text={text} /><span className="text-[#969aa1]">{bindingRuntimeLabel(binding.runtime_state, text)}</span></> : <span className="text-[#969aa1]">{text.notConnected}</span>}</div>
-        <div className="flex flex-wrap gap-1.5">
-          {binding ? <><Button disabled={disabled || binding.lifecycle_status === "revoked"} ghost onClick={() => onBindingAction("test")} size="sm">{text.testConnection}</Button><Button disabled={disabled || binding.lifecycle_status === "revoked"} ghost onClick={onBinding} size="sm">{text.updateCredentials}</Button>{binding.lifecycle_status === "active" ? <Button disabled={disabled} ghost onClick={() => onBindingAction("suspended")} size="sm">{text.suspendBinding}</Button> : binding.lifecycle_status === "suspended" ? <Button disabled={disabled} ghost onClick={() => onBindingAction("active")} size="sm">{text.resumeBinding}</Button> : null}<Button disabled={disabled || binding.lifecycle_status === "revoked"} ghost onClick={() => onBindingAction("revoked")} size="sm">{text.revokeBinding}</Button></> : <Button disabled={employee.lifecycle_status === "revoked"} ghost onClick={onBinding} size="sm">{text.connect}</Button>}
-        </div>
-      </div>
+          <div className="mt-3 flex flex-wrap items-center justify-between gap-3 border-t border-[#ebecef] pt-3">
+            <div className="flex items-center gap-2 text-xs"><Link2 className="h-3.5 w-3.5 text-[#777c84]" /><span className="font-medium">{text.channel}</span>{binding ? <><StatusPill status={binding.lifecycle_status} text={text} /><span className="text-[#969aa1]">{bindingRuntimeLabel(binding.runtime_state, text)}</span></> : <span className="text-[#969aa1]">{text.notConnected}</span>}</div>
+            <div className="flex flex-wrap gap-1.5">
+              {binding ? <><Button disabled={disabled || binding.lifecycle_status === "revoked"} ghost onClick={() => onBindingAction("test")} size="sm">{text.testConnection}</Button><Button disabled={disabled || binding.lifecycle_status === "revoked"} ghost onClick={onBinding} size="sm">{text.updateCredentials}</Button>{binding.lifecycle_status === "active" ? <Button disabled={disabled} ghost onClick={() => onBindingAction("suspended")} size="sm">{text.suspendBinding}</Button> : binding.lifecycle_status === "suspended" ? <Button disabled={disabled} ghost onClick={() => onBindingAction("active")} size="sm">{text.resumeBinding}</Button> : null}<Button disabled={disabled || binding.lifecycle_status === "revoked"} ghost onClick={() => onBindingAction("revoked")} size="sm">{text.revokeBinding}</Button></> : <Button disabled={employee.lifecycle_status === "revoked"} ghost onClick={onBinding} size="sm">{text.connect}</Button>}
+            </div>
+          </div>
+        </>
+      ) : (
+        <p className="mt-4 border-l-2 border-[#e8eaed] pl-3 text-xs leading-5 text-[#777c84]">{text.builtinManaged}</p>
+      )}
     </div>
   );
 }
 
-function EmployeeAvatar({ employee, large = false }: { employee: Pick<Employee, "avatar_url" | "profile">; large?: boolean }) {
+function EmployeeAvatar({ employee, large = false }: { employee: Pick<Employee, "avatar_url" | "profile"> & Partial<Pick<Employee, "employee_kind">>; large?: boolean }) {
   const [failed, setFailed] = useState(false);
   useEffect(() => setFailed(false), [employee.avatar_url]);
-  const label = employee.profile?.name || "E";
+  const label = employee.employee_kind === "builtin_assistant" ? "AI" : employee.profile?.name || "E";
   const classes = large ? "h-14 w-14" : "h-10 w-10";
   return employee.avatar_url && !failed
     ? <img alt="" className={cn("shrink-0 rounded-full border border-[#e1e3e7] object-cover", classes)} onError={() => setFailed(true)} src={withHermesAssetAuth(employee.avatar_url)} />
-    : <span aria-hidden className={cn("flex shrink-0 items-center justify-center rounded-full border border-[#e1e3e7] bg-[#f3f4f6] text-sm font-semibold", classes)}>{label.trim().charAt(0).toUpperCase() || "E"}</span>;
+    : <span aria-hidden className={cn("flex shrink-0 items-center justify-center rounded-full border border-[#e1e3e7] bg-[#f3f4f6] text-sm font-semibold", classes)}>{label.trim().slice(0, 2).toUpperCase() || "E"}</span>;
 }
 
 function StatusPill({ status, text }: { status: EmployeeLifecycleStatus; text: EmployeeText }) {

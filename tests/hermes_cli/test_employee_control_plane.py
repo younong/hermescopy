@@ -98,6 +98,9 @@ def test_create_without_channel_and_list_detail_are_owner_scoped(authenticated_c
     payload = created.json()
     employee_id = payload["employee_id"]
     assert employee_id.startswith("emp_")
+    assert payload["employee_kind"] == "managed"
+    assert payload["protected"] is False
+    assert payload["chat_eligible"] is True
     assert payload["profile"] == {**_policy(), "max_tokens": None}
     assert payload["channels"] == {}
     assert payload["collaboration_policy"] == {
@@ -105,7 +108,17 @@ def test_create_without_channel_and_list_detail_are_owner_scoped(authenticated_c
         "may_create_groups": False,
         "invite_quota": 5,
     }
-    assert client.get("/api/employees").json() == {"employees": [payload]}
+    listed = client.get("/api/employees").json()["employees"]
+    assert len(listed) == 2
+    builtin = next(item for item in listed if item["employee_kind"] == "builtin_assistant")
+    assert builtin["protected"] is True
+    assert builtin["chat_eligible"] is True
+    assert builtin["profile"] is None
+    assert builtin["collaboration_policy"] == {
+        "may_participate": True,
+        "may_create_groups": True,
+        "invite_quota": None,
+    }
     assert client.get(f"/api/employees/{employee_id}").json() == payload
 
     other = Session(
@@ -122,7 +135,13 @@ def test_create_without_channel_and_list_detail_are_owner_scoped(authenticated_c
         store, owner=owner_context_from_session(other), profile=_policy("Hidden")
     )
     assert client.get(f"/api/employees/{hidden.employee_id}").status_code == 404
-    assert [item["employee_id"] for item in client.get("/api/employees").json()["employees"]] == [employee_id]
+    listed_ids = {
+        item["employee_id"]
+        for item in client.get("/api/employees").json()["employees"]
+    }
+    assert employee_id in listed_ids
+    assert hidden.employee_id not in listed_ids
+    assert len(listed_ids) == 2
 
 
 def test_create_rejects_invalid_reasoning_effort(authenticated_client):
@@ -184,6 +203,49 @@ def test_profile_policy_and_lifecycle_are_generic_employee_routes(authenticated_
     )
     assert terminal.status_code == 409
     assert terminal.json() == {"detail": "employee_revoked"}
+
+
+def test_builtin_employee_mutation_routes_return_protected_conflict(
+    authenticated_client,
+):
+    client, _session = authenticated_client
+    builtin = next(
+        employee
+        for employee in client.get("/api/employees").json()["employees"]
+        if employee["employee_kind"] == "builtin_assistant"
+    )
+    employee_id = builtin["employee_id"]
+    requests = (
+        client.put(
+            f"/api/employees/{employee_id}/profile",
+            json={"expected_revision": 0, "profile": _policy()},
+        ),
+        client.put(
+            f"/api/employees/{employee_id}/collaboration-policy",
+            json={
+                "may_participate": False,
+                "may_create_groups": False,
+                "invite_quota": 0,
+            },
+        ),
+        client.put(
+            f"/api/employees/{employee_id}/lifecycle",
+            json={"status": "suspended"},
+        ),
+        client.post(f"/api/employees/{employee_id}/rollover"),
+        client.put(
+            f"/api/employees/{employee_id}/channels/feishu",
+            json={"app_id": "app-a", "app_secret": "secret"},
+        ),
+        client.put(
+            f"/api/employees/{employee_id}/avatar",
+            files={"file": ("avatar.png", _image_bytes(), "image/png")},
+        ),
+        client.delete(f"/api/employees/{employee_id}/avatar"),
+    )
+    for response in requests:
+        assert response.status_code == 409
+        assert response.json() == {"detail": "builtin_employee_protected"}
 
 
 def _image_bytes(format="PNG", color="red"):

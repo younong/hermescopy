@@ -12,7 +12,7 @@ from hermes_cli.dashboard_auth.owner_context import OwnerContext, owner_context_
 
 from .credentials import encrypt_account_credentials
 from .models import RegisteredChannel
-from .store import ChannelIdentityStore
+from .store import ChannelIdentityStore, _builtin_assistant_employee_id
 
 _PROVIDER = "weixin_ilink"
 _AUTH_PROVIDER = "channel-weixin-ilink"
@@ -66,6 +66,11 @@ def _ensure_owner_binding(conn, *, owner: OwnerContext, now: float) -> str:
         _validate_owner_binding(existing, owner=owner)
         if existing["status"] != "active":
             raise RuntimeError("channel owner binding is unavailable")
+        _ensure_builtin_assistant(
+            conn,
+            canonical_user_id=existing["canonical_user_id"],
+            now=now,
+        )
         return existing["canonical_user_id"]
 
     canonical_user_id = f"cu_{uuid.uuid4().hex}"
@@ -84,7 +89,35 @@ def _ensure_owner_binding(conn, *, owner: OwnerContext, now: float) -> str:
             now,
         ),
     )
+    _ensure_builtin_assistant(conn, canonical_user_id=canonical_user_id, now=now)
     return canonical_user_id
+
+
+def _ensure_builtin_assistant(conn, *, canonical_user_id: str, now: float) -> str:
+    employee_id = _builtin_assistant_employee_id(canonical_user_id)
+    conn.execute(
+        """
+        INSERT INTO employees
+          (employee_id, canonical_user_id, employee_kind, lifecycle_status,
+           created_at, updated_at)
+        VALUES (?, ?, 'builtin_assistant', 'active', ?, ?)
+        ON CONFLICT(employee_id) DO NOTHING
+        """,
+        (employee_id, canonical_user_id, now, now),
+    )
+    row = conn.execute(
+        "SELECT canonical_user_id, employee_kind, lifecycle_status "
+        "FROM employees WHERE employee_id=?",
+        (employee_id,),
+    ).fetchone()
+    if (
+        row is None
+        or row["canonical_user_id"] != canonical_user_id
+        or row["employee_kind"] != "builtin_assistant"
+        or row["lifecycle_status"] != "active"
+    ):
+        raise RuntimeError("builtin assistant employee is inconsistent")
+    return employee_id
 
 
 def _validate_owner_binding(row, *, owner: OwnerContext) -> None:
@@ -554,6 +587,9 @@ def _register_weixin_identity(
                     owner.owner_key,
                     now,
                 ),
+            )
+            _ensure_builtin_assistant(
+                conn, canonical_user_id=canonical_user_id, now=now
             )
         conn.execute(
             """

@@ -13,6 +13,7 @@ from hermes_cli.channel_identity import (
     resolve_employee_profile,
 )
 from hermes_cli.dashboard_auth.owner_context import owner_context_from_owner_key
+from hermes_cli.employee_catalog import BUILTIN_ASSISTANT_SYSTEM_PROMPT
 from hermes_cli.employee_policy import canonical_employee_snapshot, normalize_employee_source_policy
 from hermes_cli.model_registrations import resolve_chat_model_registration
 
@@ -42,6 +43,7 @@ class ResolvedCollaborationEmployee:
     employee_policy: dict[str, Any]
     may_participate: bool
     may_create_groups: bool = False
+    may_manage_employees: bool = False
     invite_quota: int | None = 5
 
 
@@ -135,8 +137,10 @@ class CollaborationEmployeeResolver:
             raise RuntimeError("retained Feishu origin does not match binding authority")
 
     def resolve_current(self, employee_id: str) -> ResolvedCollaborationEmployee:
-        """Resolve the active profile and current collaboration authorization."""
+        """Resolve current identity and runtime policy from durable authority."""
         managed = self._resolve_live_authority(employee_id)
+        if managed.employee_kind == "builtin_assistant":
+            return self._resolved_builtin(managed)
         profile = resolve_employee_profile(
             self._authority_store(),
             owner=self.owner,
@@ -155,6 +159,14 @@ class CollaborationEmployeeResolver:
     ) -> ResolvedCollaborationEmployee:
         """Resolve an immutable profile revision while rechecking live authority."""
         managed = self._resolve_live_authority(employee_id)
+        if managed.employee_kind == "builtin_assistant":
+            resolved = self._resolved_builtin(managed)
+            if (
+                resolved.member.profile_revision != int(profile_revision)
+                or resolved.member.profile_fingerprint != str(profile_fingerprint)
+            ):
+                raise RuntimeError("collaboration member profile fingerprint is inconsistent")
+            return resolved
         if not managed.collaboration_policy.may_participate:
             raise RuntimeError("collaboration participation is revoked")
         profile = resolve_employee_profile(
@@ -176,6 +188,52 @@ class CollaborationEmployeeResolver:
         if employee.lifecycle_status != "active":
             raise RuntimeError("employee is unavailable")
         return employee
+
+    def _resolved_builtin(self, managed) -> ResolvedCollaborationEmployee:
+        from hermes_cli.config import load_config
+        from hermes_cli.model_registrations import get_model_registrations_payload
+        from hermes_cli.tools_config import _get_platform_tools, enabled_mcp_server_names
+
+        config = load_config()
+        registrations = get_model_registrations_payload()
+        active_chat = dict(registrations.get("active", {}).get("chat") or {})
+        registration_id = str(active_chat.get("registration_id") or "").strip()
+        if not registration_id:
+            raise RuntimeError("active Chat model registration is unavailable")
+        model = resolve_chat_model_registration(registration_id)
+        toolsets = sorted(
+            _get_platform_tools(config, "cli", include_default_mcp_servers=False)
+            | {"project"}
+        )
+        snapshot = {
+            "schema_version": 1,
+            "employee_id": managed.employee_id,
+            "profile_revision": 1,
+            "source_profile_fingerprint": "builtin-assistant-v1",
+            "system_prompt": BUILTIN_ASSISTANT_SYSTEM_PROMPT,
+            "model": model,
+            "toolsets": toolsets,
+            "skills": [],
+            "mcp_servers": sorted(enabled_mcp_server_names(config)),
+            "workspace_relative_path": "",
+            "knowledge_relative_paths": [],
+            "max_iterations": 90,
+            "max_tokens": None,
+            "builtin_assistant": True,
+        }
+        policy, _ = canonical_employee_snapshot(snapshot)
+        return ResolvedCollaborationEmployee(
+            member=CollaborationMemberProfile(
+                employee_id=managed.employee_id,
+                profile_revision=1,
+                profile_fingerprint="builtin-assistant-v1",
+            ),
+            employee_policy=policy,
+            may_participate=True,
+            may_create_groups=True,
+            may_manage_employees=True,
+            invite_quota=None,
+        )
 
     @staticmethod
     def _resolved(managed, profile) -> ResolvedCollaborationEmployee:
@@ -207,5 +265,6 @@ class CollaborationEmployeeResolver:
             employee_policy=employee_policy,
             may_participate=managed.collaboration_policy.may_participate,
             may_create_groups=managed.collaboration_policy.may_create_groups,
+            may_manage_employees=False,
             invite_quota=managed.collaboration_policy.invite_quota,
         )
