@@ -25,6 +25,7 @@ def collaboration_member_policy(
 ) -> dict[str, Any]:
     """Bind a pinned employee policy to one membership's read-only attachments."""
     snapshot = dict(employee_policy)
+    snapshot.pop("snapshot_fingerprint", None)
     knowledge = list(snapshot.get("knowledge_relative_paths") or ())
     attachment_prefix = f"collaboration-attachments/{membership_id}"
     if attachment_prefix not in knowledge:

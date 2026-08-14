@@ -5436,8 +5436,24 @@ class CollaborationAgentRunner:
         except (TypeError, ValueError) as exc:
             raise RuntimeError("collaboration member policy is invalid") from exc
         persisted_policy = model_config.get(_EMPLOYEE_POLICY_CONFIG_KEY)
-        if not isinstance(persisted_policy, dict) or persisted_policy != employee_policy:
+        if not isinstance(persisted_policy, dict):
             raise RuntimeError("collaboration member policy snapshot is inconsistent")
+        from hermes_cli.employee_policy import normalize_employee_snapshot_for_resume
+
+        try:
+            normalized_persisted_policy = normalize_employee_snapshot_for_resume(
+                persisted_policy
+            )
+            normalized_employee_policy = normalize_employee_snapshot_for_resume(
+                employee_policy
+            )
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError(
+                "collaboration member policy snapshot is inconsistent"
+            ) from exc
+        if normalized_persisted_policy != normalized_employee_policy:
+            raise RuntimeError("collaboration member policy snapshot is inconsistent")
+        persisted_policy = normalized_persisted_policy
         with self._lock:
             agent = self._agents.get(hidden_session_id)
             if agent is None:
