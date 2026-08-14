@@ -311,11 +311,16 @@ describe("connectGuiChat", () => {
   it("switches the current session model through config.set", async () => {
     const connection = connectGuiChat({ ownerKey: "owner-a" });
 
-    await connection.switchModel("runtime-a", "provider-a", "model-a", true);
+    await connection.switchModel(
+      "runtime-a",
+      { id: "registration-a", provider: "provider-a", model: "model-a" },
+      { confirmExpensiveModel: true },
+    );
 
     expect(mocks.gatewayInstances[0].request).toHaveBeenCalledWith("config.set", {
       confirm_expensive_model: true,
       key: "model",
+      registration_id: "registration-a",
       session_id: "runtime-a",
       value: "model-a --provider provider-a --session",
     });
@@ -336,11 +341,16 @@ describe("connectGuiChat", () => {
   it("can persist a model switch for new sessions", async () => {
     const connection = connectGuiChat({ ownerKey: "owner-a" });
 
-    await connection.switchModel("runtime-a", "provider-a", "model-a", false, true);
+    await connection.switchModel(
+      "runtime-a",
+      { id: "registration-a", provider: "provider-a", model: "model-a" },
+      { persistGlobally: true },
+    );
 
     expect(mocks.gatewayInstances[0].request).toHaveBeenCalledWith("config.set", {
       confirm_expensive_model: false,
       key: "model",
+      registration_id: "registration-a",
       session_id: "runtime-a",
       value: "model-a --provider provider-a --global",
     });

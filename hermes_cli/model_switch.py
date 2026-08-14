@@ -765,6 +765,7 @@ def switch_model(
     explicit_provider: str = "",
     user_providers: dict = None,
     custom_providers: list | None = None,
+    trusted_selection: bool = False,
 ) -> ModelSwitchResult:
     """Core model-switching pipeline shared between CLI and gateway.
 
@@ -799,6 +800,8 @@ def switch_model(
         explicit_provider: From --provider flag (empty = no explicit provider).
         user_providers: The ``providers:`` dict from config.yaml (for user endpoints).
         custom_providers: The ``custom_providers:`` list from config.yaml.
+        trusted_selection: Skip remote catalog validation for a model-plane
+            registration that was already resolved locally.
 
     Returns:
         ModelSwitchResult with all information the caller needs.
@@ -1274,7 +1277,7 @@ def switch_model(
     # Deployment routes are an exact operator allowlist and the worker cannot
     # query their private upstream catalogs. Treat only that exact route as
     # validated; all ordinary providers retain normal catalog validation.
-    if deployment_managed:
+    if deployment_managed or trusted_selection:
         validation = {
             "accepted": True,
             "persist": True,
@@ -1381,11 +1384,18 @@ def switch_model(
     ):
         base_url = re.sub(r"/v1/?$", "", base_url)
 
-    # --- Get capabilities (legacy) ---
-    capabilities = get_model_capabilities(target_provider, new_model)
-
-    # --- Get full model info from models.dev ---
-    model_info = get_model_info(target_provider, new_model)
+    # Registered UI selections must not block on metadata refreshes. Cached
+    # metadata still powers the price guard and capability display when present.
+    capabilities = get_model_capabilities(
+        target_provider,
+        new_model,
+        allow_network=not trusted_selection,
+    )
+    model_info = get_model_info(
+        target_provider,
+        new_model,
+        allow_network=not trusted_selection,
+    )
 
     # --- Collect warnings ---
     warnings: list[str] = []

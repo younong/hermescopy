@@ -791,6 +791,7 @@ class AIAgent:
         base_url='',
         api_mode='',
         relay_provider='',
+        route_only=False,
     ):
         """Forwarder — see ``agent.agent_runtime_helpers.switch_model``."""
         from agent.agent_runtime_helpers import switch_model
@@ -802,6 +803,7 @@ class AIAgent:
             base_url,
             api_mode,
             relay_provider,
+            route_only,
         )
 
     def _safe_print(self, *args, **kwargs):

@@ -3397,6 +3397,7 @@ def _apply_model_switch(
     confirm_expensive_model: bool = False,
     pin_session_override: bool = True,
     parsed_flags: tuple[str, str, bool, bool, bool] | None = None,
+    trusted_selection: bool = False,
 ) -> dict:
     from hermes_cli.model_switch import (
         parse_model_flags,
@@ -3467,11 +3468,12 @@ def _apply_model_switch(
         explicit_provider=explicit_provider,
         user_providers=user_provs,
         custom_providers=custom_provs,
+        trusted_selection=trusted_selection,
     )
     if not result.success:
         raise ValueError(result.error_message or "model switch failed")
 
-    if agent:
+    if agent and not trusted_selection:
         try:
             from hermes_cli.context_switch_guard import merge_preflight_compression_warning
 
@@ -3500,6 +3502,7 @@ def _apply_model_switch(
                 base_url=result.base_url or current_base_url,
                 api_key=result.api_key or current_api_key,
                 model_info=result.model_info,
+                allow_network=not trusted_selection,
             )
         except Exception:
             warning = None
@@ -3523,6 +3526,7 @@ def _apply_model_switch(
                 base_url=result.base_url,
                 api_mode=result.api_mode,
                 relay_provider=getattr(result, "relay_provider", ""),
+                route_only=trusted_selection,
             )
         except Exception as exc:
             # The in-place swap rolled the agent back to the old working
@@ -3538,11 +3542,18 @@ def _apply_model_switch(
                 f"staying on {getattr(agent, 'model', current_model)}."
             ) from exc
         _persist_live_session_runtime(session)
-        _persist_live_session_system_prompt(session)
-        _append_model_switch_marker(
-            session, model=result.new_model, provider=result.target_provider
-        )
-        _emit("session.info", sid, _session_info(agent, session))
+        if trusted_selection:
+            _emit(
+                "session.info",
+                sid,
+                {"model": result.new_model, "provider": result.target_provider},
+            )
+        else:
+            _persist_live_session_system_prompt(session)
+            _append_model_switch_marker(
+                session, model=result.new_model, provider=result.target_provider
+            )
+            _emit("session.info", sid, _session_info(agent, session))
 
     # Record the switch as a PER-SESSION override so a later rebuild of THIS
     # session (e.g. /new via _reset_session_agent, or resume) re-derives the
@@ -12663,7 +12674,43 @@ def _(rid, params: dict) -> dict:
                 from hermes_cli.model_switch import parse_model_flags
 
                 parsed_flags = parse_model_flags(value)
-                _model_input, explicit_provider, _persist_global, _force_refresh, _is_session = parsed_flags
+                (
+                    model_input,
+                    explicit_provider,
+                    persist_global,
+                    force_refresh,
+                    is_session,
+                ) = parsed_flags
+                registration_id = str(params.get("registration_id") or "").strip()
+                trusted_selection = False
+                if registration_id:
+                    from hermes_cli.model_registrations import (
+                        resolve_chat_model_registration,
+                    )
+
+                    registration = resolve_chat_model_registration(registration_id)
+                    registered_model = str(registration.get("model") or "").strip()
+                    registered_provider = str(
+                        registration.get("provider") or ""
+                    ).strip()
+                    if (
+                        model_input != registered_model
+                        or explicit_provider.strip().lower()
+                        != registered_provider.lower()
+                    ):
+                        return _err(
+                            rid,
+                            4002,
+                            "model registration does not match requested route",
+                        )
+                    parsed_flags = (
+                        registered_model,
+                        registered_provider,
+                        persist_global,
+                        force_refresh,
+                        is_session,
+                    )
+                    trusted_selection = True
                 if session.get("agent") is None and not explicit_provider.strip():
                     session_id = params.get("session_id", "")
                     _start_agent_build(session_id, session)
@@ -12680,6 +12727,7 @@ def _(rid, params: dict) -> dict:
                         params.get("confirm_expensive_model", False)
                     ),
                     parsed_flags=parsed_flags,
+                    trusted_selection=trusted_selection,
                 )
             else:
                 result = _apply_model_switch(

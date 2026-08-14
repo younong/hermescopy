@@ -34,7 +34,7 @@ import { PageHeaderContext } from "@/contexts/page-header-context";
 import { GuiChatFilesPane } from "@/features/files/components/GuiChatFilesPane";
 import { guiChatTranslations, useI18n } from "@/i18n";
 import SessionsPage from "@/pages/SessionsPage";
-import { api, type Employee, type ReasoningLevel } from "@/lib/api";
+import { api, type Employee, type ModelRegistration, type ReasoningLevel } from "@/lib/api";
 import { JsonRpcGatewayError, type GatewayEvent } from "@/lib/gatewayClient";
 import { emitChatDiagnostic } from "@/lib/chatDiagnostics";
 import { dashboardAuthTransition } from "@/lib/dashboardAuthTransition";
@@ -798,7 +798,7 @@ export function GuiChatShell() {
 
   const switchChatModel = useCallback(
     async (
-      registration: { model: string; provider: string },
+      registration: Pick<ModelRegistration, "id" | "model" | "provider">,
       confirmExpensiveModel = false,
       persistGlobally = false,
     ) => {
@@ -808,13 +808,10 @@ export function GuiChatShell() {
       if (state.isGenerating) {
         throw new Error(copy.shell.stopBeforeSwitchingModels);
       }
-      return connection.switchModel(
-        sessionId,
-        registration.provider,
-        registration.model,
+      return connection.switchModel(sessionId, registration, {
         confirmExpensiveModel,
         persistGlobally,
-      );
+      });
     },
     [copy.shell.noActiveConversation, copy.shell.stopBeforeSwitchingModels, state.isGenerating, state.sessionId],
   );

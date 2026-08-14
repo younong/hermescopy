@@ -82,6 +82,37 @@ def _run_switch(
         )
 
 
+def test_trusted_selection_skips_remote_validation_and_metadata_refresh():
+    with patch("hermes_cli.models.validate_requested_model") as validate, \
+         patch("hermes_cli.model_switch.get_model_info", return_value=None) as get_info, \
+         patch("hermes_cli.model_switch.get_model_capabilities", return_value=None) as get_caps, \
+         patch("hermes_cli.runtime_provider.resolve_runtime_provider", return_value={
+             "api_key": "new-key",
+             "base_url": "https://api.example/v1",
+             "api_mode": "chat_completions",
+         }):
+        result = switch_model(
+            raw_input="registered-model",
+            current_provider="old-provider",
+            current_model="old-model",
+            explicit_provider="openrouter",
+            trusted_selection=True,
+        )
+
+    assert result.success is True
+    validate.assert_not_called()
+    get_info.assert_called_once_with(
+        result.target_provider,
+        result.new_model,
+        allow_network=False,
+    )
+    get_caps.assert_called_once_with(
+        result.target_provider,
+        result.new_model,
+        allow_network=False,
+    )
+
+
 def test_typed_configured_model_routes_away_from_openai_codex():
     """The core repro: a model declared under ``providers.<slug>`` typed while
     on ``openai-codex`` routes to the configured provider, not Codex."""

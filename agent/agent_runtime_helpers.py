@@ -1663,6 +1663,7 @@ def switch_model(
     base_url='',
     api_mode='',
     relay_provider='',
+    route_only=False,
 ):
     """Switch the model/provider in-place for a live agent.
 
@@ -1670,7 +1671,8 @@ def switch_model(
     ``model_switch.switch_model()`` has resolved credentials and
     validated the model.  This method performs the actual runtime
     swap: rebuilding clients, updating caching flags, and refreshing
-    the context compressor.
+    the context compressor. Registered UI switches may use ``route_only``
+    to preserve conversation context while replacing the request route.
 
     The implementation mirrors ``_try_activate_fallback()`` for the
     client-swap logic but also updates ``_primary_runtime`` so the
@@ -1908,35 +1910,42 @@ def switch_model(
     )
 
     # ── LM Studio: preload before probing context length ──
-    agent._ensure_lmstudio_runtime_loaded()
+    # Route-only UI switches defer model loading to the next actual request.
+    if not route_only:
+        agent._ensure_lmstudio_runtime_loaded()
 
     # ── Update context compressor ──
     if hasattr(agent, "context_compressor") and agent.context_compressor:
-        from agent.model_metadata import get_model_context_length
-        # Re-read custom_providers from live config so per-model
-        # context_length overrides are honored when switching to a
-        # custom provider mid-session (closes #15779).
-        _sm_custom_providers = None
-        try:
-            from hermes_cli.config import load_config, get_compatible_custom_providers
-            _sm_cfg = load_config()
-            _sm_custom_providers = get_compatible_custom_providers(_sm_cfg)
-        except Exception:
-            _sm_custom_providers = None
-        # ``agent.api_key`` may be a callable (Azure Foundry Entra ID
-        # token provider). ``get_model_context_length`` expects a
-        # string for its live-probe paths; for Foundry the context
-        # length normally resolves via config or static catalogs and
-        # never hits a probe, but coerce to empty string defensively.
-        _ctx_api_key = agent.api_key if isinstance(agent.api_key, str) else ""
-        new_context_length = get_model_context_length(
-            agent.model,
-            base_url=agent.base_url,
-            api_key=_ctx_api_key,
-            provider=agent.provider,
-            config_context_length=getattr(agent, "_config_context_length", None),
-            custom_providers=_sm_custom_providers,
+        new_context_length = (
+            agent.context_compressor.context_length if route_only else None
         )
+        if new_context_length is None:
+            from agent.model_metadata import get_model_context_length
+
+            # Re-read custom_providers from live config so per-model
+            # context_length overrides are honored when switching to a
+            # custom provider mid-session (closes #15779).
+            _sm_custom_providers = None
+            try:
+                from hermes_cli.config import load_config, get_compatible_custom_providers
+                _sm_cfg = load_config()
+                _sm_custom_providers = get_compatible_custom_providers(_sm_cfg)
+            except Exception:
+                _sm_custom_providers = None
+            # ``agent.api_key`` may be a callable (Azure Foundry Entra ID
+            # token provider). ``get_model_context_length`` expects a
+            # string for its live-probe paths; for Foundry the context
+            # length normally resolves via config or static catalogs and
+            # never hits a probe, but coerce to empty string defensively.
+            _ctx_api_key = agent.api_key if isinstance(agent.api_key, str) else ""
+            new_context_length = get_model_context_length(
+                agent.model,
+                base_url=agent.base_url,
+                api_key=_ctx_api_key,
+                provider=agent.provider,
+                config_context_length=getattr(agent, "_config_context_length", None),
+                custom_providers=_sm_custom_providers,
+            )
         agent.context_compressor.update_model(
             model=agent.model,
             context_length=new_context_length,
@@ -1950,8 +1959,10 @@ def switch_model(
         agent._compression_feasibility_checked = False
         agent._compression_prepare_token_cap = None
 
-    # ── Invalidate cached system prompt so it rebuilds next turn ──
-    agent._cached_system_prompt = None
+    # CLI switches refresh route metadata embedded in the prompt. Route-only UI
+    # switches keep the established conversation prompt unchanged.
+    if not route_only:
+        agent._cached_system_prompt = None
 
     # ── Update _primary_runtime so the change persists across turns ──
     _cc = agent.context_compressor if hasattr(agent, "context_compressor") and agent.context_compressor else None
