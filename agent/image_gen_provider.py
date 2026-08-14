@@ -49,18 +49,23 @@ import base64
 import datetime
 import logging
 import math
+import re
 import uuid
+from decimal import Decimal, InvalidOperation
+from fractions import Fraction
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
-
-# Canonical ratios are exact strings so a user request can survive provider
-# routing without being confused with a provider-specific "portrait" preset.
-VALID_ASPECT_RATIOS: Tuple[str, ...] = (
-    "1:1", "3:4", "2:3", "4:3", "3:2", "16:9", "9:16",
+ASPECT_RATIO_PATTERN = r"\s*\+?(?:\d+(?:\.\d*)?|\.\d+)\s*:\s*\+?(?:\d+(?:\.\d*)?|\.\d+)\s*"
+_ASPECT_RATIO_RE = re.compile(
+    r"\s*([+]?(?:\d+(?:\.\d*)?|\.\d+))\s*:\s*"
+    r"([+]?(?:\d+(?:\.\d*)?|\.\d+))\s*"
 )
+
+# Ratios are canonicalized as reduced width:height strings so a user request can
+# survive provider routing without being confused with a directional preset.
 DEFAULT_ASPECT_RATIO = "16:9"
 VALID_RESOLUTIONS: Tuple[str, ...] = ("1K", "2K", "4K")
 DEFAULT_RESOLUTION = "2K"
@@ -210,15 +215,26 @@ class ImageGenProvider(abc.ABC):
 
 
 def canonical_aspect_ratio(value: object) -> Optional[str]:
-    """Return the canonical ratio for a supported value, or ``None``."""
+    """Return a reduced positive width:height ratio, or ``None`` when invalid."""
     if not isinstance(value, str):
         return None
     normalized = value.strip().lower()
+    if len(normalized) > 64:
+        return None
     if normalized in _LEGACY_ASPECT_RATIO_ALIASES:
         return _LEGACY_ASPECT_RATIO_ALIASES[normalized]
-    if normalized in VALID_ASPECT_RATIOS:
-        return normalized
-    return None
+    match = _ASPECT_RATIO_RE.fullmatch(normalized)
+    if match is None:
+        return None
+    try:
+        width = Decimal(match.group(1))
+        height = Decimal(match.group(2))
+    except InvalidOperation:
+        return None
+    if not width.is_finite() or not height.is_finite() or width <= 0 or height <= 0:
+        return None
+    ratio = Fraction(width) / Fraction(height)
+    return f"{ratio.numerator}:{ratio.denominator}"
 
 
 def resolve_aspect_ratio(value: Optional[str]) -> str:
@@ -234,9 +250,10 @@ def resolve_aspect_ratio(value: Optional[str]) -> str:
 
 def aspect_ratio_value(value: str) -> float:
     """Return a ratio's numeric width/height value for nearest-ratio selection."""
-    width, separator, height = value.partition(":")
-    if not separator or not width.isdigit() or not height.isdigit() or int(height) <= 0:
+    canonical = canonical_aspect_ratio(value)
+    if canonical is None:
         raise ValueError(f"Invalid aspect ratio: {value!r}")
+    width, height = canonical.split(":", 1)
     return int(width) / int(height)
 
 
@@ -244,12 +261,10 @@ def nearest_aspect_ratio(value: str, supported: Tuple[str, ...]) -> str:
     """Choose the mathematically nearest supported canonical ratio."""
     if not supported:
         raise ValueError("At least one supported aspect ratio is required")
-    requested = resolve_aspect_ratio(value)
+    requested_value = aspect_ratio_value(resolve_aspect_ratio(value))
     return min(
         supported,
-        key=lambda candidate: abs(
-            aspect_ratio_value(requested) - aspect_ratio_value(candidate)
-        ),
+        key=lambda candidate: abs(requested_value - aspect_ratio_value(candidate)),
     )
 
 

@@ -71,9 +71,9 @@ from tools.tool_backend_helpers import (
     prefers_gateway,
 )
 from agent.image_gen_provider import (
+    ASPECT_RATIO_PATTERN,
     DEFAULT_ASPECT_RATIO,
     DEFAULT_RESOLUTION,
-    VALID_ASPECT_RATIOS,
     VALID_RESOLUTIONS,
     resolve_resolution,
     nearest_aspect_ratio,
@@ -1284,14 +1284,12 @@ IMAGE_GENERATE_SCHEMA = {
             },
             "aspect_ratio": {
                 "type": "string",
-                "enum": list(VALID_ASPECT_RATIOS),
+                "pattern": f"^{ASPECT_RATIO_PATTERN}$",
                 "description": (
-                    "Exact output width:height ratio. If the user requests a ratio "
-                    "such as 3:4 or 2:3, pass that exact value. Do not replace it "
-                    "with portrait or another approximation; if the active model "
-                    "cannot express it, the backend uses the nearest supported "
-                    "ratio and reports the effective ratio. Legacy portrait, square, "
-                    "and landscape inputs are accepted by compatibility code only."
+                    "Exact positive output width:height ratio, such as 16:9, 3:4, "
+                    "or 2.35:1. Pass the user's exact ratio rather than replacing it "
+                    "with a preset; the backend maps it to the closest provider-valid "
+                    "output and reports the effective ratio."
                 ),
                 "default": DEFAULT_ASPECT_RATIO,
             },

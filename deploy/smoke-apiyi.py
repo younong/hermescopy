@@ -28,7 +28,6 @@ if str(ROOT) not in sys.path:
 
 from agent.image_gen_provider import (  # noqa: E402
     DEFAULT_RESOLUTION,
-    VALID_ASPECT_RATIOS,
     VALID_RESOLUTIONS,
     resolve_aspect_ratio,
 )
@@ -41,7 +40,6 @@ from agent.image_size import (  # noqa: E402
 from plugins.image_gen.apiyi import ApiyiImageGenProvider  # noqa: E402
 
 DEFAULT_MODELS = ("gpt-image-2-medium", "nano-banana-2")
-_LEGACY_ASPECT_RATIOS = ("landscape", "square", "portrait")
 
 
 def _redact_error(value: Any) -> str:
@@ -140,8 +138,7 @@ def main() -> int:
     parser.add_argument(
         "--aspect-ratio",
         default="square",
-        choices=(*VALID_ASPECT_RATIOS, *_LEGACY_ASPECT_RATIOS),
-        help="Hermes image aspect ratio (canonical ratio or legacy alias).",
+        help="Hermes image width:height ratio or legacy directional alias.",
     )
     parser.add_argument(
         "--resolution",
