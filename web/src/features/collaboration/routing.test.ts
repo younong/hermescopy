@@ -1,6 +1,11 @@
 import { describe, expect, it } from "vitest";
 
-import { directChatSearch, groupChatSearch, parseChatRoute } from "./routing";
+import {
+  directChatSearch,
+  employeeChatSearch,
+  groupChatSearch,
+  parseChatRoute,
+} from "./routing";
 
 describe("collaboration routing", () => {
   it("uses direct resume routes without group state", () => {
@@ -9,8 +14,16 @@ describe("collaboration routing", () => {
     expect(directChatSearch(null)).toBe("");
   });
 
-  it("uses group routes and gives them precedence over stale resume parameters", () => {
-    expect(parseChatRoute("?resume=session-a&group=group-a")).toEqual({
+  it("uses stable employee routes without retaining a session identifier", () => {
+    expect(parseChatRoute("?resume=session-a&employee=employee-a")).toEqual({
+      id: "employee-a",
+      kind: "employee",
+    });
+    expect(employeeChatSearch("employee-a")).toBe("?employee=employee-a");
+  });
+
+  it("uses group routes and gives them precedence over other chat targets", () => {
+    expect(parseChatRoute("?resume=session-a&employee=employee-a&group=group-a")).toEqual({
       id: "group-a",
       kind: "group",
     });
@@ -19,6 +32,10 @@ describe("collaboration routing", () => {
 
   it("does not retain one route's identifier when switching modes", () => {
     expect(parseChatRoute(groupChatSearch("group-a"))).toEqual({ id: "group-a", kind: "group" });
+    expect(parseChatRoute(employeeChatSearch("employee-a"))).toEqual({
+      id: "employee-a",
+      kind: "employee",
+    });
     expect(parseChatRoute(directChatSearch("session-a"))).toEqual({
       id: "session-a",
       kind: "direct",

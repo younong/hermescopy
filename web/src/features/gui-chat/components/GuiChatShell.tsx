@@ -27,7 +27,11 @@ import { LanguageSwitcher } from "@/components/LanguageSwitcher";
 import { CreateGroupDialog } from "@/features/collaboration/components/CreateGroupDialog";
 import { GroupChatView } from "@/features/collaboration/components/GroupChatView";
 import { GroupsSidebar } from "@/features/collaboration/components/GroupsSidebar";
-import { groupChatSearch, parseChatRoute } from "@/features/collaboration/routing";
+import {
+  employeeChatSearch,
+  groupChatSearch,
+  parseChatRoute,
+} from "@/features/collaboration/routing";
 import type { CollaborationGroup } from "@/features/collaboration/types";
 import { ConnectWeChatModal } from "@/features/ilink/ConnectWeChatModal";
 import { PageHeaderContext } from "@/contexts/page-header-context";
@@ -80,17 +84,24 @@ export function GuiChatShell() {
   const [searchParams, setSearchParams] = useSearchParams();
   const routeTarget = parseChatRoute(searchParams);
   const groupId = routeTarget.kind === "group" ? routeTarget.id : null;
+  const employeeRouteId = routeTarget.kind === "employee" ? routeTarget.id : null;
   const resumeSessionId = routeTarget.kind === "direct" ? routeTarget.id : null;
   const mockMode = searchParams.get("mock") === "1";
   const contactsSearch = mockMode ? "?mock=1" : "";
   const workspacePath = location.pathname.replace(/\/$/, "");
+  // Existing browser history still contains the former path-based contact URL.
+  // Remove this redirect after one release cycle has migrated those entries.
+  const legacyEmployeeMatch = workspacePath.match(/^\/chat\/contacts\/([^/]+)$/);
+  const legacyEmployeeId = legacyEmployeeMatch
+    ? decodeURIComponent(legacyEmployeeMatch[1])
+    : null;
+  const employeeId = employeeRouteId ?? legacyEmployeeId;
   const statisticsOpen = workspacePath === "/chat/statistics";
   const filesOpen = workspacePath === "/chat/files";
   const skillsOpen = workspacePath === "/chat/skills";
   const scheduledTasksOpen = workspacePath === "/chat/scheduled-tasks";
-  const contactsMatch = workspacePath.match(/^\/chat\/contacts(?:\/([^/]+))?$/);
-  const contactsOpen = contactsMatch !== null;
-  const selectedEmployeeId = contactsMatch?.[1] ?? null;
+  const contactsOpen = workspacePath === "/chat/contacts" || employeeId !== null;
+  const selectedEmployeeId = employeeId;
   const modelsOpen = workspacePath === "/chat/models";
   const workspacePaneOpen = statisticsOpen || filesOpen || skillsOpen || scheduledTasksOpen || contactsOpen || modelsOpen;
   const [state, dispatch] = useReducer(guiChatReducer, initialGuiChatState);
@@ -138,7 +149,7 @@ export function GuiChatShell() {
   const [createGroupOpen, setCreateGroupOpen] = useState(false);
   const [employees, setEmployees] = useState<Employee[]>([]);
   const [employeeLoadStatus, setEmployeeLoadStatus] = useState<"loading" | "ready" | "error">("loading");
-  const contactTargetRef = useRef<string | null>(null);
+  const employeeRouteTargetRef = useRef<string | null>(null);
   const { authMe, authRequired, ownerKey, ready: authIdentityReady } = useDashboardAuthIdentity();
   const weChatStatus = authMe?.feature_status?.weixin_ilink_connect;
   const weChatReady = Boolean(authMe?.features?.weixin_ilink_connect);
@@ -180,7 +191,17 @@ export function GuiChatShell() {
       : false,
   );
   const mobilePanelOpen = mobilePanelOpenRaw;
-  const activeSessionId = state.historySessionId ?? resumeSessionId;
+  const selectedEmployee = useMemo(
+    () => employees.find((employee) => employee.employee_id === selectedEmployeeId) ?? null,
+    [employees, selectedEmployeeId],
+  );
+  const selectedEmployeeAvailable = selectedEmployee?.chat_eligible === true;
+  const employeeRouteReady = employeeId !== null
+    && employeeLoadStatus === "ready"
+    && selectedEmployeeAvailable;
+  const activeSessionId = groupId || (contactsOpen && !employeeId)
+    ? null
+    : state.storedSessionId ?? state.historySessionId ?? resumeSessionId;
   const forceBottomKey = `${activeSessionId ?? "new"}:${sendScrollNonce}`;
   const closeMobilePanel = useCallback(() => setMobilePanelOpenRaw(false), []);
   const handleActiveSessionChange = useCallback(
@@ -310,11 +331,11 @@ export function GuiChatShell() {
             if (groupIdRef.current) {
               return connection.attachOwner().then(() => null);
             }
-            if (contactsOpenRef.current) {
-              const employeeId = selectedEmployeeIdRef.current;
-              if (!employeeId) return Promise.resolve(null);
+            const employeeId = selectedEmployeeIdRef.current;
+            if (employeeId && employeeRouteTargetRef.current === employeeId) {
               return coordinator.start(null, undefined, { employeeId });
             }
+            if (contactsOpenRef.current) return Promise.resolve(null);
             return coordinator.start(
               coordinator.committedSessionId ??
                 stateRef.current.storedSessionId ??
@@ -329,8 +350,22 @@ export function GuiChatShell() {
   switchCoordinatorRef.current = switchCoordinator;
 
   const connectRoute = useCallback(() => {
-    if (contactsOpen) return;
+    if (contactsOpen && !employeeId) {
+      if (employeeRouteTargetRef.current === null) return;
+      employeeRouteTargetRef.current = null;
+      historyAbortRef.current?.abort();
+      setAttachmentsToQueue([]);
+      reconnectLifecycleRef.current?.cancelRecovery();
+      switchCoordinator.cancel();
+      dispatch({
+        type: "session.selected",
+        generation: switchCoordinator.currentGeneration,
+        sessionId: null,
+      });
+      return;
+    }
     if (groupId) {
+      employeeRouteTargetRef.current = null;
       historyAbortRef.current?.abort();
       setAttachmentsToQueue([]);
       switchCoordinator.cancel();
@@ -343,6 +378,15 @@ export function GuiChatShell() {
     setResumeNotice(null);
     historyAbortRef.current?.abort();
     setAttachmentsToQueue([]);
+    if (employeeId) {
+      if (!employeeRouteReady) return;
+      if (employeeRouteTargetRef.current === employeeId) return;
+      employeeRouteTargetRef.current = employeeId;
+      const generation = switchCoordinator.start(null, undefined, { employeeId });
+      dispatch({ type: "session.selected", generation, sessionId: null });
+      return;
+    }
+    employeeRouteTargetRef.current = null;
     const existingTrace = latencyTraceRef.current;
     const navigationStart = navigationStartedAt();
     const trace = existingTrace ?? startGuiChatLatencyTrace(
@@ -416,22 +460,22 @@ export function GuiChatShell() {
           }
         : undefined,
     );
-  }, [contactsOpen, groupId, mockMode, resumeSessionId, switchCoordinator, updateSearchParams]);
-
-  const startEmployeeTarget = useCallback((employeeId: string) => {
-    contactTargetRef.current = employeeId;
-    const generation = switchCoordinator.start(
-      null,
-      undefined,
-      { employeeId },
-    );
-    dispatch({ type: "session.selected", generation, sessionId: null });
-  }, [switchCoordinator]);
+  }, [
+    contactsOpen,
+    employeeId,
+    employeeRouteReady,
+    groupId,
+    mockMode,
+    resumeSessionId,
+    switchCoordinator,
+    updateSearchParams,
+  ]);
 
   const retryConnection = useCallback(() => {
     setResumeNotice(null);
-    if (contactsOpen && selectedEmployeeId) {
-      startEmployeeTarget(selectedEmployeeId);
+    if (employeeId) {
+      employeeRouteTargetRef.current = null;
+      connectRoute();
       return;
     }
     if (mockMode) {
@@ -439,7 +483,7 @@ export function GuiChatShell() {
       return;
     }
     reconnectLifecycleRef.current?.retryNow();
-  }, [connectRoute, contactsOpen, mockMode, selectedEmployeeId, startEmployeeTarget]);
+  }, [connectRoute, employeeId, mockMode]);
 
   useEffect(() => {
     if (!authIdentityReady) return;
@@ -511,61 +555,37 @@ export function GuiChatShell() {
     });
   }, [refreshGroups, switchScope]);
 
-  const selectedEmployee = useMemo(
-    () => employees.find((employee) => employee.employee_id === selectedEmployeeId) ?? null,
-    [employees, selectedEmployeeId],
-  );
-  const selectedEmployeeAvailable = selectedEmployee?.chat_eligible === true;
+  useEffect(() => {
+    if (!legacyEmployeeId) return;
+    const search = new URLSearchParams(employeeChatSearch(legacyEmployeeId));
+    if (mockMode) search.set("mock", "1");
+    navigate(`/chat?${search.toString()}`, { replace: true });
+  }, [legacyEmployeeId, mockMode, navigate]);
 
   useEffect(() => {
-    if (!contactsOpen) {
-      contactTargetRef.current = null;
-      return;
-    }
-    if (employeeLoadStatus !== "ready") return;
-    if (!selectedEmployeeId) {
-      if (contactTargetRef.current !== null) {
-        contactTargetRef.current = null;
-        historyAbortRef.current?.abort();
-        setAttachmentsToQueue([]);
-        reconnectLifecycleRef.current?.cancelRecovery();
-        switchCoordinator.cancel();
-        dispatch({
-          type: "session.selected",
-          generation: switchCoordinator.currentGeneration,
-          sessionId: null,
-        });
-      }
-      return;
-    }
-    if (!selectedEmployeeAvailable) {
-      contactTargetRef.current = null;
-      navigate(`/chat/contacts${contactsSearch}`, { replace: true });
-      dispatch({ type: "error", message: copy.shell.employeeUnavailable });
-      return;
-    }
-    if (contactTargetRef.current === selectedEmployeeId) return;
+    if (!employeeId || employeeLoadStatus !== "ready" || selectedEmployeeAvailable) return;
+    employeeRouteTargetRef.current = null;
     historyAbortRef.current?.abort();
-    setAttachmentsToQueue([]);
     reconnectLifecycleRef.current?.cancelRecovery();
-    setResumeNotice(null);
-    startEmployeeTarget(selectedEmployeeId);
+    switchCoordinator.cancel();
+    navigate(`/chat/contacts${contactsSearch}`, { replace: true });
+    dispatch({ type: "error", message: copy.shell.employeeUnavailable });
   }, [
-    contactsOpen,
     contactsSearch,
     copy.shell.employeeUnavailable,
+    employeeId,
     employeeLoadStatus,
     navigate,
     selectedEmployeeAvailable,
-    selectedEmployeeId,
-    startEmployeeTarget,
     switchCoordinator,
   ]);
 
-  const pickContact = useCallback((employeeId: string) => {
+  const pickContact = useCallback((nextEmployeeId: string) => {
     closeMobilePanel();
-    navigate(`/chat/contacts/${encodeURIComponent(employeeId)}${contactsSearch}`);
-  }, [closeMobilePanel, contactsSearch, navigate]);
+    const search = new URLSearchParams(employeeChatSearch(nextEmployeeId));
+    if (mockMode) search.set("mock", "1");
+    navigate(`/chat?${search.toString()}`);
+  }, [closeMobilePanel, mockMode, navigate]);
 
   const pickGroup = useCallback((nextGroupId: string) => {
     closeMobilePanel();

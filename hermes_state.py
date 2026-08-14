@@ -774,6 +774,24 @@ CREATE TABLE IF NOT EXISTS sessions (
     )
 );
 
+CREATE TABLE IF NOT EXISTS web_direct_employee_conversations (
+    owner_key TEXT NOT NULL,
+    workspace_root TEXT NOT NULL,
+    employee_id TEXT NOT NULL,
+    root_session_id TEXT,
+    binding_epoch INTEGER NOT NULL DEFAULT 1 CHECK(binding_epoch > 0),
+    reservation_worker_generation INTEGER,
+    tombstoned INTEGER NOT NULL DEFAULT 0 CHECK(tombstoned IN (0, 1)),
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL,
+    tombstoned_at REAL,
+    PRIMARY KEY(owner_key, workspace_root, employee_id),
+    CHECK(
+        (tombstoned = 0 AND length(trim(root_session_id)) > 0) OR
+        (tombstoned = 1 AND root_session_id IS NULL)
+    )
+);
+
 CREATE TABLE IF NOT EXISTS messages (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     session_id TEXT NOT NULL REFERENCES sessions(id),
@@ -2596,6 +2614,260 @@ class SessionDB(SessionQueryMixin):
 
         self._execute_write(_do)
 
+    @staticmethod
+    def _web_direct_employee_binding_key(
+        *, owner_key: str, workspace_root: str, employee_id: str
+    ) -> tuple[str, str, str]:
+        key = tuple(str(value or "").strip() for value in (
+            owner_key,
+            workspace_root,
+            employee_id,
+        ))
+        if not all(key):
+            raise ValueError("web direct employee binding scope is incomplete")
+        return key
+
+    def claim_web_direct_employee_conversation(
+        self,
+        *,
+        owner_key: str,
+        workspace_root: str,
+        employee_id: str,
+        proposed_session_id: str,
+        worker_generation: int,
+    ) -> Dict[str, Any]:
+        """Atomically return or reserve one durable conversation for an employee.
+
+        A reservation intentionally does not require a ``sessions`` row. This keeps
+        opening a contact lazy while still making concurrent opens converge on one
+        stored ID. A reservation left by an older worker generation is replaceable;
+        a persisted conversation is permanent until explicit deletion tombstones it.
+        """
+        owner_key, workspace_root, employee_id = self._web_direct_employee_binding_key(
+            owner_key=owner_key,
+            workspace_root=workspace_root,
+            employee_id=employee_id,
+        )
+        proposed_session_id = str(proposed_session_id or "").strip()
+        if not proposed_session_id:
+            raise ValueError("proposed employee session id is required")
+        try:
+            worker_generation = int(worker_generation)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("employee reservation worker generation is invalid") from exc
+        if worker_generation <= 0:
+            raise ValueError("employee reservation worker generation is invalid")
+
+        def _do(conn):
+            now = time.time()
+            binding = conn.execute(
+                """SELECT * FROM web_direct_employee_conversations
+                   WHERE owner_key = ? AND workspace_root = ? AND employee_id = ?""",
+                (owner_key, workspace_root, employee_id),
+            ).fetchone()
+            if binding is None:
+                # Upgrade adoption runs only before a binding (including a
+                # tombstone) has ever existed, so deleting a contact conversation
+                # can never rediscover an older row.
+                legacy = conn.execute(
+                    """SELECT id FROM sessions
+                       WHERE owner_key = ? AND workspace_root = ?
+                         AND typeof(worker_generation) = 'integer'
+                         AND worker_generation > 0
+                         AND source = 'dashboard-gui'
+                         AND visibility = 'visible'
+                         AND session_kind = 'conversation'
+                         AND json_extract(
+                               COALESCE(model_config, '{}'),
+                               '$.hermes_web_direct_employee_id'
+                             ) = ?
+                         AND json_extract(
+                               COALESCE(model_config, '{}'),
+                               '$.hermes_employee_policy.employee_id'
+                             ) = ?
+                         AND json_extract(
+                               COALESCE(model_config, '{}'), '$._branched_from'
+                             ) IS NULL
+                         AND json_extract(
+                               COALESCE(model_config, '{}'), '$._delegate_from'
+                             ) IS NULL
+                         AND COALESCE(source, '') != 'tool'
+                       ORDER BY COALESCE(
+                           (SELECT MAX(timestamp) FROM messages WHERE session_id = sessions.id),
+                           started_at
+                       ) DESC, started_at DESC, id DESC
+                       LIMIT 1""",
+                    (owner_key, workspace_root, employee_id, employee_id),
+                ).fetchone()
+                root_session_id = str(legacy["id"]) if legacy else proposed_session_id
+                reservation_generation = None if legacy else worker_generation
+                conn.execute(
+                    """INSERT INTO web_direct_employee_conversations (
+                           owner_key, workspace_root, employee_id, root_session_id,
+                           binding_epoch, reservation_worker_generation, tombstoned,
+                           created_at, updated_at, tombstoned_at
+                       ) VALUES (?, ?, ?, ?, 1, ?, 0, ?, ?, NULL)""",
+                    (
+                        owner_key,
+                        workspace_root,
+                        employee_id,
+                        root_session_id,
+                        reservation_generation,
+                        now,
+                        now,
+                    ),
+                )
+                state = "adopted" if legacy else "reserved"
+            else:
+                root_session_id = str(binding["root_session_id"] or "")
+                epoch = int(binding["binding_epoch"])
+                if binding["tombstoned"]:
+                    root_session_id = proposed_session_id
+                    conn.execute(
+                        """UPDATE web_direct_employee_conversations
+                           SET root_session_id = ?,
+                               reservation_worker_generation = ?, tombstoned = 0,
+                               updated_at = ?, tombstoned_at = NULL
+                           WHERE owner_key = ? AND workspace_root = ? AND employee_id = ?""",
+                        (
+                            root_session_id,
+                            worker_generation,
+                            now,
+                            owner_key,
+                            workspace_root,
+                            employee_id,
+                        ),
+                    )
+                    state = "reserved"
+                else:
+                    persisted = conn.execute(
+                        """SELECT 1 FROM sessions
+                           WHERE id = ? AND owner_key = ? AND workspace_root = ?
+                             AND visibility = 'visible'
+                             AND session_kind = 'conversation'
+                             AND json_extract(
+                                   COALESCE(model_config, '{}'),
+                                   '$.hermes_web_direct_employee_id'
+                                 ) = ?
+                             AND json_extract(
+                                   COALESCE(model_config, '{}'), '$._branched_from'
+                                 ) IS NULL
+                             AND json_extract(
+                                   COALESCE(model_config, '{}'), '$._delegate_from'
+                                 ) IS NULL
+                             AND COALESCE(source, '') != 'tool'
+                           LIMIT 1""",
+                        (root_session_id, owner_key, workspace_root, employee_id),
+                    ).fetchone()
+                    reservation_generation = binding["reservation_worker_generation"]
+                    if persisted is None and reservation_generation != worker_generation:
+                        root_session_id = proposed_session_id
+                        epoch += 1
+                        conn.execute(
+                            """UPDATE web_direct_employee_conversations
+                               SET root_session_id = ?, binding_epoch = ?,
+                                   reservation_worker_generation = ?, updated_at = ?
+                               WHERE owner_key = ? AND workspace_root = ? AND employee_id = ?""",
+                            (
+                                root_session_id,
+                                epoch,
+                                worker_generation,
+                                now,
+                                owner_key,
+                                workspace_root,
+                                employee_id,
+                            ),
+                        )
+                        state = "reserved"
+                    else:
+                        state = "persisted" if persisted else "reserved"
+
+            row = conn.execute(
+                """SELECT * FROM web_direct_employee_conversations
+                   WHERE owner_key = ? AND workspace_root = ? AND employee_id = ?""",
+                (owner_key, workspace_root, employee_id),
+            ).fetchone()
+            result = dict(row)
+            result["state"] = state
+            return result
+
+        return self._execute_write(_do)
+
+    def web_direct_employee_binding_matches(
+        self,
+        *,
+        owner_key: str,
+        workspace_root: str,
+        employee_id: str,
+        root_session_id: str,
+        binding_epoch: int,
+    ) -> bool:
+        """Fence stale live runtimes after deletion or reservation replacement."""
+        owner_key, workspace_root, employee_id = self._web_direct_employee_binding_key(
+            owner_key=owner_key,
+            workspace_root=workspace_root,
+            employee_id=employee_id,
+        )
+        with self._lock:
+            row = self._conn.execute(
+                """SELECT 1 FROM web_direct_employee_conversations
+                   WHERE owner_key = ? AND workspace_root = ? AND employee_id = ?
+                     AND root_session_id = ? AND binding_epoch = ? AND tombstoned = 0""",
+                (
+                    owner_key,
+                    workspace_root,
+                    employee_id,
+                    str(root_session_id or ""),
+                    int(binding_epoch),
+                ),
+            ).fetchone()
+        return row is not None
+
+    def _tombstone_web_direct_employee_bindings(
+        self, conn, session_ids: List[str]
+    ) -> None:
+        """Tombstone bindings whose compression lineage is explicitly deleted."""
+        if not session_ids:
+            return
+        placeholders = ",".join("?" for _ in session_ids)
+        now = time.time()
+        conn.execute(
+            f"""
+            WITH RECURSIVE
+              seeds(id) AS (
+                SELECT id FROM sessions WHERE id IN ({placeholders})
+              ),
+              ancestors(id) AS (
+                SELECT id FROM seeds
+                UNION
+                SELECT parent.id
+                FROM ancestors a
+                JOIN sessions child ON child.id = a.id
+                JOIN sessions parent ON parent.id = child.parent_session_id
+                WHERE parent.end_reason = 'compression'
+              ),
+              descendants(id) AS (
+                SELECT id FROM seeds
+                UNION
+                SELECT child.id
+                FROM descendants d
+                JOIN sessions parent ON parent.id = d.id
+                JOIN sessions child ON child.parent_session_id = parent.id
+                WHERE parent.end_reason = 'compression'
+              ),
+              lineage(id) AS (
+                SELECT id FROM ancestors
+                UNION
+                SELECT id FROM descendants
+              )
+            UPDATE web_direct_employee_conversations
+            SET root_session_id = NULL, binding_epoch = binding_epoch + 1,
+                reservation_worker_generation = NULL, tombstoned = 1,
+                updated_at = ?, tombstoned_at = ?
+            WHERE tombstoned = 0 AND root_session_id IN (SELECT id FROM lineage)
+            """,
+            (*session_ids, now, now),
+        )
 
     def find_resume_recovery_scope(self, session_id_or_title: str) -> Optional[Dict[str, Any]]:
         """Resolve a resume selector to its minimal persisted scope record.
@@ -4646,6 +4918,7 @@ class SessionDB(SessionQueryMixin):
                 scope_params=scope_params,
             ):
                 return False
+            self._tombstone_web_direct_employee_bindings(conn, [session_id])
             removed_delegate_ids.extend(
                 _delete_delegate_children(
                     conn,
@@ -4692,22 +4965,24 @@ class SessionDB(SessionQueryMixin):
         flushed. Returns True if the session was deleted.
         """
         def _do(conn):
-            cursor = conn.execute(
-                """
-                DELETE FROM sessions
-                WHERE id = ?
-                  AND title IS NULL
-                  AND NOT EXISTS (
-                      SELECT 1 FROM messages WHERE messages.session_id = sessions.id
-                  )
-                  AND NOT EXISTS (
-                      SELECT 1 FROM sessions child
-                      WHERE child.parent_session_id = sessions.id
-                  )
-                """,
+            exists = conn.execute(
+                """SELECT 1 FROM sessions
+                   WHERE id = ?
+                     AND title IS NULL
+                     AND NOT EXISTS (
+                         SELECT 1 FROM messages WHERE messages.session_id = sessions.id
+                     )
+                     AND NOT EXISTS (
+                         SELECT 1 FROM sessions child
+                         WHERE child.parent_session_id = sessions.id
+                     )""",
                 (session_id,),
-            )
-            return cursor.rowcount > 0
+            ).fetchone()
+            if exists is None:
+                return False
+            self._tombstone_web_direct_employee_bindings(conn, [session_id])
+            conn.execute("DELETE FROM sessions WHERE id = ?", (session_id,))
+            return True
 
         deleted = self._execute_write(_do)
         if deleted:
@@ -4782,6 +5057,7 @@ class SessionDB(SessionQueryMixin):
                 return 0
 
             existing_placeholders = ",".join("?" * len(existing))
+            self._tombstone_web_direct_employee_bindings(conn, existing)
             removed_delegate_ids.extend(
                 _delete_delegate_children(
                     conn,
@@ -4877,6 +5153,7 @@ class SessionDB(SessionQueryMixin):
                 return 0
 
             placeholders = ",".join("?" * len(session_ids))
+            self._tombstone_web_direct_employee_bindings(conn, session_ids)
             conn.execute(
                 f"UPDATE sessions AS child SET parent_session_id = NULL "
                 f"WHERE child.parent_session_id IN ({placeholders})"
@@ -4947,6 +5224,7 @@ class SessionDB(SessionQueryMixin):
 
             # Orphan any in-scope sessions whose parent is about to be deleted.
             placeholders = ",".join("?" * len(session_ids))
+            self._tombstone_web_direct_employee_bindings(conn, session_ids)
             conn.execute(
                 f"UPDATE sessions AS child SET parent_session_id = NULL "
                 f"WHERE child.parent_session_id IN ({placeholders})"
