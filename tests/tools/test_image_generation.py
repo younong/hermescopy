@@ -54,10 +54,12 @@ class TestFalCatalog:
             assert meta["size_style"] in valid, \
                 f"{mid} has invalid size_style: {meta['size_style']}"
 
-    def test_sizes_cover_all_aspect_ratios(self, image_tool):
+    def test_sizes_use_valid_aspect_ratios(self, image_tool):
         for mid, meta in image_tool.FAL_MODELS.items():
-            assert set(meta["sizes"]).issubset(set(image_tool.VALID_ASPECT_RATIOS)), \
-                f"{mid} has a non-canonical aspect_ratio key"
+            assert all(
+                image_tool.resolve_aspect_ratio(aspect) == aspect
+                for aspect in meta["sizes"]
+            ), f"{mid} has a non-canonical aspect_ratio key"
 
     def test_supports_is_a_set(self, image_tool):
         for mid, meta in image_tool.FAL_MODELS.items():
@@ -376,9 +378,11 @@ class TestRegistryIntegration:
         assert props["resolution"]["default"] == "2K"
         assert image_tool.IMAGE_GENERATE_SCHEMA["parameters"]["required"] == ["prompt"]
 
-    def test_aspect_ratio_enum_is_canonical(self, image_tool):
-        enum = image_tool.IMAGE_GENERATE_SCHEMA["parameters"]["properties"]["aspect_ratio"]["enum"]
-        assert set(enum) == set(image_tool.VALID_ASPECT_RATIOS)
+    def test_aspect_ratio_schema_accepts_custom_ratios(self, image_tool):
+        aspect = image_tool.IMAGE_GENERATE_SCHEMA["parameters"]["properties"]["aspect_ratio"]
+        assert "enum" not in aspect
+        assert "2.35:1" in aspect["description"]
+        assert aspect["default"] == "16:9"
 
 
 # ---------------------------------------------------------------------------

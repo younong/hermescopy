@@ -30,9 +30,19 @@ class ImageNativeSize:
 
 
 @dataclass(frozen=True)
+class ImageCustomSizeConstraints:
+    step: int
+    min_pixels: int
+    max_pixels: int
+    max_side: int
+    max_aspect_ratio: float
+
+
+@dataclass(frozen=True)
 class ImageSizeProfile:
     name: str
     native_sizes: tuple[ImageNativeSize, ...]
+    custom_constraints: ImageCustomSizeConstraints | None = None
 
 
 @dataclass(frozen=True)
@@ -81,6 +91,13 @@ class ActualImageInfo:
 
 GPT_IMAGE_2_SIZE_PROFILE = ImageSizeProfile(
     name="gpt-image-2",
+    custom_constraints=ImageCustomSizeConstraints(
+        step=16,
+        min_pixels=655_360,
+        max_pixels=8_294_400,
+        max_side=3840,
+        max_aspect_ratio=3.0,
+    ),
     native_sizes=tuple(
         ImageNativeSize(aspect_ratio, resolution, width, height)
         for resolution, sizes in (
@@ -121,13 +138,86 @@ def image_size_profile(name: str) -> ImageSizeProfile:
         raise ValueError(f"Unknown image size profile: {name!r}") from exc
 
 
+def _custom_size_for_aspect(
+    aspect_ratio: str,
+    *,
+    target_long_side: int,
+    constraints: ImageCustomSizeConstraints,
+) -> tuple[str, int, int]:
+    requested_value = aspect_ratio_value(aspect_ratio)
+    target_value = min(
+        max(requested_value, 1 / constraints.max_aspect_ratio),
+        constraints.max_aspect_ratio,
+    )
+    effective_aspect = (
+        aspect_ratio
+        if target_value == requested_value
+        else aspect_ratio_from_dimensions(
+            int(constraints.max_aspect_ratio),
+            1,
+        ) if requested_value > 1 else aspect_ratio_from_dimensions(
+            1,
+            int(constraints.max_aspect_ratio),
+        )
+    )
+    landscape = target_value >= 1
+    long_to_short = target_value if landscape else 1 / target_value
+    min_long_side = max(
+        constraints.step,
+        int((constraints.min_pixels * long_to_short) ** 0.5),
+    )
+    max_long_side = min(
+        constraints.max_side,
+        int((constraints.max_pixels * long_to_short) ** 0.5),
+    )
+    min_long_side = max(
+        constraints.step,
+        (min_long_side // constraints.step - 1) * constraints.step,
+    )
+    max_long_side = min(
+        constraints.max_side,
+        (max_long_side // constraints.step + 1) * constraints.step,
+    )
+    best: tuple[float, int, int] | None = None
+    for long_side in range(min_long_side, max_long_side + 1, constraints.step):
+        rounded_short = round(
+            long_side / long_to_short / constraints.step
+        ) * constraints.step
+        for short_side in range(
+            rounded_short - constraints.step,
+            rounded_short + constraints.step * 2,
+            constraints.step,
+        ):
+            if short_side <= 0 or short_side > long_side:
+                continue
+            pixels = long_side * short_side
+            if not constraints.min_pixels <= pixels <= constraints.max_pixels:
+                continue
+            actual_value = long_side / short_side
+            if actual_value > constraints.max_aspect_ratio:
+                continue
+            score = (
+                abs(long_side - target_long_side) / target_long_side
+                + 2 * abs(actual_value - long_to_short) / long_to_short
+            )
+            width, height = (
+                (long_side, short_side) if landscape else (short_side, long_side)
+            )
+            candidate = (score, width, height)
+            if best is None or candidate < best:
+                best = candidate
+    if best is None:
+        raise ValueError(f"No valid image size for aspect ratio {aspect_ratio}")
+    return effective_aspect, best[1], best[2]
+
+
 def resolve_image_size(
     aspect_ratio: str | None,
     resolution: str | None,
     *,
     profile: ImageSizeProfile,
 ) -> ImageSizePlan:
-    """Resolve a unified request to one provider-native fixed output size."""
+    """Resolve a unified request to a provider-valid output size."""
     requested_aspect = resolve_aspect_ratio(aspect_ratio)
     requested_resolution = resolve_resolution(resolution)
     resolutions = tuple(dict.fromkeys(item.resolution for item in profile.native_sizes))
@@ -141,13 +231,33 @@ def resolve_image_size(
         item for item in profile.native_sizes
         if item.resolution == effective_resolution
     )
-    effective_aspect = nearest_aspect_ratio(
-        requested_aspect,
-        tuple(item.aspect_ratio for item in candidates),
-    )
     native = next(
-        item for item in candidates if item.aspect_ratio == effective_aspect
+        (item for item in candidates if item.aspect_ratio == requested_aspect),
+        None,
     )
+    if native is not None:
+        effective_aspect = requested_aspect
+        width, height = native.width, native.height
+    elif profile.custom_constraints is not None:
+        nearest = nearest_aspect_ratio(
+            requested_aspect,
+            tuple(item.aspect_ratio for item in candidates),
+        )
+        target = next(item for item in candidates if item.aspect_ratio == nearest)
+        effective_aspect, width, height = _custom_size_for_aspect(
+            requested_aspect,
+            target_long_side=max(target.width, target.height),
+            constraints=profile.custom_constraints,
+        )
+    else:
+        effective_aspect = nearest_aspect_ratio(
+            requested_aspect,
+            tuple(item.aspect_ratio for item in candidates),
+        )
+        native = next(
+            item for item in candidates if item.aspect_ratio == effective_aspect
+        )
+        width, height = native.width, native.height
     mode: ResolutionMode = (
         "native"
         if effective_aspect == requested_aspect
@@ -160,8 +270,8 @@ def resolve_image_size(
         requested_resolution=requested_resolution,
         effective_resolution=effective_resolution,
         resolution_mode=mode,
-        width=native.width,
-        height=native.height,
+        width=width,
+        height=height,
     )
 
 

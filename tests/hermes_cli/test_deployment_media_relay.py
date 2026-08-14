@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 from PIL import Image
 
-from agent.image_gen_provider import VALID_ASPECT_RATIOS
+from agent.image_gen_provider import canonical_aspect_ratio
 from agent.transcription_provider import TranscriptionProvider
 from agent.tts_provider import TTSProvider
 from hermes_cli.dashboard_auth.authority import (
@@ -91,6 +91,7 @@ def _fake_executor(**kwargs):
         "2:3": (300, 450), "4:3": (400, 300),
         "3:2": (450, 300), "16:9": (480, 270),
         "landscape": (480, 270), "9:16": (270, 480),
+        "47:20": (470, 200),
     }[aspect]
     return {
         "image_bytes": _png_bytes(dimensions),
@@ -408,7 +409,7 @@ def test_relay_requires_active_exact_lease_and_returns_bytes(tmp_path):
 
 @pytest.mark.parametrize(
     "aspect_ratio",
-    [*VALID_ASPECT_RATIOS, "landscape", "square", "portrait"],
+    ["16:9", "3:4", "2.35:1", "landscape", "square", "portrait"],
 )
 def test_relay_accepts_supported_image_aspect_ratios(tmp_path, aspect_ratio):
     store = AuthorityStore(tmp_path)
@@ -424,7 +425,7 @@ def test_relay_accepts_supported_image_aspect_ratios(tmp_path, aspect_ratio):
         active,
         _request(policy, aspect_ratio=aspect_ratio),
     )
-    assert result["aspect_ratio"] in VALID_ASPECT_RATIOS
+    assert result["aspect_ratio"] == canonical_aspect_ratio(aspect_ratio)
     broker.close()
 
 

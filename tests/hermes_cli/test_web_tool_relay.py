@@ -9,7 +9,7 @@ from pathlib import Path
 
 import pytest
 
-from agent.image_gen_provider import VALID_ASPECT_RATIOS, VALID_RESOLUTIONS
+from agent.image_gen_provider import VALID_RESOLUTIONS
 from hermes_cli.authenticated_file_context import AuthenticatedWorkspaceContext
 from hermes_cli.controlled_roots import controlled_roots_for
 from hermes_cli.dashboard_auth.authority import OwnerWorkerAuthorityLease, WorkerLeaseState
@@ -499,7 +499,7 @@ def test_owner_relay_dispatches_canonical_image_generation():
 
 @pytest.mark.parametrize(
     "aspect_ratio",
-    [*VALID_ASPECT_RATIOS, "landscape", "square", "portrait"],
+    ["16:9", "3:4", "2.35:1", "landscape", "square", "portrait"],
 )
 def test_owner_relay_accepts_supported_image_aspect_ratios(aspect_ratio):
     broker = OwnerToolRelayBroker(

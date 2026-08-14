@@ -3,7 +3,7 @@ import io
 import pytest
 from PIL import Image
 
-from agent.image_gen_provider import VALID_ASPECT_RATIOS, VALID_RESOLUTIONS
+from agent.image_gen_provider import VALID_RESOLUTIONS, canonical_aspect_ratio
 from agent.image_size import (
     GPT_IMAGE_2_SIZE_PROFILE,
     image_prompt_with_size_requirements,
@@ -32,15 +32,16 @@ def test_gpt_image_2_profile_preserves_requested_ratio_and_resolution():
     assert plan.size == "1536x2048"
 
 
-def test_gpt_image_2_profile_covers_all_unified_ratios_and_resolutions():
+def test_gpt_image_2_profile_covers_native_ratio_resolution_pairs():
     native_pairs = {
         (size.aspect_ratio, size.resolution)
         for size in GPT_IMAGE_2_SIZE_PROFILE.native_sizes
     }
 
+    native_aspects = {size.aspect_ratio for size in GPT_IMAGE_2_SIZE_PROFILE.native_sizes}
     assert native_pairs == {
         (aspect_ratio, resolution)
-        for aspect_ratio in VALID_ASPECT_RATIOS
+        for aspect_ratio in native_aspects
         for resolution in VALID_RESOLUTIONS
     }
     for aspect_ratio, resolution in native_pairs:
@@ -50,6 +51,48 @@ def test_gpt_image_2_profile_covers_all_unified_ratios_and_resolutions():
         assert plan.effective_aspect_ratio == aspect_ratio
         assert plan.effective_resolution == resolution
         assert plan.resolution_mode == "native"
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        ("2.35:1", "47:20"),
+        (" 21 : 9 ", "7:3"),
+        ("4:4", "1:1"),
+        ("portrait", "3:4"),
+    ],
+)
+def test_canonical_aspect_ratio_accepts_arbitrary_positive_ratios(value, expected):
+    assert canonical_aspect_ratio(value) == expected
+
+
+@pytest.mark.parametrize("value", ["", "wide", "0:1", "1:0", "-1:2", "1/2"])
+def test_canonical_aspect_ratio_rejects_invalid_values(value):
+    assert canonical_aspect_ratio(value) is None
+
+
+def test_gpt_image_2_profile_computes_provider_valid_custom_size():
+    plan = resolve_image_size(
+        "2.35:1", "4K", profile=GPT_IMAGE_2_SIZE_PROFILE
+    )
+
+    assert plan.requested_aspect_ratio == "47:20"
+    assert plan.effective_resolution == "4K"
+    assert plan.width % 16 == plan.height % 16 == 0
+    assert max(plan.width, plan.height) <= 3840
+    assert 655_360 <= plan.width * plan.height <= 8_294_400
+    assert max(plan.width / plan.height, plan.height / plan.width) <= 3
+    assert abs(plan.width / plan.height - 2.35) < 0.01
+
+
+def test_gpt_image_2_profile_maps_extreme_ratio_to_api_limit():
+    plan = resolve_image_size(
+        "4:1", "2K", profile=GPT_IMAGE_2_SIZE_PROFILE
+    )
+
+    assert plan.requested_aspect_ratio == "4:1"
+    assert plan.effective_aspect_ratio == "3:1"
+    assert plan.resolution_mode == "mapped"
 
 
 def test_gpt_image_2_profile_preserves_exact_native_tier_and_legacy_alias():
