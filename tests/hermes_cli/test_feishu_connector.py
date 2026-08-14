@@ -142,7 +142,6 @@ def _register(
             "toolsets": [],
             "skills": [],
             "mcp_servers": [],
-            "workspace_relative_path": "employees/researcher",
             "knowledge_relative_paths": [],
             "max_iterations": 20,
         },

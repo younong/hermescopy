@@ -104,7 +104,6 @@ _TOOL_DEFINITIONS = (
                         "items": {"type": "string", "minLength": 1},
                         "uniqueItems": True,
                     },
-                    "workspace_relative_path": {"type": "string", "minLength": 1},
                     "knowledge_relative_paths": {
                         "type": "array",
                         "items": {"type": "string", "minLength": 1},
@@ -122,7 +121,6 @@ _TOOL_DEFINITIONS = (
                     "toolsets",
                     "skills",
                     "mcp_servers",
-                    "workspace_relative_path",
                     "knowledge_relative_paths",
                     "max_iterations",
                     "max_tokens",
@@ -210,7 +208,6 @@ _ALLOWED_ARGS = {
             "toolsets",
             "skills",
             "mcp_servers",
-            "workspace_relative_path",
             "knowledge_relative_paths",
             "max_iterations",
             "max_tokens",

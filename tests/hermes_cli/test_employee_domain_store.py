@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import base64
+import json
+import os
 import sqlite3
 
 import pytest
@@ -15,8 +17,10 @@ from hermes_cli.channel_identity import (
     FeishuCredentialRevisionConflict,
     Keyring,
     create_employee,
+    employee_profile_fingerprint,
     ensure_owner_binding,
     list_employees,
+    reconcile_employee_workspaces,
     register_employee_feishu_binding,
     resolve_employee,
     resolve_employee_feishu_credentials,
@@ -29,6 +33,21 @@ from hermes_cli.channel_identity import (
 )
 from hermes_cli.dashboard_auth.base import Session
 from hermes_cli.dashboard_auth.owner_context import owner_context_from_session
+
+
+def _policy(name="Analyst"):
+    return {
+        "schema_version": 1,
+        "name": name,
+        "role": "Research analyst",
+        "model_registration_id": "registration-a",
+        "system_prompt": "Research carefully.",
+        "toolsets": [],
+        "skills": [],
+        "mcp_servers": [],
+        "knowledge_relative_paths": [],
+        "max_iterations": 20,
+    }
 
 
 def _owner(user_id: str):
@@ -262,9 +281,7 @@ def test_v15_upgrade_backfills_builtin_for_existing_owner(
 def test_employee_crud_profiles_policy_and_owner_security(store):
     owner = _owner("owner-a")
     other = _owner("owner-b")
-    employee = create_employee(
-        store, owner=owner, profile={"name": "Analyst", "tools": ["web"]}
-    )
+    employee = create_employee(store, owner=owner, profile=_policy())
 
     assert employee.employee_id.startswith("emp_")
     assert employee.feishu_binding is None
@@ -292,7 +309,7 @@ def test_employee_crud_profiles_policy_and_owner_security(store):
         store,
         owner=owner,
         employee_id=employee.employee_id,
-        profile={"name": "Senior Analyst"},
+        profile=_policy("Senior Analyst"),
         expected_revision=1,
     )
     assert updated.revision == 2
@@ -301,7 +318,7 @@ def test_employee_crud_profiles_policy_and_owner_security(store):
             store,
             owner=owner,
             employee_id=employee.employee_id,
-            profile={"name": "stale"},
+            profile=_policy("stale"),
             expected_revision=1,
         )
     policy = update_employee_collaboration_policy(
@@ -333,9 +350,154 @@ def test_employee_crud_profiles_policy_and_owner_security(store):
             )
 
 
+def test_employee_workspace_is_unique_stable_and_server_managed(store):
+    owner = _owner("owner-a")
+    first = create_employee(store, owner=owner, profile=_policy("First"))
+    second = create_employee(store, owner=owner, profile=_policy("Second"))
+    first_profile = resolve_employee_profile(
+        store, owner=owner, employee_id=first.employee_id
+    )
+    second_profile = resolve_employee_profile(
+        store, owner=owner, employee_id=second.employee_id
+    )
+
+    first_workspace = f"employees/{first.employee_id}"
+    second_workspace = f"employees/{second.employee_id}"
+    assert first_profile.profile["workspace_relative_path"] == first_workspace
+    assert second_profile.profile["workspace_relative_path"] == second_workspace
+    assert first_workspace != second_workspace
+    assert (owner.host_owner_home / "workspaces" / "default" / first_workspace).is_dir()
+    assert (owner.host_owner_home / "workspaces" / "default" / second_workspace).is_dir()
+
+    updated = update_employee_profile(
+        store,
+        owner=owner,
+        employee_id=first.employee_id,
+        profile=_policy("Updated"),
+        expected_revision=1,
+    )
+    assert updated.profile["workspace_relative_path"] == first_workspace
+    with pytest.raises(ValueError, match="server-managed"):
+        update_employee_profile(
+            store,
+            owner=owner,
+            employee_id=first.employee_id,
+            profile={**_policy("Moved"), "workspace_relative_path": "employees/moved"},
+            expected_revision=2,
+        )
+
+
+def test_employee_workspace_rejects_unsafe_existing_targets(store):
+    owner = _owner("owner-a")
+    employees = owner.host_owner_home / "workspaces" / "default" / "employees"
+    employees.mkdir(mode=0o700, parents=True)
+    if os.name != "nt":
+        owner.host_owner_home.chmod(0o700)
+
+    file_employee_id = "emp_existing_file"
+    (employees / file_employee_id).write_text("not a directory", encoding="utf-8")
+    with pytest.raises(RuntimeError, match="must be a directory"):
+        create_employee(
+            store,
+            owner=owner,
+            employee_id=file_employee_id,
+            profile=_policy(),
+        )
+
+    if os.name != "nt":
+        symlink_employee_id = "emp_existing_symlink"
+        (employees / symlink_employee_id).symlink_to(employees)
+        with pytest.raises(RuntimeError, match="must be a directory"):
+            create_employee(
+                store,
+                owner=owner,
+                employee_id=symlink_employee_id,
+                profile=_policy(),
+            )
+
+
+def test_employee_workspace_is_removed_when_database_commit_fails(store, monkeypatch):
+    owner = _owner("owner-a")
+    employee_id = "emp_failed_commit"
+
+    def fail_profile_insert(*_args, **_kwargs):
+        raise sqlite3.IntegrityError("forced profile failure")
+
+    monkeypatch.setattr(
+        "hermes_cli.channel_identity.employees._insert_profile_revision",
+        fail_profile_insert,
+    )
+
+    with pytest.raises(sqlite3.IntegrityError, match="forced profile failure"):
+        create_employee(
+            store,
+            owner=owner,
+            employee_id=employee_id,
+            profile=_policy(),
+        )
+
+    workspace = owner.host_owner_home / "workspaces" / "default" / "employees" / employee_id
+    assert not workspace.exists()
+    with store.read() as conn:
+        assert conn.execute(
+            "SELECT 1 FROM employees WHERE employee_id=?",
+            (employee_id,),
+        ).fetchone() is None
+
+
+def test_reconcile_legacy_workspace_once_and_preserve_old_revision(store):
+    owner = _owner("owner-a")
+    employee = create_employee(store, owner=owner, profile=_policy())
+    legacy_profile = {
+        **_policy(),
+        "workspace_relative_path": "employees/new-employee",
+    }
+    legacy_payload = json.dumps(
+        legacy_profile,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    legacy_fingerprint = employee_profile_fingerprint(legacy_profile)
+    ciphertext, key_version = store.crypto.encrypt_text(
+        legacy_payload,
+        table="employee_profiles",
+        record_id=f"{employee.employee_id}:1",
+        field="profile",
+    )
+    with store.write() as conn:
+        conn.execute("DROP TRIGGER employee_profiles_identity_immutable")
+        conn.execute(
+            "UPDATE employee_profiles SET profile_ciphertext=?, profile_key_version=?, "
+            "profile_fingerprint=? WHERE employee_id=? AND revision=1",
+            (ciphertext, key_version, legacy_fingerprint, employee.employee_id),
+        )
+        ChannelIdentityStore._execute_schema(conn)
+
+    assert reconcile_employee_workspaces(store) == 1
+    assert reconcile_employee_workspaces(store) == 0
+    current = resolve_employee_profile(
+        store, owner=owner, employee_id=employee.employee_id
+    )
+    historical = resolve_employee_profile(
+        store, owner=owner, employee_id=employee.employee_id, revision=1
+    )
+    assert current.revision == 2
+    assert current.profile["workspace_relative_path"] == f"employees/{employee.employee_id}"
+    assert historical.fingerprint == legacy_fingerprint
+    assert historical.profile["workspace_relative_path"] == "employees/new-employee"
+    assert (
+        owner.host_owner_home
+        / "workspaces"
+        / "default"
+        / "employees"
+        / employee.employee_id
+    ).is_dir()
+
+
 def test_feishu_binding_lifecycle_credentials_and_rebind_are_separate(store):
     owner = _owner("owner-a")
-    employee = create_employee(store, owner=owner, profile={"name": "Analyst"})
+    employee = create_employee(store, owner=owner, profile=_policy())
     first = register_employee_feishu_binding(
         store,
         owner=owner,
@@ -409,7 +571,7 @@ def test_employee_profile_key_version_is_validated(tmp_path, monkeypatch):
         encryption=Keyring(keys={1: b"e" * 32, 2: b"f" * 32}, active_version=2),
     )
     store = ChannelIdentityStore(crypto, tmp_path / "control", global_home=tmp_path)
-    create_employee(store, owner=_owner("owner-a"), profile={"name": "Analyst"})
+    create_employee(store, owner=_owner("owner-a"), profile=_policy())
 
     missing_key_crypto = ChannelCrypto(
         lookup=Keyring(keys={1: b"l" * 32}, active_version=1),

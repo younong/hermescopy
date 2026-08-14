@@ -24,7 +24,6 @@ def _policy(name="Researcher"):
         "toolsets": [],
         "skills": [],
         "mcp_servers": [],
-        "workspace_relative_path": "employees/researcher",
         "knowledge_relative_paths": [],
         "max_iterations": 20,
         "reasoning_effort": "high",
@@ -101,7 +100,18 @@ def test_create_without_channel_and_list_detail_are_owner_scoped(authenticated_c
     assert payload["employee_kind"] == "managed"
     assert payload["protected"] is False
     assert payload["chat_eligible"] is True
-    assert payload["profile"] == {**_policy(), "max_tokens": None}
+    assert payload["profile"] == {
+        **_policy(),
+        "max_tokens": None,
+        "workspace_relative_path": f"employees/{employee_id}",
+    }
+    assert (
+        owner_context_from_session(session).host_owner_home
+        / "workspaces"
+        / "default"
+        / "employees"
+        / employee_id
+    ).is_dir()
     assert payload["channels"] == {}
     assert payload["collaboration_policy"] == {
         "may_participate": True,

@@ -19,6 +19,19 @@ class _Supervisor:
         self.resource_manager = object()
 
 
+def _mock_identity_store(monkeypatch, store):
+    monkeypatch.setattr(
+        connector_bootstrap,
+        "ChannelIdentityStore",
+        lambda *args, **kwargs: store,
+    )
+    monkeypatch.setattr(
+        connector_bootstrap,
+        "reconcile_employee_workspaces",
+        lambda candidate: 0 if candidate is store else pytest.fail("unexpected store"),
+    )
+
+
 @pytest.mark.anyio
 async def test_empty_configuration_initializes_control_plane_store(
     monkeypatch,
@@ -33,6 +46,12 @@ async def test_empty_configuration_initializes_control_plane_store(
     )
     create_store = MagicMock(return_value=store)
     monkeypatch.setattr(connector_bootstrap, "ChannelIdentityStore", create_store)
+    reconcile = MagicMock(return_value=0)
+    monkeypatch.setattr(
+        connector_bootstrap,
+        "reconcile_employee_workspaces",
+        reconcile,
+    )
 
     runtime = await connector_bootstrap.bootstrap_channel_connectors(
         {},
@@ -49,6 +68,7 @@ async def test_empty_configuration_initializes_control_plane_store(
         tmp_path / "control-plane",
         global_home=tmp_path,
     )
+    reconcile.assert_called_once_with(store)
     await runtime.close()
 
 
@@ -121,11 +141,7 @@ async def test_feishu_requires_exactly_one_active_account(monkeypatch, tmp_path)
     read_context.__enter__.return_value = connection
     read_context.__exit__.return_value = False
     store.read.return_value = read_context
-    monkeypatch.setattr(
-        connector_bootstrap,
-        "ChannelIdentityStore",
-        lambda *args, **kwargs: store,
-    )
+    _mock_identity_store(monkeypatch, store)
 
     runtime = await connector_bootstrap.bootstrap_channel_connectors(
         {"feishu": {"enabled": True}},
@@ -155,11 +171,7 @@ async def test_feishu_registers_with_shared_supervisor(monkeypatch, tmp_path):
     read_context.__enter__.return_value = connection
     read_context.__exit__.return_value = False
     store.read.return_value = read_context
-    monkeypatch.setattr(
-        connector_bootstrap,
-        "ChannelIdentityStore",
-        lambda *args, **kwargs: store,
-    )
+    _mock_identity_store(monkeypatch, store)
     constructor = MagicMock(return_value=service)
     monkeypatch.setattr(
         connector_bootstrap,
@@ -212,11 +224,7 @@ async def test_feishu_starts_every_managed_account_with_partial_failure(
     read_context.__enter__.return_value = connection
     read_context.__exit__.return_value = False
     store.read.return_value = read_context
-    monkeypatch.setattr(
-        connector_bootstrap,
-        "ChannelIdentityStore",
-        lambda *args, **kwargs: store,
-    )
+    _mock_identity_store(monkeypatch, store)
     monkeypatch.setattr(
         connector_bootstrap,
         "FeishuConnector",
@@ -260,11 +268,7 @@ async def test_webhook_registers_only_with_active_account(monkeypatch, tmp_path)
     read_context.__enter__.return_value = connection
     read_context.__exit__.return_value = False
     store.read.return_value = read_context
-    monkeypatch.setattr(
-        connector_bootstrap,
-        "ChannelIdentityStore",
-        lambda *args, **kwargs: store,
-    )
+    _mock_identity_store(monkeypatch, store)
     monkeypatch.setattr(
         connector_bootstrap,
         "WebhookService",

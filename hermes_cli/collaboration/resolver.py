@@ -14,10 +14,19 @@ from hermes_cli.channel_identity import (
 )
 from hermes_cli.dashboard_auth.owner_context import owner_context_from_owner_key
 from hermes_cli.employee_catalog import BUILTIN_ASSISTANT_SYSTEM_PROMPT
-from hermes_cli.employee_policy import canonical_employee_snapshot, normalize_employee_source_policy
+from hermes_cli.employee_policy import (
+    canonical_employee_snapshot,
+    effective_employee_workspace,
+    normalize_employee_source_policy,
+)
 from hermes_cli.model_registrations import resolve_chat_model_registration
 
 from .models import CollaborationMemberProfile
+
+
+def collaboration_attachment_prefix(membership_id: str) -> str:
+    """Return one membership's read-only attachment capability root."""
+    return f"collaboration-attachments/{membership_id}"
 
 
 def collaboration_member_policy(
@@ -28,7 +37,7 @@ def collaboration_member_policy(
     snapshot = dict(employee_policy)
     snapshot.pop("snapshot_fingerprint", None)
     knowledge = list(snapshot.get("knowledge_relative_paths") or ())
-    attachment_prefix = f"collaboration-attachments/{membership_id}"
+    attachment_prefix = collaboration_attachment_prefix(membership_id)
     if attachment_prefix not in knowledge:
         knowledge.append(attachment_prefix)
     snapshot["knowledge_relative_paths"] = knowledge
@@ -249,7 +258,10 @@ class CollaborationEmployeeResolver:
             "toolsets": source_policy["toolsets"],
             "skills": source_policy["skills"],
             "mcp_servers": source_policy["mcp_servers"],
-            "workspace_relative_path": source_policy["workspace_relative_path"],
+            "workspace_relative_path": effective_employee_workspace(
+                managed.employee_id,
+                source_policy["workspace_relative_path"],
+            ),
             "knowledge_relative_paths": source_policy["knowledge_relative_paths"],
             "max_iterations": source_policy["max_iterations"],
             "max_tokens": source_policy["max_tokens"],

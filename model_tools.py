@@ -1212,10 +1212,18 @@ def handle_function_call(
                 workspace_prefix = None
                 knowledge_prefixes: tuple[str, ...] = ()
                 if employee_policy is not None:
+                    from hermes_cli.employee_policy import effective_employee_workspace
+
                     context = _owner_runtime.filesystem_context
+                    employee_id = str(employee_policy.get("employee_id") or "").strip()
                     workspace_path = str(
                         employee_policy.get("workspace_relative_path") or ""
                     )
+                    if employee_id and workspace_path:
+                        workspace_path = effective_employee_workspace(
+                            employee_id,
+                            workspace_path,
+                        )
                     workspace_prefix = (
                         context.controlled_workspace_path(workspace_path)
                         if workspace_path

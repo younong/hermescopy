@@ -800,7 +800,7 @@ export const api = {
     }),
   updateEmployeeProfile: (
     employeeId: string,
-    body: { expected_revision: number; profile: EmployeePolicy },
+    body: { expected_revision: number; profile: EmployeePolicyDraft },
   ) =>
     fetchJSON<Employee>(`/api/employees/${encodeURIComponent(employeeId)}/profile`, {
       method: "PUT",
@@ -1529,7 +1529,7 @@ export interface MessagingPlatformTestResult {
 export type EmployeeLifecycleStatus = "active" | "suspended" | "revoked";
 export type EmployeeKind = "managed" | "builtin_assistant";
 
-export interface EmployeePolicy {
+export interface EmployeePolicyDraft {
   schema_version: 1;
   name?: string;
   role?: string;
@@ -1538,11 +1538,14 @@ export interface EmployeePolicy {
   toolsets: string[];
   skills: string[];
   mcp_servers: string[];
-  workspace_relative_path: string;
   knowledge_relative_paths: string[];
   max_iterations: number;
   max_tokens?: number | null;
   reasoning_effort?: ReasoningLevel | "";
+}
+
+export interface EmployeePolicy extends EmployeePolicyDraft {
+  workspace_relative_path: string;
 }
 
 export interface EmployeeCollaborationPolicy {
@@ -1584,7 +1587,7 @@ export interface EmployeeCatalog {
 }
 
 export interface EmployeeCreate {
-  profile: EmployeePolicy;
+  profile: EmployeePolicyDraft;
   activate?: boolean;
 }
 

@@ -4,12 +4,26 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+import stat
 import time
 import uuid
 from collections.abc import Mapping
+from pathlib import Path
 from typing import Any
 
-from hermes_cli.dashboard_auth.owner_context import OwnerContext
+from hermes_cli.dashboard_auth.owner_context import (
+    OwnerContext,
+    ensure_owner_home,
+    owner_context_from_owner_key,
+)
+from hermes_cli.employee_policy import (
+    LEGACY_EMPLOYEE_WORKSPACE,
+    effective_employee_workspace,
+    employee_policy_with_workspace,
+    employee_workspace_relative_path,
+    normalize_employee_source_policy,
+)
 
 from .credentials import decrypt_account_credentials, encrypt_account_credentials
 from .models import (
@@ -78,37 +92,46 @@ def create_employee(
     owner: OwnerContext,
     profile: Mapping[str, Any],
     activate: bool = True,
+    employee_id: str | None = None,
 ) -> Employee:
-    """Create an Owner-scoped employee without requiring a channel account."""
-    normalized_profile, profile_payload, profile_fingerprint = _canonical_profile(profile)
-    employee_id = f"emp_{uuid.uuid4().hex}"
+    """Create an Owner-scoped employee with one backend-owned workspace."""
+    employee_id = _employee_id(employee_id) if employee_id else f"emp_{uuid.uuid4().hex}"
+    source_policy = employee_policy_with_workspace(profile, employee_id=employee_id)
+    _, profile_payload, profile_fingerprint = _canonical_profile(source_policy)
+    workspace = _provision_employee_workspace(owner, employee_id, require_new=True)
+    committed = False
     now = time.time()
-    with store.write() as conn:
-        canonical_user_id = ensure_owner_binding(store, owner, conn=conn)
-        conn.execute(
-            """
-            INSERT INTO employees
-              (employee_id, canonical_user_id, employee_kind, lifecycle_status,
-               created_at, updated_at)
-            VALUES (?, ?, 'managed', ?, ?, ?)
-            """,
-            (
-                employee_id,
-                canonical_user_id,
-                "active" if activate else "suspended",
-                now,
-                now,
-            ),
-        )
-        _insert_profile_revision(
-            store,
-            conn,
-            employee_id=employee_id,
-            revision=1,
-            profile_payload=profile_payload,
-            profile_fingerprint=profile_fingerprint,
-            now=now,
-        )
+    try:
+        with store.write() as conn:
+            canonical_user_id = ensure_owner_binding(store, owner, conn=conn)
+            conn.execute(
+                """
+                INSERT INTO employees
+                  (employee_id, canonical_user_id, employee_kind, lifecycle_status,
+                   created_at, updated_at)
+                VALUES (?, ?, 'managed', ?, ?, ?)
+                """,
+                (
+                    employee_id,
+                    canonical_user_id,
+                    "active" if activate else "suspended",
+                    now,
+                    now,
+                ),
+            )
+            _insert_profile_revision(
+                store,
+                conn,
+                employee_id=employee_id,
+                revision=1,
+                profile_payload=profile_payload,
+                profile_fingerprint=profile_fingerprint,
+                now=now,
+            )
+        committed = True
+    finally:
+        if not committed:
+            _remove_empty_workspace(workspace)
     return resolve_employee(store, owner=owner, employee_id=employee_id)
 
 
@@ -190,7 +213,6 @@ def update_employee_profile(
         raise ValueError("expected revision must be an integer") from exc
     if expected_revision < 0:
         raise ValueError("expected revision must not be negative")
-    normalized_profile, profile_payload, fingerprint = _canonical_profile(profile)
     now = time.time()
     with store.write() as conn:
         employee = _owned_employee_row(conn, owner=owner, employee_id=employee_id)
@@ -200,7 +222,7 @@ def update_employee_profile(
         if employee["lifecycle_status"] != "active":
             raise RuntimeError("employee is unavailable")
         current = conn.execute(
-            "SELECT revision FROM employee_profiles "
+            "SELECT * FROM employee_profiles "
             "WHERE employee_id=? AND lifecycle_status='active'",
             (employee_id,),
         ).fetchone()
@@ -209,6 +231,19 @@ def update_employee_profile(
             raise EmployeeProfileRevisionConflict(
                 f"employee profile revision changed from {expected_revision} to {current_revision}"
             )
+        current_workspace = employee_workspace_relative_path(employee_id)
+        if current is not None:
+            current_profile = _profile_from_row(store, current)
+            current_workspace = effective_employee_workspace(
+                employee_id,
+                current_profile["workspace_relative_path"],
+            )
+        source_policy = employee_policy_with_workspace(
+            profile,
+            employee_id=employee_id,
+            current_workspace=current_workspace,
+        )
+        normalized_profile, profile_payload, fingerprint = _canonical_profile(source_policy)
         revision = current_revision + 1
         if current is not None:
             conn.execute(
@@ -259,19 +294,7 @@ def resolve_employee_profile(
             ).fetchone()
     if row is None:
         raise RuntimeError("employee profile is unavailable")
-    payload = store.crypto.decrypt_text(
-        row["profile_ciphertext"],
-        table=EMPLOYEE_PROFILE_AAD_TABLE,
-        record_id=f"{employee_id}:{row['revision']}",
-        field="profile",
-        version=row["profile_key_version"],
-    )
-    try:
-        profile = json.loads(payload)
-    except (TypeError, json.JSONDecodeError) as exc:
-        raise RuntimeError("employee profile is invalid") from exc
-    if not isinstance(profile, dict):
-        raise RuntimeError("employee profile is invalid")
+    profile = _profile_from_row(store, row)
     _, _, fingerprint = _canonical_profile(profile)
     if fingerprint != row["profile_fingerprint"]:
         raise RuntimeError("employee profile fingerprint is inconsistent")
@@ -752,6 +775,122 @@ def set_employee_feishu_binding_status(
         employee_id=employee_id,
         include_revoked=status == "revoked",
     )
+
+
+def _profile_from_row(store: ChannelIdentityStore, row) -> dict[str, Any]:
+    payload = store.crypto.decrypt_text(
+        row["profile_ciphertext"],
+        table=EMPLOYEE_PROFILE_AAD_TABLE,
+        record_id=f"{row['employee_id']}:{row['revision']}",
+        field="profile",
+        version=row["profile_key_version"],
+    )
+    try:
+        profile = json.loads(payload)
+    except (TypeError, json.JSONDecodeError) as exc:
+        raise RuntimeError("employee profile is invalid") from exc
+    if not isinstance(profile, dict):
+        raise RuntimeError("employee profile is invalid")
+    return profile
+
+
+def _provision_employee_workspace(
+    owner: OwnerContext,
+    employee_id: str,
+    *,
+    require_new: bool,
+) -> Path:
+    owner_home = ensure_owner_home(owner)
+    employees = owner_home / "workspaces" / "default" / "employees"
+    try:
+        employees.mkdir(mode=0o700)
+    except FileExistsError:
+        pass
+    parent_info = employees.lstat()
+    if stat.S_ISLNK(parent_info.st_mode) or not stat.S_ISDIR(parent_info.st_mode):
+        raise RuntimeError("employee workspace parent must be a directory")
+    if os.name != "nt" and parent_info.st_mode & (stat.S_IRWXG | stat.S_IRWXO):
+        raise RuntimeError("employee workspace parent has unsafe permissions")
+    workspace = owner_home / "workspaces" / "default" / employee_workspace_relative_path(employee_id)
+    try:
+        workspace.mkdir(mode=0o700)
+        created = True
+    except FileExistsError:
+        created = False
+    info = workspace.lstat()
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+        raise RuntimeError("employee workspace must be a directory")
+    if os.name != "nt" and info.st_mode & (stat.S_IRWXG | stat.S_IRWXO):
+        raise RuntimeError("employee workspace has unsafe permissions")
+    if hasattr(os, "getuid") and info.st_uid != os.getuid():
+        raise RuntimeError("employee workspace has unexpected ownership")
+    if require_new and not created:
+        raise RuntimeError("employee workspace already exists")
+    return workspace
+
+
+def _remove_empty_workspace(workspace: Path) -> None:
+    try:
+        workspace.rmdir()
+    except (FileNotFoundError, OSError):
+        pass
+
+
+def reconcile_employee_workspaces(store: ChannelIdentityStore) -> int:
+    """Provision canonical workspaces and revise only the retired UI placeholder."""
+    with store.read() as conn:
+        rows = conn.execute(
+            "SELECT p.*, o.owner_key FROM employee_profiles p "
+            "JOIN employees e ON e.employee_id=p.employee_id "
+            "JOIN owner_bindings o ON o.canonical_user_id=e.canonical_user_id "
+            "WHERE p.lifecycle_status='active' AND e.employee_kind='managed'"
+        ).fetchall()
+    repaired = 0
+    for row in rows:
+        profile = _profile_from_row(store, row)
+        if profile.get("workspace_relative_path") != LEGACY_EMPLOYEE_WORKSPACE:
+            continue
+        owner = owner_context_from_owner_key(
+            str(row["owner_key"]),
+            global_home=store.global_home,
+        )
+        employee_id = str(row["employee_id"])
+        _provision_employee_workspace(owner, employee_id, require_new=False)
+        now = time.time()
+        with store.write() as conn:
+            current = conn.execute(
+                "SELECT * FROM employee_profiles WHERE employee_id=? "
+                "AND lifecycle_status='active'",
+                (employee_id,),
+            ).fetchone()
+            if current is None:
+                continue
+            current_profile = _profile_from_row(store, current)
+            if current_profile.get("workspace_relative_path") != LEGACY_EMPLOYEE_WORKSPACE:
+                continue
+            source_policy = normalize_employee_source_policy(current_profile)
+            replacement = {
+                **source_policy,
+                "workspace_relative_path": employee_workspace_relative_path(employee_id),
+            }
+            _, payload, fingerprint = _canonical_profile(replacement)
+            revision = int(current["revision"]) + 1
+            conn.execute(
+                "UPDATE employee_profiles SET lifecycle_status='superseded', updated_at=? "
+                "WHERE employee_id=? AND revision=?",
+                (now, employee_id, current["revision"]),
+            )
+            _insert_profile_revision(
+                store,
+                conn,
+                employee_id=employee_id,
+                revision=revision,
+                profile_payload=payload,
+                profile_fingerprint=fingerprint,
+                now=now,
+            )
+        repaired += 1
+    return repaired
 
 
 def _insert_profile_revision(

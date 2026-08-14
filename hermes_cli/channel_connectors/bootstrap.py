@@ -12,7 +12,11 @@ import aiohttp
 import certifi
 
 from gateway.weixin_ilink.media import PublicAddressResolver
-from hermes_cli.channel_identity import ChannelCrypto, ChannelIdentityStore
+from hermes_cli.channel_identity import (
+    ChannelCrypto,
+    ChannelIdentityStore,
+    reconcile_employee_workspaces,
+)
 
 from .feishu import FeishuConnector
 from .supervisor import ConnectorSupervisor
@@ -58,11 +62,13 @@ def build_channel_identity_store(
         lookup_version=lookup_version,
         encryption_version=encryption_version,
     )
-    return ChannelIdentityStore(
+    store = ChannelIdentityStore(
         crypto,
         resolved_control_home,
         global_home=resolved_global_home,
     )
+    reconcile_employee_workspaces(store)
+    return store
 
 
 @dataclass(frozen=True)
