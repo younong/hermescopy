@@ -1420,6 +1420,31 @@ code { font-size: 0.875rem; }
   padding: 0 10px;
 }
 
+[data-gui-chat] .gui-chat-employee-policy-editor input:not([type="checkbox"]):not([type="file"]),
+[data-gui-chat] .gui-chat-employee-policy-editor textarea,
+[data-gui-chat] .gui-chat-employee-policy-editor [id="employee-skills"] {
+  border-color: #dfe2e7;
+  border-radius: 8px;
+  background: #fff;
+  color: #2c2f35;
+}
+
+[data-gui-chat] .gui-chat-employee-policy-editor input:not([type="checkbox"]):not([type="file"]):focus,
+[data-gui-chat] .gui-chat-employee-policy-editor textarea:focus {
+  border-color: #8ca7c5;
+  outline: none;
+  box-shadow: 0 0 0 2px #dce5ef;
+}
+
+[data-gui-chat] .gui-chat-employee-policy-editor [id="employee-skills"] label {
+  border-radius: 6px;
+  color: #555a62;
+}
+
+[data-gui-chat] .gui-chat-employee-policy-editor [id="employee-skills"] label:hover {
+  background: #f0f1f3;
+}
+
 [data-gui-chat] .gui-chat-model-checkbox {
   display: flex;
   align-items: center;

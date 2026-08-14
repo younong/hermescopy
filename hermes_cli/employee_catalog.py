@@ -6,6 +6,7 @@ from typing import Any
 
 
 def employee_catalog_payload(owner_home: Path) -> dict[str, Any]:
+    from agent.models_dev import get_selectable_reasoning_levels
     from hermes_cli.config import load_config
     from hermes_cli.model_registrations import get_model_registrations_payload
     from hermes_cli.owner_runtime import owner_worker_runtime_paths
@@ -21,7 +22,14 @@ def employee_catalog_payload(owner_home: Path) -> dict[str, Any]:
     )
     return {
         "model_registrations": [
-            item
+            {
+                **item,
+                "reasoning_levels": list(get_selectable_reasoning_levels(
+                    str(item.get("provider") or ""),
+                    str(item.get("model") or ""),
+                    allow_network=False,
+                )),
+            }
             for item in get_model_registrations_payload()["registrations"]
             if item.get("kind") == "chat"
         ],
