@@ -376,6 +376,22 @@ class TestBuildNativeContentParts:
         assert parts[1]["type"] == "image_url"
         assert parts[1]["image_url"]["url"].startswith("data:image/png;base64,")
 
+    def test_path_hint_can_use_sandbox_visible_alias(self, tmp_path: Path):
+        img = tmp_path / "cat.png"
+        img.write_bytes(_png_bytes())
+
+        parts, skipped = build_native_content_parts(
+            "hello",
+            [str(img)],
+            image_path_hints=["/workspace/uploads/cat.png"],
+        )
+
+        assert skipped == []
+        assert parts[0]["text"] == (
+            "hello\n\n[Image attached at: /workspace/uploads/cat.png]"
+        )
+        assert str(img) not in parts[0]["text"]
+
     def test_empty_text_inserts_default_prompt(self, tmp_path: Path):
         img = tmp_path / "cat.jpg"
         img.write_bytes(_png_bytes())
