@@ -33,6 +33,10 @@ class FeishuCredentialRevisionConflict(RuntimeError):
     """The requested Feishu credential version is no longer current."""
 
 
+class BuiltinEmployeeProtected(RuntimeError):
+    """A mutation targeted the Owner's protected built-in assistant."""
+
+
 def _employee_id(value: str) -> str:
     employee_id = str(value or "").strip()
     if not employee_id.startswith("emp_") or len(employee_id) <= 4:
@@ -84,8 +88,9 @@ def create_employee(
         conn.execute(
             """
             INSERT INTO employees
-              (employee_id, canonical_user_id, lifecycle_status, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?)
+              (employee_id, canonical_user_id, employee_kind, lifecycle_status,
+               created_at, updated_at)
+            VALUES (?, ?, 'managed', ?, ?, ?)
             """,
             (
                 employee_id,
@@ -112,11 +117,14 @@ def list_employees(
     *,
     owner: OwnerContext,
 ) -> tuple[Employee, ...]:
-    """List employees owned by the authenticated Owner."""
-    with store.read() as conn:
+    """List employees owned by the authenticated Owner, repairing its built-in."""
+    with store.write() as conn:
+        ensure_owner_binding(store, owner, conn=conn)
         rows = conn.execute(
             _EMPLOYEE_SELECT +
-            " WHERE o.owner_key=? ORDER BY e.created_at, e.employee_id",
+            " WHERE o.owner_key=? "
+            "ORDER BY e.employee_kind='builtin_assistant' DESC, "
+            "e.created_at, e.employee_id",
             (owner.owner_key,),
         ).fetchall()
     return tuple(_employee_from_row(row) for row in rows)
@@ -156,6 +164,7 @@ def set_employee_status(
         row = _owned_employee_row(conn, owner=owner, employee_id=employee_id)
         if row is None:
             raise RuntimeError("employee is unavailable")
+        _reject_builtin_mutation(row)
         if row["lifecycle_status"] == "revoked" and status != "revoked":
             raise RuntimeError("revoked employee cannot be reactivated")
         conn.execute(
@@ -185,7 +194,10 @@ def update_employee_profile(
     now = time.time()
     with store.write() as conn:
         employee = _owned_employee_row(conn, owner=owner, employee_id=employee_id)
-        if employee is None or employee["lifecycle_status"] != "active":
+        if employee is None:
+            raise RuntimeError("employee is unavailable")
+        _reject_builtin_mutation(employee)
+        if employee["lifecycle_status"] != "active":
             raise RuntimeError("employee is unavailable")
         current = conn.execute(
             "SELECT revision FROM employee_profiles "
@@ -305,8 +317,10 @@ def update_employee_collaboration_policy(
         raise ValueError("invite quota must be a non-negative integer or null")
     now = time.time()
     with store.write() as conn:
-        if _owned_employee_row(conn, owner=owner, employee_id=employee_id) is None:
+        employee = _owned_employee_row(conn, owner=owner, employee_id=employee_id)
+        if employee is None:
             raise RuntimeError("employee is unavailable")
+        _reject_builtin_mutation(employee)
         conn.execute(
             """
             INSERT INTO employee_collaboration_policies
@@ -368,9 +382,15 @@ def ensure_employee_feishu_conversation_binding(
     )
     now = time.time()
     with store.write() as conn:
+        kind = conn.execute(
+            "SELECT employee_kind FROM employees WHERE employee_id=?",
+            (employee_id,),
+        ).fetchone()
+        if kind is not None:
+            _reject_builtin_mutation(kind)
         row = conn.execute(
             """
-            SELECT e.canonical_user_id, o.owner_key
+            SELECT e.canonical_user_id, e.employee_kind, o.owner_key
             FROM employees e
             JOIN employee_channel_bindings eb ON eb.employee_id=e.employee_id
             JOIN connector_accounts a ON a.account_id=eb.connector_account_id
@@ -384,6 +404,7 @@ def ensure_employee_feishu_conversation_binding(
         ).fetchone()
         if row is None:
             raise RuntimeError("employee Feishu binding is unavailable")
+        _reject_builtin_mutation(row)
         existing = conn.execute(
             "SELECT binding_id, external_identity_id FROM channel_bindings "
             "WHERE account_id=? AND peer_lookup_hash=?",
@@ -497,7 +518,10 @@ def register_employee_feishu_binding(
     account_status = "active" if activate else "pending"
     with store.write() as conn:
         employee = _owned_employee_row(conn, owner=owner, employee_id=employee_id)
-        if employee is None or employee["lifecycle_status"] == "revoked":
+        if employee is None:
+            raise RuntimeError("employee is unavailable")
+        _reject_builtin_mutation(employee)
+        if employee["lifecycle_status"] == "revoked":
             raise RuntimeError("employee is unavailable")
         if conn.execute(
             "SELECT 1 FROM employee_channel_bindings "
@@ -570,6 +594,10 @@ def resolve_employee_feishu_credentials(
     """Decrypt current Feishu credentials after exact employee Owner authorization."""
     employee_id = _employee_id(employee_id)
     with store.read() as conn:
+        employee = _owned_employee_row(conn, owner=owner, employee_id=employee_id)
+        if employee is None:
+            raise RuntimeError("employee is unavailable")
+        _reject_builtin_mutation(employee)
         row = _owned_feishu_binding_row(
             conn, owner=owner, employee_id=employee_id
         )
@@ -603,6 +631,10 @@ def rotate_employee_feishu_credentials(
         raise ValueError("connector credentials are required")
     now = time.time()
     with store.write() as conn:
+        employee = _owned_employee_row(conn, owner=owner, employee_id=employee_id)
+        if employee is None:
+            raise RuntimeError("employee is unavailable")
+        _reject_builtin_mutation(employee)
         row = _owned_feishu_binding_row(
             conn, owner=owner, employee_id=employee_id
         )
@@ -643,7 +675,10 @@ def rollover_employee_sessions(
     employee_id = _employee_id(employee_id)
     with store.write() as conn:
         employee = _owned_employee_row(conn, owner=owner, employee_id=employee_id)
-        if employee is None or employee["lifecycle_status"] != "active":
+        if employee is None:
+            raise RuntimeError("employee is unavailable")
+        _reject_builtin_mutation(employee)
+        if employee["lifecycle_status"] != "active":
             raise RuntimeError("employee is unavailable")
         active = conn.execute(
             """
@@ -688,6 +723,10 @@ def set_employee_feishu_binding_status(
         raise ValueError("employee Feishu binding status is invalid")
     now = time.time()
     with store.write() as conn:
+        employee = _owned_employee_row(conn, owner=owner, employee_id=employee_id)
+        if employee is None:
+            raise RuntimeError("employee is unavailable")
+        _reject_builtin_mutation(employee)
         row = _owned_feishu_binding_row(
             conn,
             owner=owner,
@@ -750,10 +789,21 @@ def _insert_profile_revision(
     )
 
 
+def reject_builtin_employee_mutation(employee: Employee) -> None:
+    """Reject a mutation against a resolved protected built-in employee."""
+    if employee.protected:
+        raise BuiltinEmployeeProtected("built-in assistant employee is protected")
+
+
+def _reject_builtin_mutation(row) -> None:
+    if row["employee_kind"] == "builtin_assistant":
+        raise BuiltinEmployeeProtected("built-in assistant employee is protected")
+
+
 def _owned_employee_row(conn, *, owner: OwnerContext, employee_id: str):
     return conn.execute(
         """
-        SELECT e.canonical_user_id, e.lifecycle_status
+        SELECT e.canonical_user_id, e.employee_kind, e.lifecycle_status
         FROM employees e
         JOIN owner_bindings o ON o.canonical_user_id=e.canonical_user_id
         WHERE e.employee_id=? AND o.owner_key=?
@@ -806,10 +856,12 @@ def _employee_from_row(row) -> Employee:
     binding = None
     if row["binding_id"] is not None:
         binding = _binding_from_row(row)
+    is_builtin = row["employee_kind"] == "builtin_assistant"
     return Employee(
         employee_id=row["employee_id"],
         canonical_user_id=row["canonical_user_id"],
         owner_key=row["owner_key"],
+        employee_kind=row["employee_kind"],
         lifecycle_status=row["employee_status"],
         profile_revision=(
             int(row["profile_revision"])
@@ -819,12 +871,12 @@ def _employee_from_row(row) -> Employee:
         profile_fingerprint=row["profile_fingerprint"],
         collaboration_policy=EmployeeCollaborationPolicy(
             employee_id=row["employee_id"],
-            may_participate=bool(row["may_participate"]),
-            may_create_groups=bool(row["may_create_groups"]),
+            may_participate=True if is_builtin else bool(row["may_participate"]),
+            may_create_groups=True if is_builtin else bool(row["may_create_groups"]),
             invite_quota=(
-                int(row["invite_quota"])
-                if row["invite_quota"] is not None
-                else None
+                None
+                if is_builtin or row["invite_quota"] is None
+                else int(row["invite_quota"])
             ),
         ),
         feishu_binding=binding,
@@ -843,8 +895,9 @@ JOIN connector_accounts a ON a.account_id=eb.connector_account_id
 """
 
 _EMPLOYEE_SELECT = """
-SELECT e.employee_id, e.canonical_user_id, e.lifecycle_status AS employee_status,
-       o.owner_key, p.revision AS profile_revision, p.profile_fingerprint,
+SELECT e.employee_id, e.canonical_user_id, e.employee_kind,
+       e.lifecycle_status AS employee_status, o.owner_key,
+       p.revision AS profile_revision, p.profile_fingerprint,
        COALESCE(cp.may_participate, 1) AS may_participate,
        COALESCE(cp.may_create_groups, 0) AS may_create_groups,
        CASE WHEN cp.employee_id IS NULL THEN 5 ELSE cp.invite_quota END AS invite_quota,

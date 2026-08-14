@@ -63,11 +63,20 @@ class Employee:
     employee_id: str
     canonical_user_id: str
     owner_key: str
+    employee_kind: str
     lifecycle_status: str
     profile_revision: int | None
     profile_fingerprint: str | None
     collaboration_policy: EmployeeCollaborationPolicy
     feishu_binding: EmployeeChannelBinding | None
+
+    @property
+    def protected(self) -> bool:
+        return self.employee_kind == "builtin_assistant"
+
+    @property
+    def chat_eligible(self) -> bool:
+        return self.lifecycle_status == "active"
 
 
 @dataclass(frozen=True)

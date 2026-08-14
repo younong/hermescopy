@@ -1527,6 +1527,7 @@ export interface MessagingPlatformTestResult {
 }
 
 export type EmployeeLifecycleStatus = "active" | "suspended" | "revoked";
+export type EmployeeKind = "managed" | "builtin_assistant";
 
 export interface EmployeePolicy {
   schema_version: 1;
@@ -1561,6 +1562,9 @@ export interface EmployeeChannelBinding {
 
 export interface Employee {
   employee_id: string;
+  employee_kind: EmployeeKind;
+  protected: boolean;
+  chat_eligible: boolean;
   avatar_url: string | null;
   lifecycle_status: EmployeeLifecycleStatus;
   profile_revision: number | null;

@@ -2214,6 +2214,10 @@ def _ensure_session_db_row(session: dict) -> None:
         model_config[_WEB_DIRECT_EMPLOYEE_CONFIG_KEY] = str(
             employee_policy["employee_id"]
         )
+        if employee_policy.get("builtin_assistant") is True:
+            model_config[_BUILTIN_ASSISTANT_CONFIG_KEY] = str(
+                employee_policy["employee_id"]
+            )
     elif (
         employee_policy
         and collaboration_context is not None
@@ -2802,8 +2806,20 @@ def _stored_session_runtime_overrides(row: dict | None) -> dict:
         session_key = str(row.get("id") or "").strip()
         if not session_key:
             raise RuntimeError("web direct employee session identity is invalid")
+        service = _collaboration_service()
+        durable = service.resolver.resolve_current(direct_employee_id)
+        builtin_id = str(model_config.get(_BUILTIN_ASSISTANT_CONFIG_KEY) or "").strip()
+        if durable.may_manage_employees:
+            if (
+                builtin_id != direct_employee_id
+                or employee_policy.get("builtin_assistant") is not True
+                or "runtime_toolsets" not in employee_policy
+            ):
+                raise RuntimeError("built-in assistant session identity is inconsistent")
+        elif builtin_id or employee_policy.get("builtin_assistant") is True:
+            raise RuntimeError("built-in assistant authority is unavailable")
         overrides["collaboration_context"] = _web_direct_collaboration_context(
-            service=_collaboration_service(),
+            service=service,
             employee_policy=employee_policy,
             session_key=session_key,
         )
@@ -5195,14 +5211,15 @@ def _make_agent(
     if model_kind == "code":
         runtime_profile = "coding"
         runtime_toolset = "coding"
-    enabled_toolsets = (
-        [
+    if employee_policy is None:
+        enabled_toolsets = _load_enabled_toolsets()
+    elif employee_policy.get("builtin_assistant") is True:
+        enabled_toolsets = employee_policy.get("runtime_toolsets")
+    else:
+        enabled_toolsets = [
             *employee_policy["toolsets"],
             *(f"mcp-{name}" for name in employee_policy["mcp_servers"]),
         ]
-        if employee_policy is not None
-        else _load_enabled_toolsets()
-    )
     if model_kind == "code" and employee_policy is None:
         enabled_toolsets = [runtime_toolset]
     agent = AIAgent(
@@ -5287,8 +5304,13 @@ def _make_agent(
 
 
 def _restrict_employee_agent_tools(agent) -> None:
-    """Remove unrestricted Skill discovery/mutation from policy-pinned agents."""
-    blocked = {"skills_list", "skill_view", "skill_manage"}
+    """Remove Skill authority not granted by the immutable employee identity."""
+    policy = getattr(agent, "employee_policy", None) or {}
+    blocked = (
+        {"skill_manage"}
+        if policy.get("builtin_assistant") is True
+        else {"skills_list", "skill_view", "skill_manage"}
+    )
     agent.tools = [
         tool
         for tool in (getattr(agent, "tools", None) or [])
@@ -5306,7 +5328,15 @@ def _inject_collaboration_agent_tools(agent, context) -> None:
         and int(context.source_depth) == 0
         and bool(context.may_create_authorized)
     )
-    schemas = tool_definitions(role=context.role, may_create=may_create)
+    schemas = tool_definitions(
+        role=context.role,
+        may_create=may_create,
+        may_manage_employees=(
+            context.role == "source"
+            and int(context.source_depth) == 0
+            and bool(context.may_manage_employees)
+        ),
+    )
     existing = set(getattr(agent, "valid_tool_names", set()))
     for schema in schemas:
         name = schema["function"]["name"]
@@ -6061,6 +6091,7 @@ def _inflight_snapshot(session: dict) -> dict | None:
 
 _EMPLOYEE_POLICY_CONFIG_KEY = "hermes_employee_policy"
 _WEB_DIRECT_EMPLOYEE_CONFIG_KEY = "hermes_web_direct_employee_id"
+_BUILTIN_ASSISTANT_CONFIG_KEY = "hermes_builtin_assistant_employee_id"
 _FEISHU_DIRECT_SOURCE_CONFIG_KEY = "hermes_feishu_direct_source"
 
 
@@ -6223,7 +6254,15 @@ def _web_direct_employee(
     try:
         service = _collaboration_service()
         resolved = service.resolver.resolve_current(employee_id)
-        return resolved.employee_policy, service, None
+        employee_policy = resolved.employee_policy
+        if resolved.may_manage_employees:
+            from hermes_cli.employee_policy import canonical_employee_snapshot
+
+            snapshot = dict(employee_policy)
+            snapshot.pop("snapshot_fingerprint", None)
+            snapshot["runtime_toolsets"] = _load_enabled_toolsets()
+            employee_policy, _ = canonical_employee_snapshot(snapshot)
+        return employee_policy, service, None
     except (TypeError, ValueError, RuntimeError) as exc:
         return None, None, str(exc)
 

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import sqlite3
@@ -12,10 +13,18 @@ from typing import Iterator
 
 from .crypto import ChannelCrypto
 
-SCHEMA_VERSION = 15
+SCHEMA_VERSION = 16
 ACCOUNT_CREDENTIAL_AAD_TABLE = "ilink_accounts"
 EMPLOYEE_PROFILE_AAD_TABLE = "employee_profiles"
 _DB_FILENAME = "channel_identities.sqlite3"
+
+
+def _builtin_assistant_employee_id(canonical_user_id: str) -> str:
+    digest = hashlib.sha256(
+        f"builtin-assistant:{canonical_user_id}".encode("utf-8")
+    ).hexdigest()
+    return f"emp_builtin_{digest}"
+
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS channel_identity_meta (
@@ -113,6 +122,8 @@ END;
 CREATE TABLE IF NOT EXISTS employees (
     employee_id TEXT PRIMARY KEY CHECK(employee_id GLOB 'emp_*'),
     canonical_user_id TEXT NOT NULL REFERENCES canonical_users(canonical_user_id),
+    employee_kind TEXT NOT NULL DEFAULT 'managed'
+        CHECK(employee_kind IN ('managed', 'builtin_assistant')),
     lifecycle_status TEXT NOT NULL
         CHECK(lifecycle_status IN ('active', 'suspended', 'revoked')),
     created_at REAL NOT NULL,
@@ -120,10 +131,25 @@ CREATE TABLE IF NOT EXISTS employees (
 );
 CREATE INDEX IF NOT EXISTS idx_employees_owner
 ON employees(canonical_user_id, lifecycle_status);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_employees_builtin_assistant_owner
+ON employees(canonical_user_id) WHERE employee_kind='builtin_assistant';
 CREATE TRIGGER IF NOT EXISTS employees_owner_immutable
 BEFORE UPDATE OF employee_id, canonical_user_id ON employees
 BEGIN
     SELECT RAISE(ABORT, 'employee Owner is immutable');
+END;
+CREATE TRIGGER IF NOT EXISTS builtin_assistant_delete_protected
+BEFORE DELETE ON employees
+WHEN OLD.employee_kind='builtin_assistant'
+BEGIN
+    SELECT RAISE(ABORT, 'builtin employee is protected');
+END;
+CREATE TRIGGER IF NOT EXISTS builtin_assistant_identity_protected
+BEFORE UPDATE OF employee_id, canonical_user_id, employee_kind, lifecycle_status
+ON employees
+WHEN OLD.employee_kind='builtin_assistant' OR NEW.employee_kind='builtin_assistant'
+BEGIN
+    SELECT RAISE(ABORT, 'builtin employee is protected');
 END;
 CREATE TABLE IF NOT EXISTS employee_collaboration_policies (
     employee_id TEXT PRIMARY KEY REFERENCES employees(employee_id),
@@ -511,6 +537,9 @@ class ChannelIdentityStore:
                         elif version == 14:
                             self._migrate_v14_to_v15(conn)
                             version = 15
+                        elif version == 15:
+                            self._migrate_v15_to_v16(conn)
+                            version = 16
                         else:
                             raise RuntimeError(
                                 "channel identity database schema is older than supported"
@@ -1157,6 +1186,79 @@ class ChannelIdentityStore:
             conn.execute(f"DROP TABLE IF EXISTS {table}")
         conn.execute(
             "UPDATE channel_identity_meta SET value='15' WHERE key='schema_version'"
+        )
+
+    @staticmethod
+    def _migrate_v15_to_v16(conn: sqlite3.Connection) -> None:
+        columns = {
+            row["name"] for row in conn.execute("PRAGMA table_info(employees)")
+        }
+        if not columns:
+            conn.execute(
+                """
+                CREATE TABLE employees (
+                    employee_id TEXT PRIMARY KEY CHECK(employee_id GLOB 'emp_*'),
+                    canonical_user_id TEXT NOT NULL
+                        REFERENCES canonical_users(canonical_user_id),
+                    lifecycle_status TEXT NOT NULL
+                        CHECK(lifecycle_status IN ('active', 'suspended', 'revoked')),
+                    created_at REAL NOT NULL,
+                    updated_at REAL NOT NULL
+                )
+                """
+            )
+        if "employee_kind" not in columns:
+            conn.execute(
+                "ALTER TABLE employees ADD COLUMN employee_kind TEXT NOT NULL "
+                "DEFAULT 'managed' CHECK(employee_kind IN ('managed', 'builtin_assistant'))"
+            )
+        for row in conn.execute(
+            "SELECT canonical_user_id, created_at FROM owner_bindings"
+        ).fetchall():
+            employee_id = _builtin_assistant_employee_id(row["canonical_user_id"])
+            conn.execute(
+                """
+                INSERT INTO employees
+                  (employee_id, canonical_user_id, employee_kind, lifecycle_status,
+                   created_at, updated_at)
+                VALUES (?, ?, 'builtin_assistant', 'active', ?, ?)
+                ON CONFLICT(employee_id) DO NOTHING
+                """,
+                (
+                    employee_id,
+                    row["canonical_user_id"],
+                    row["created_at"],
+                    row["created_at"],
+                ),
+            )
+            inserted = conn.execute(
+                "SELECT canonical_user_id, employee_kind, lifecycle_status "
+                "FROM employees WHERE employee_id=?",
+                (employee_id,),
+            ).fetchone()
+            if (
+                inserted is None
+                or inserted["canonical_user_id"] != row["canonical_user_id"]
+                or inserted["employee_kind"] != "builtin_assistant"
+                or inserted["lifecycle_status"] != "active"
+            ):
+                raise RuntimeError("builtin assistant employee migration is inconsistent")
+        inconsistent_owner = conn.execute(
+            """
+            SELECT o.canonical_user_id
+            FROM owner_bindings o
+            LEFT JOIN employees e
+              ON e.canonical_user_id=o.canonical_user_id
+             AND e.employee_kind='builtin_assistant'
+            GROUP BY o.canonical_user_id
+            HAVING COUNT(e.employee_id)<>1
+            LIMIT 1
+            """
+        ).fetchone()
+        if inconsistent_owner is not None:
+            raise RuntimeError("builtin assistant employee migration is inconsistent")
+        conn.execute(
+            "UPDATE channel_identity_meta SET value='16' WHERE key='schema_version'"
         )
 
     @staticmethod
