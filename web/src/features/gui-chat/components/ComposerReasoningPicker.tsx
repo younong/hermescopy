@@ -3,12 +3,7 @@ import { Brain, Check, ChevronDown } from "lucide-react";
 
 import { guiChatTranslations, useI18n } from "@/i18n";
 import type { ReasoningLevel } from "@/lib/api";
-
-const LABELS: Record<ReasoningLevel, string> = {
-  high: "High",
-  xhigh: "XHigh",
-  max: "Max",
-};
+import { REASONING_LEVEL_LABELS } from "@/lib/reasoning-level";
 
 export function ComposerReasoningPicker({
   busy,
@@ -75,7 +70,7 @@ export function ComposerReasoningPicker({
         type="button"
       >
         <Brain aria-hidden className="h-3 w-3" />
-        <span>{selected ? LABELS[selected] : copy.levels}</span>
+        <span>{selected ? REASONING_LEVEL_LABELS[selected] : copy.levels}</span>
         <ChevronDown aria-hidden className="h-3 w-3" />
       </button>
 
@@ -95,7 +90,7 @@ export function ComposerReasoningPicker({
               role="option"
               type="button"
             >
-              {LABELS[level]}
+              {REASONING_LEVEL_LABELS[level]}
               {level === selected ? <Check aria-hidden className="h-3.5 w-3.5" /> : null}
             </button>
           ))}

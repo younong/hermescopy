@@ -243,6 +243,14 @@ def test_owner_worker_code_session_isolated_from_chat_config(owner_gateway, monk
     }
 
 
+def test_employee_reasoning_config_uses_pinned_policy():
+    assert server._employee_reasoning_config({"reasoning_effort": "max"}) == {
+        "enabled": True,
+        "effort": "max",
+    }
+    assert server._employee_reasoning_config({"reasoning_effort": ""}) is None
+
+
 def test_employee_policy_rejects_interactive_source_spoof(owner_gateway):
     _db, runtime, _workspace_root = owner_gateway
 
@@ -329,6 +337,7 @@ def test_web_direct_employee_selection_is_server_resolved_and_context_bound(
         "knowledge_relative_paths": [],
         "max_iterations": 20,
         "max_tokens": 2000,
+        "reasoning_effort": "max",
     }
 
     class _Resolver:
