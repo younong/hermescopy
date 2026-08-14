@@ -51,7 +51,7 @@ describe("ChannelsPage", () => {
     expect(getMessagingPlatforms).not.toHaveBeenCalled();
     expect(document.body.textContent).toContain("Feishu / Lark");
     expect(document.body.textContent).toContain("No employee Feishu / Lark bindings are configured.");
-    const link = document.querySelector<HTMLAnchorElement>('a[href="/chat/robots"]');
+    const link = document.querySelector<HTMLAnchorElement>('a[href="/chat/contacts"]');
     expect(link?.textContent).toBe("Manage employees");
     expect(document.body.textContent).not.toContain("Add employee");
     expect(document.body.textContent).not.toContain("May participate");
@@ -78,7 +78,7 @@ describe("ChannelsPage", () => {
 
     expect(document.body.textContent).toContain("按员工管理的飞书和 Lark 连接");
     expect(document.body.textContent).toContain("尚未配置员工飞书 / Lark 绑定。");
-    expect(document.querySelector<HTMLAnchorElement>('a[href="/chat/robots"]')?.textContent).toBe("管理员工");
+    expect(document.querySelector<HTMLAnchorElement>('a[href="/chat/contacts"]')?.textContent).toBe("管理员工");
   });
 
 });
