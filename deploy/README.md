@@ -203,6 +203,12 @@ npm run deploy -- --tag v2026.7.4 --keep-releases 8
 npm run deploy -- --tag v2026.7.4 --no-prune-releases
 ```
 
+部署提交后还会自动回收 `/opt/hermes/runtimes/python` 中未被任何运行进程引用的旧 immutable runtime。当前候选 runtime 永远保留；进程的 executable、cwd、root、open fd、memory map 或 mount 引用命中时也会保留。无法完整检查 `/proc` 时清理会 fail closed，不会猜测删除。旧 tag 回滚如果需要已回收的 runtime，会按 lock 和 host 输入重新构建。紧急调查时可临时禁用：
+
+```bash
+npm run deploy -- --tag v2026.7.4 --no-prune-runtimes
+```
+
 ## Nginx 单一登录层迁移
 
 仓库只维护 `deploy/nginx/hermes-dashboard.conf` 这个 server-context snippet，不覆盖完整 vhost、站点根应用或 Certbot/TLS 配置。首次从旧的 Nginx Basic Auth/remember-cookie 结构迁移时，必须显式执行：
