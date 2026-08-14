@@ -96,7 +96,8 @@ export function MessageList({
       }
     }
     for (const clarificationId of state.clarificationOrder) {
-      if (state.clarifications[clarificationId]) {
+      const clarification = state.clarifications[clarificationId];
+      if (clarification && ["pending", "submitting"].includes(clarification.status)) {
         result.push({
           clarificationId,
           id: `clarify:${clarificationId}`,
