@@ -156,6 +156,163 @@ def test_config_set_reasoning_max_updates_live_session(monkeypatch):
     assert emitted == [("session.info", "runtime-a", {"reasoning_effort": "max"})]
 
 
+def test_registered_config_switch_uses_runtime_only_fast_path(monkeypatch):
+    from hermes_cli import model_cost_guard, model_registrations, model_switch
+    from tui_gateway import server
+
+    class Agent:
+        model = "old-model"
+        provider = "old-provider"
+        base_url = "https://old.example/v1"
+        api_key = "old-key"
+        context_compressor = SimpleNamespace(context_length=65_536)
+        _cached_system_prompt = "existing prompt"
+
+        def switch_model(self, **kwargs):
+            self.switch_kwargs = kwargs
+            self.model = kwargs["new_model"]
+            self.provider = kwargs["new_provider"]
+
+    agent = Agent()
+    session = {
+        "agent": agent,
+        "history": [{"role": "user", "content": "hello"}],
+        "history_version": 1,
+        "session_key": "stored-a",
+    }
+    runtime = server.OwnerWorkerGatewayRuntime("owner", 1, "worker", 1, 0)
+    runtime.mutable_state.sessions["runtime-a"] = session
+    emitted = []
+    switch_calls = []
+    cost_calls = []
+
+    monkeypatch.setattr(
+        model_registrations,
+        "resolve_chat_model_registration",
+        lambda registration_id: {
+            "registration_id": registration_id,
+            "provider": "new-provider",
+            "model": "new-model",
+            "source": "catalog",
+        },
+    )
+    monkeypatch.setattr(server, "_load_cfg", lambda: {})
+    scheduled = []
+    monkeypatch.setattr(
+        server,
+        "_schedule_live_session_runtime_persist",
+        lambda live_session, route: scheduled.append((live_session, route)),
+    )
+    monkeypatch.setattr(server, "_emit", lambda *args: emitted.append(args))
+    monkeypatch.setattr(
+        server,
+        "_session_info",
+        lambda *_args: (_ for _ in ()).throw(AssertionError("full session info called")),
+    )
+
+    def fake_switch_model(**kwargs):
+        switch_calls.append(kwargs)
+        return SimpleNamespace(
+            success=True,
+            new_model="new-model",
+            target_provider="new-provider",
+            api_key="new-key",
+            base_url="https://new.example/v1",
+            api_mode="chat_completions",
+            relay_provider="",
+            deployment_managed=False,
+            model_info=None,
+            warning_message="",
+        )
+
+    monkeypatch.setattr(model_switch, "switch_model", fake_switch_model)
+
+    def fake_expensive_model_warning(*args, **kwargs):
+        cost_calls.append((args, kwargs))
+        return None
+
+    monkeypatch.setattr(
+        model_cost_guard,
+        "expensive_model_warning",
+        fake_expensive_model_warning,
+    )
+
+    with server.owner_worker_gateway_runtime(runtime):
+        response = server._methods["config.set"]("request", {
+            "key": "model",
+            "session_id": "runtime-a",
+            "registration_id": "registration-a",
+            "value": "new-model --provider new-provider --session",
+        })
+
+    assert response["result"]["value"] == "new-model"
+    assert switch_calls[0]["trusted_selection"] is True
+    assert cost_calls[0][1]["allow_network"] is False
+    assert agent.switch_kwargs["route_only"] is True
+    assert agent._cached_system_prompt == "existing prompt"
+    assert session["history"] == [{"role": "user", "content": "hello"}]
+    assert session["history_version"] == 1
+    assert session["model_override"]["model"] == "new-model"
+    assert scheduled == [(session, {
+        "model": "new-model",
+        "provider": "new-provider",
+        "base_url": "https://new.example/v1",
+        "api_mode": "chat_completions",
+    })]
+    assert emitted == [
+        ("session.info", "runtime-a", {"model": "new-model", "provider": "new-provider"})
+    ]
+
+
+def test_stale_route_persistence_is_discarded_before_db_access():
+    from tui_gateway import server
+
+    db = SimpleNamespace(get_session=lambda _sid: (_ for _ in ()).throw(
+        AssertionError("stale route touched the database")
+    ))
+    agent = SimpleNamespace(_session_db=db)
+    session = {
+        "agent": agent,
+        "route_generation": 2,
+        "session_key": "stored-a",
+    }
+
+    server._persist_live_session_runtime(
+        session,
+        route={"model": "old-model", "provider": "old-provider"},
+        generation=1,
+    )
+
+
+def test_registered_config_switch_rejects_mismatched_route(monkeypatch):
+    from hermes_cli import model_registrations
+    from tui_gateway import server
+
+    session = {"agent": SimpleNamespace()}
+    runtime = server.OwnerWorkerGatewayRuntime("owner", 1, "worker", 1, 0)
+    runtime.mutable_state.sessions["runtime-a"] = session
+    monkeypatch.setattr(
+        model_registrations,
+        "resolve_chat_model_registration",
+        lambda registration_id: {
+            "registration_id": registration_id,
+            "provider": "registered-provider",
+            "model": "registered-model",
+        },
+    )
+
+    with server.owner_worker_gateway_runtime(runtime):
+        response = server._methods["config.set"]("request", {
+            "key": "model",
+            "session_id": "runtime-a",
+            "registration_id": "registration-a",
+            "value": "different-model --provider registered-provider --session",
+        })
+
+    assert response["error"]["code"] == 4002
+    assert response["error"]["message"] == "model registration does not match requested route"
+
+
 def test_persist_model_switch_uses_config_set_value_for_all_model_keys(monkeypatch):
     from hermes_cli import config
     from tui_gateway import server

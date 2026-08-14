@@ -27,6 +27,7 @@ import json
 import logging
 import re
 import time
+from collections import OrderedDict
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -1655,6 +1656,87 @@ def create_openai_client(agent, client_kwargs: dict, *, reason: str, shared: boo
     return client
 
 
+_ROUTE_CLIENT_CACHE_LIMIT = 3
+
+
+def _route_cache_value(value: Any) -> Any:
+    """Return a stable, non-secret identity for request-affecting values."""
+    if isinstance(value, dict):
+        return tuple(sorted((str(key), _route_cache_value(item)) for key, item in value.items()))
+    if isinstance(value, (list, tuple)):
+        return tuple(_route_cache_value(item) for item in value)
+    if isinstance(value, (str, int, float, bool, type(None))):
+        return value
+    return (type(value).__module__, type(value).__qualname__, id(value))
+
+
+def _route_cache_key(
+    provider: str,
+    base_url: str,
+    api_mode: str,
+    api_key: Any,
+    relay_provider: str,
+    client_kwargs: dict,
+) -> tuple:
+    # SDK timeouts are model policy, not transport identity. Request-local
+    # clients receive the current timeout without invalidating a reusable route.
+    identity_kwargs = dict(client_kwargs or {})
+    identity_kwargs.pop("api_key", None)
+    identity_kwargs.pop("base_url", None)
+    identity_kwargs.pop("timeout", None)
+    identity_kwargs.pop("max_retries", None)
+    if relay_provider and identity_kwargs.get("default_headers") == {
+        "x-hermes-deployment-provider": relay_provider,
+    }:
+        identity_kwargs.pop("default_headers", None)
+    return (
+        str(provider or "").strip().lower(),
+        str(base_url or "").strip().rstrip("/"),
+        str(api_mode or "").strip().lower(),
+        _route_cache_value(api_key),
+        str(relay_provider or "").strip().lower(),
+        _route_cache_value(identity_kwargs),
+    )
+
+
+def _cache_current_route(agent, route_key: tuple) -> None:
+    cache = getattr(agent, "_route_client_cache", None)
+    if cache is None:
+        cache = OrderedDict()
+        agent._route_client_cache = cache
+    client = getattr(agent, "client", None)
+    anthropic_client = getattr(agent, "_anthropic_client", None)
+    pool = getattr(agent, "_credential_pool", None)
+    if client is None and anthropic_client is None and pool is None:
+        return
+    cache[route_key] = (client, anthropic_client, pool)
+    cache.move_to_end(route_key)
+    while len(cache) > _ROUTE_CLIENT_CACHE_LIMIT:
+        _old_key, (old_client, old_anthropic, _old_pool) = cache.popitem(last=False)
+        agent._close_route_resources(
+            old_client,
+            old_anthropic,
+            reason="route_cache_evict",
+        )
+
+
+def activate_pending_route(agent) -> None:
+    """Lazily load route-local credentials and special transport facades."""
+    if not getattr(agent, "_route_activation_pending", False):
+        return
+    provider = str(getattr(agent, "provider", "") or "").strip().lower()
+    if getattr(agent, "_credential_pool", None) is None:
+        try:
+            from agent.credential_pool import load_pool
+            agent._credential_pool = load_pool(getattr(agent, "_route_pool_provider", None) or provider)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("lazy route credential pool load failed for %s: %s", provider, exc)
+    if provider == "moa" and getattr(agent, "client", None) is None:
+        from agent.moa_loop import MoAClient
+        agent.client = MoAClient(agent.model or "default")
+    agent._route_activation_pending = False
+
+
 def switch_model(
     agent,
     new_model,
@@ -1663,6 +1745,7 @@ def switch_model(
     base_url='',
     api_mode='',
     relay_provider='',
+    route_only=False,
 ):
     """Switch the model/provider in-place for a live agent.
 
@@ -1670,7 +1753,8 @@ def switch_model(
     ``model_switch.switch_model()`` has resolved credentials and
     validated the model.  This method performs the actual runtime
     swap: rebuilding clients, updating caching flags, and refreshing
-    the context compressor.
+    the context compressor. Registered UI switches may use ``route_only``
+    to preserve conversation context while replacing the request route.
 
     The implementation mirrors ``_try_activate_fallback()`` for the
     client-swap logic but also updates ``_primary_runtime`` so the
@@ -1760,29 +1844,98 @@ def switch_model(
         if api_key:
             agent.api_key = api_key
 
-        # ── Reload credential pool for the new provider (issue #52727) ──
-        # Without this, ``recover_with_credential_pool`` sees a
-        # ``pool.provider != agent.provider`` mismatch and short-circuits,
-        # leaving the new provider with no rotation/recovery on 401/429 and
-        # burning the original pool's entries. Only reload when the provider
-        # actually changed (or the pool was missing) — re-selecting the same
-        # provider must not churn the pool reference. A reload failure is
-        # logged + swallowed: the switch itself must still complete.
         old_norm = (old_provider or "").strip().lower()
         new_norm = (new_provider or "").strip().lower()
-        if old_norm != new_norm or getattr(agent, "_credential_pool", None) is None:
-            try:
-                from agent.credential_pool import load_pool
-                agent._credential_pool = load_pool(new_provider)
-            except Exception as _pool_exc:  # noqa: BLE001
-                logger.warning(
-                    "switch_model: credential pool reload failed for %s (%s); "
-                    "continuing without pool rotation this turn",
-                    new_provider, _pool_exc,
-                )
 
-        # ── Build new client ──
-        if (new_provider or "").strip().lower() == "moa":
+        if route_only:
+            # Registered Chat GUI switches install an in-memory route only. A
+            # compatible route keeps the exact existing client and pool; a
+            # previously used route reuses its cached resources; a genuinely
+            # new route stays clientless until the next turn starts.
+            if new_norm == "moa":
+                agent.api_mode = "chat_completions"
+                agent.api_key = api_key or "moa-virtual-provider"
+                agent.base_url = "moa://local"
+                desired_kwargs = {}
+            elif api_mode == "anthropic_messages":
+                agent.api_key = api_key
+                agent._anthropic_api_key = api_key
+                agent._anthropic_base_url = base_url or None
+                agent._is_anthropic_oauth = False
+                agent.base_url = base_url
+                desired_kwargs = {}
+            else:
+                agent.api_key = api_key
+                agent.base_url = base_url
+                desired_kwargs = {
+                    "api_key": agent.api_key,
+                    "base_url": agent.base_url,
+                }
+                if agent.relay_provider:
+                    desired_kwargs["default_headers"] = {
+                        "x-hermes-deployment-provider": agent.relay_provider,
+                    }
+                try:
+                    from hermes_cli.config import (
+                        apply_custom_provider_tls_to_client_kwargs,
+                        get_compatible_custom_providers,
+                        load_config_readonly,
+                    )
+                    apply_custom_provider_tls_to_client_kwargs(
+                        desired_kwargs,
+                        str(agent.base_url or ""),
+                        get_compatible_custom_providers(load_config_readonly()),
+                    )
+                except Exception:
+                    logger.debug("custom-provider TLS resolution skipped on route switch", exc_info=True)
+
+            old_key = _route_cache_key(
+                old_provider,
+                "" if _snapshot.get("base_url") is _MISSING else str(_snapshot.get("base_url") or ""),
+                "" if _snapshot.get("api_mode") is _MISSING else str(_snapshot.get("api_mode") or ""),
+                "" if _snapshot.get("api_key") is _MISSING else _snapshot.get("api_key"),
+                "" if _snapshot.get("relay_provider") is _MISSING else str(_snapshot.get("relay_provider") or ""),
+                _snapshot["_client_kwargs"],
+            )
+            new_key = _route_cache_key(
+                agent.provider,
+                agent.base_url,
+                agent.api_mode,
+                agent.api_key,
+                agent.relay_provider,
+                desired_kwargs,
+            )
+            if new_key != old_key:
+                _cache_current_route(agent, old_key)
+                cached = getattr(agent, "_route_client_cache", {}).pop(new_key, None)
+                if cached is None:
+                    agent.client = None
+                    agent._anthropic_client = None
+                    agent._credential_pool = None
+                    agent._route_activation_pending = True
+                else:
+                    agent.client, agent._anthropic_client, agent._credential_pool = cached
+                    agent._route_activation_pending = False
+            # Same-route model changes preserve the existing activation state:
+            # if the route is already live its clients remain reusable; if it was
+            # just installed clientless, the next turn still has to activate it.
+            agent._client_kwargs = desired_kwargs
+            agent._route_pool_provider = new_provider
+        else:
+            # Legacy /model switches retain eager pool and client activation.
+            if old_norm != new_norm or getattr(agent, "_credential_pool", None) is None:
+                try:
+                    from agent.credential_pool import load_pool
+                    agent._credential_pool = load_pool(new_provider)
+                except Exception as _pool_exc:  # noqa: BLE001
+                    logger.warning(
+                        "switch_model: credential pool reload failed for %s (%s); "
+                        "continuing without pool rotation this turn",
+                        new_provider, _pool_exc,
+                    )
+
+        # ── Build new client for legacy eager switches ──
+        if not route_only and (new_provider or "").strip().lower() == "moa":
             from agent.moa_loop import MoAClient
 
             # The MoA virtual provider speaks only chat.completions via the
@@ -1801,7 +1954,7 @@ def switch_model(
             agent.base_url = "moa://local"
             agent._client_kwargs = {}
             agent.client = MoAClient(agent.model or "default")
-        elif api_mode == "anthropic_messages":
+        elif not route_only and api_mode == "anthropic_messages":
             from agent.anthropic_adapter import (
                 build_anthropic_client,
                 resolve_anthropic_token,
@@ -1844,7 +1997,7 @@ def switch_model(
             agent._is_anthropic_oauth = _is_oauth_token(effective_key) if (_is_native_anthropic and isinstance(effective_key, str)) else False
             agent.client = None
             agent._client_kwargs = {}
-        else:
+        elif not route_only:
             effective_key = api_key or agent.api_key
             effective_base = base_url or agent.base_url
             agent._client_kwargs = {
@@ -1908,35 +2061,42 @@ def switch_model(
     )
 
     # ── LM Studio: preload before probing context length ──
-    agent._ensure_lmstudio_runtime_loaded()
+    # Route-only UI switches defer model loading to the next actual request.
+    if not route_only:
+        agent._ensure_lmstudio_runtime_loaded()
 
     # ── Update context compressor ──
     if hasattr(agent, "context_compressor") and agent.context_compressor:
-        from agent.model_metadata import get_model_context_length
-        # Re-read custom_providers from live config so per-model
-        # context_length overrides are honored when switching to a
-        # custom provider mid-session (closes #15779).
-        _sm_custom_providers = None
-        try:
-            from hermes_cli.config import load_config, get_compatible_custom_providers
-            _sm_cfg = load_config()
-            _sm_custom_providers = get_compatible_custom_providers(_sm_cfg)
-        except Exception:
-            _sm_custom_providers = None
-        # ``agent.api_key`` may be a callable (Azure Foundry Entra ID
-        # token provider). ``get_model_context_length`` expects a
-        # string for its live-probe paths; for Foundry the context
-        # length normally resolves via config or static catalogs and
-        # never hits a probe, but coerce to empty string defensively.
-        _ctx_api_key = agent.api_key if isinstance(agent.api_key, str) else ""
-        new_context_length = get_model_context_length(
-            agent.model,
-            base_url=agent.base_url,
-            api_key=_ctx_api_key,
-            provider=agent.provider,
-            config_context_length=getattr(agent, "_config_context_length", None),
-            custom_providers=_sm_custom_providers,
+        new_context_length = (
+            agent.context_compressor.context_length if route_only else None
         )
+        if new_context_length is None:
+            from agent.model_metadata import get_model_context_length
+
+            # Re-read custom_providers from live config so per-model
+            # context_length overrides are honored when switching to a
+            # custom provider mid-session (closes #15779).
+            _sm_custom_providers = None
+            try:
+                from hermes_cli.config import load_config, get_compatible_custom_providers
+                _sm_cfg = load_config()
+                _sm_custom_providers = get_compatible_custom_providers(_sm_cfg)
+            except Exception:
+                _sm_custom_providers = None
+            # ``agent.api_key`` may be a callable (Azure Foundry Entra ID
+            # token provider). ``get_model_context_length`` expects a
+            # string for its live-probe paths; for Foundry the context
+            # length normally resolves via config or static catalogs and
+            # never hits a probe, but coerce to empty string defensively.
+            _ctx_api_key = agent.api_key if isinstance(agent.api_key, str) else ""
+            new_context_length = get_model_context_length(
+                agent.model,
+                base_url=agent.base_url,
+                api_key=_ctx_api_key,
+                provider=agent.provider,
+                config_context_length=getattr(agent, "_config_context_length", None),
+                custom_providers=_sm_custom_providers,
+            )
         agent.context_compressor.update_model(
             model=agent.model,
             context_length=new_context_length,
@@ -1950,8 +2110,10 @@ def switch_model(
         agent._compression_feasibility_checked = False
         agent._compression_prepare_token_cap = None
 
-    # ── Invalidate cached system prompt so it rebuilds next turn ──
-    agent._cached_system_prompt = None
+    # CLI switches refresh route metadata embedded in the prompt. Route-only UI
+    # switches keep the established conversation prompt unchanged.
+    if not route_only:
+        agent._cached_system_prompt = None
 
     # ── Update _primary_runtime so the change persists across turns ──
     _cc = agent.context_compressor if hasattr(agent, "context_compressor") and agent.context_compressor else None
@@ -2015,7 +2177,7 @@ def switch_model(
     # See #48248 for the full bug description.
     _session_db = getattr(agent, "_session_db", None)
     _session_id = getattr(agent, "session_id", None)
-    if _session_db is not None and _session_id:
+    if not route_only and _session_db is not None and _session_id:
         try:
             _session_db.update_session_billing_route(
                 _session_id,
@@ -3089,6 +3251,7 @@ __all__ = [
     "sanitize_tool_call_arguments",
     "repair_message_sequence",
     "strip_think_blocks",
+    "activate_pending_route",
     "recover_with_credential_pool",
     "try_recover_primary_transport",
     "drop_thinking_only_and_merge_users",

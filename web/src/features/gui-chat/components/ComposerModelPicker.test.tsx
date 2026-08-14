@@ -79,15 +79,14 @@ describe("ComposerModelPicker", () => {
     expect(trigger().textContent).toContain("Select model");
   });
 
-  it("switches the session model and closes the popover", async () => {
-    const onSwitchChat = vi.fn().mockResolvedValue({ confirm_required: false, value: "default-model" });
+  it("switches the session model and closes the popover immediately", async () => {
+    const pending = deferred<{ confirm_required: boolean; value: string }>();
+    const onSwitchChat = vi.fn().mockReturnValue(pending.promise);
     await renderPicker({ onSwitchChat });
     await openPicker();
 
     await act(async () => {
       optionFor("default-model").click();
-      await Promise.resolve();
-      await Promise.resolve();
     });
 
     expect(onSwitchChat).toHaveBeenCalledWith(
@@ -95,6 +94,22 @@ describe("ComposerModelPicker", () => {
       false,
     );
     expect(queryListbox()).toBeNull();
+    expect(trigger().textContent).toContain("default-model");
+
+    await act(async () => pending.resolve({ confirm_required: false, value: "default-model" }));
+  });
+
+  it("rolls the optimistic label back when switching fails", async () => {
+    const pending = deferred<never>();
+    await renderPicker({ onSwitchChat: vi.fn().mockReturnValue(pending.promise) });
+    await openPicker();
+
+    await act(async () => optionFor("default-model").click());
+    expect(trigger().textContent).toContain("default-model");
+
+    await act(async () => pending.reject(new Error("switch failed")));
+    expect(trigger().textContent).toContain("current-model");
+    expect(document.body.textContent).toContain("switch failed");
   });
 
   it("confirms expensive models before switching", async () => {
@@ -110,6 +125,7 @@ describe("ComposerModelPicker", () => {
       await Promise.resolve();
     });
 
+    expect(trigger().textContent).toContain("current-model");
     expect(document.body.textContent).toContain("High price");
     expect(onSwitchChat).toHaveBeenCalledTimes(1);
 
@@ -218,4 +234,14 @@ async function clickButton(text: string, exact = false) {
     await Promise.resolve();
     await Promise.resolve();
   });
+}
+
+function deferred<T>() {
+  let reject!: (reason?: unknown) => void;
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  return { promise, reject, resolve };
 }

@@ -2873,12 +2873,13 @@ def _stored_session_runtime_overrides(row: dict | None) -> dict:
     return overrides
 
 
-def _runtime_model_config(agent, existing: dict | None = None) -> dict:
+def _runtime_model_config(agent, existing: dict | None = None, *, route: dict | None = None) -> dict:
     config = dict(existing or {})
-    model = str(getattr(agent, "model", "") or "").strip()
-    provider = str(getattr(agent, "provider", "") or "").strip()
-    base_url = str(getattr(agent, "base_url", "") or "").strip()
-    api_mode = str(getattr(agent, "api_mode", "") or "").strip()
+    route = route or {}
+    model = str(route.get("model", getattr(agent, "model", "")) or "").strip()
+    provider = str(route.get("provider", getattr(agent, "provider", "")) or "").strip()
+    base_url = str(route.get("base_url", getattr(agent, "base_url", "")) or "").strip()
+    api_mode = str(route.get("api_mode", getattr(agent, "api_mode", "")) or "").strip()
     reasoning_config = getattr(agent, "reasoning_config", None)
     service_tier = getattr(agent, "service_tier", None)
 
@@ -2951,13 +2952,20 @@ def _runtime_model_config(agent, existing: dict | None = None) -> dict:
     return config
 
 
-def _persist_live_session_runtime(session: dict | None) -> None:
-    """Persist active session runtime so future resumes restore the same footer."""
+def _persist_live_session_runtime(
+    session: dict | None,
+    *,
+    route: dict | None = None,
+    generation: int | None = None,
+) -> None:
+    """Persist an immutable runtime snapshot without letting stale writes win."""
     if not session:
         return
     agent = session.get("agent")
     session_key = str(session.get("session_key") or "").strip()
     if agent is None or not session_key:
+        return
+    if generation is not None and generation != session.get("route_generation"):
         return
 
     db = getattr(agent, "_session_db", None) or _get_db()
@@ -2966,6 +2974,8 @@ def _persist_live_session_runtime(session: dict | None) -> None:
 
     try:
         row = db.get_session(session_key) or {}
+        if generation is not None and generation != session.get("route_generation"):
+            return
         raw_config = row.get("model_config")
         existing_config = {}
         if isinstance(raw_config, dict):
@@ -2974,14 +2984,38 @@ def _persist_live_session_runtime(session: dict | None) -> None:
             parsed = json.loads(raw_config)
             if isinstance(parsed, dict):
                 existing_config = parsed
-        model_config = _runtime_model_config(agent, existing_config)
-        model = str(getattr(agent, "model", "") or "").strip()
+        model_config = _runtime_model_config(agent, existing_config, route=route)
+        model = str((route or {}).get("model", getattr(agent, "model", "")) or "").strip()
+        if generation is not None and generation != session.get("route_generation"):
+            return
         if hasattr(db, "update_session_meta"):
             db.update_session_meta(session_key, json.dumps(model_config), model or None)
         elif model and hasattr(db, "update_session_model"):
             db.update_session_model(session_key, model)
+        if generation is None or generation == session.get("route_generation"):
+            try:
+                db.update_session_billing_route(
+                    session_key,
+                    provider=str((route or {}).get("provider", getattr(agent, "provider", "")) or ""),
+                    base_url=str((route or {}).get("base_url", getattr(agent, "base_url", "")) or ""),
+                    billing_mode=str((route or {}).get("api_mode", getattr(agent, "api_mode", "")) or ""),
+                )
+            except Exception:
+                logger.debug("failed to persist live billing route", exc_info=True)
     except Exception:
         logger.debug("failed to persist live session runtime", exc_info=True)
+
+
+def _schedule_live_session_runtime_persist(session: dict, route: dict) -> None:
+    generation = int(session.get("route_generation") or 0) + 1
+    session["route_generation"] = generation
+    snapshot = dict(route)
+    _rpc_pool().submit(
+        _persist_live_session_runtime,
+        session,
+        route=snapshot,
+        generation=generation,
+    )
 
 
 def _persist_live_session_system_prompt(session: dict | None) -> None:
@@ -3397,6 +3431,7 @@ def _apply_model_switch(
     confirm_expensive_model: bool = False,
     pin_session_override: bool = True,
     parsed_flags: tuple[str, str, bool, bool, bool] | None = None,
+    trusted_selection: bool = False,
 ) -> dict:
     from hermes_cli.model_switch import (
         parse_model_flags,
@@ -3467,11 +3502,12 @@ def _apply_model_switch(
         explicit_provider=explicit_provider,
         user_providers=user_provs,
         custom_providers=custom_provs,
+        trusted_selection=trusted_selection,
     )
     if not result.success:
         raise ValueError(result.error_message or "model switch failed")
 
-    if agent:
+    if agent and not trusted_selection:
         try:
             from hermes_cli.context_switch_guard import merge_preflight_compression_warning
 
@@ -3500,6 +3536,7 @@ def _apply_model_switch(
                 base_url=result.base_url or current_base_url,
                 api_key=result.api_key or current_api_key,
                 model_info=result.model_info,
+                allow_network=not trusted_selection,
             )
         except Exception:
             warning = None
@@ -3523,6 +3560,7 @@ def _apply_model_switch(
                 base_url=result.base_url,
                 api_mode=result.api_mode,
                 relay_provider=getattr(result, "relay_provider", ""),
+                route_only=trusted_selection,
             )
         except Exception as exc:
             # The in-place swap rolled the agent back to the old working
@@ -3537,12 +3575,19 @@ def _apply_model_switch(
                 f"Model switch to {result.new_model} failed ({exc}); "
                 f"staying on {getattr(agent, 'model', current_model)}."
             ) from exc
-        _persist_live_session_runtime(session)
-        _persist_live_session_system_prompt(session)
-        _append_model_switch_marker(
-            session, model=result.new_model, provider=result.target_provider
-        )
-        _emit("session.info", sid, _session_info(agent, session))
+        if trusted_selection:
+            _emit(
+                "session.info",
+                sid,
+                {"model": result.new_model, "provider": result.target_provider},
+            )
+        else:
+            _persist_live_session_runtime(session)
+            _persist_live_session_system_prompt(session)
+            _append_model_switch_marker(
+                session, model=result.new_model, provider=result.target_provider
+            )
+            _emit("session.info", sid, _session_info(agent, session))
 
     # Record the switch as a PER-SESSION override so a later rebuild of THIS
     # session (e.g. /new via _reset_session_agent, or resume) re-derives the
@@ -3566,6 +3611,16 @@ def _apply_model_switch(
             "api_key": None if getattr(result, "deployment_managed", False) else result.api_key,
             "api_mode": result.api_mode,
         }
+    if trusted_selection and agent and isinstance(session, dict):
+        _schedule_live_session_runtime_persist(
+            session,
+            {
+                "model": result.new_model,
+                "provider": result.target_provider,
+                "base_url": result.base_url,
+                "api_mode": result.api_mode,
+            },
+        )
     if persist_global:
         _persist_model_switch(result)
     return {
@@ -12663,7 +12718,43 @@ def _(rid, params: dict) -> dict:
                 from hermes_cli.model_switch import parse_model_flags
 
                 parsed_flags = parse_model_flags(value)
-                _model_input, explicit_provider, _persist_global, _force_refresh, _is_session = parsed_flags
+                (
+                    model_input,
+                    explicit_provider,
+                    persist_global,
+                    force_refresh,
+                    is_session,
+                ) = parsed_flags
+                registration_id = str(params.get("registration_id") or "").strip()
+                trusted_selection = False
+                if registration_id:
+                    from hermes_cli.model_registrations import (
+                        resolve_chat_model_registration,
+                    )
+
+                    registration = resolve_chat_model_registration(registration_id)
+                    registered_model = str(registration.get("model") or "").strip()
+                    registered_provider = str(
+                        registration.get("provider") or ""
+                    ).strip()
+                    if (
+                        model_input != registered_model
+                        or explicit_provider.strip().lower()
+                        != registered_provider.lower()
+                    ):
+                        return _err(
+                            rid,
+                            4002,
+                            "model registration does not match requested route",
+                        )
+                    parsed_flags = (
+                        registered_model,
+                        registered_provider,
+                        persist_global,
+                        force_refresh,
+                        is_session,
+                    )
+                    trusted_selection = True
                 if session.get("agent") is None and not explicit_provider.strip():
                     session_id = params.get("session_id", "")
                     _start_agent_build(session_id, session)
@@ -12680,6 +12771,7 @@ def _(rid, params: dict) -> dict:
                         params.get("confirm_expensive_model", False)
                     ),
                     parsed_flags=parsed_flags,
+                    trusted_selection=trusted_selection,
                 )
             else:
                 result = _apply_model_switch(

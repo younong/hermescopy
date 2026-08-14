@@ -43,6 +43,7 @@ export function ComposerModelPicker({
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [switchingId, setSwitchingId] = useState<string | null>(null);
+  const [optimisticRegistration, setOptimisticRegistration] = useState<ModelRegistration | null>(null);
   const [pendingConfirm, setPendingConfirm] = useState<PendingConfirm | null>(null);
   const rootRef = useRef<HTMLDivElement | null>(null);
 
@@ -96,10 +97,13 @@ export function ComposerModelPicker({
   ) => {
     if (switchingId || (!confirmExpensiveModel && busy) || !canSwitch) return;
     setSwitchingId(registration.id);
+    setOptimisticRegistration(registration);
+    setOpen(false);
     setError(null);
     try {
       const result = await onSwitchChat(registration, confirmExpensiveModel);
       if (result.confirm_required) {
+        setOptimisticRegistration(null);
         setPendingConfirm({
           message:
             result.confirm_message ||
@@ -109,16 +113,32 @@ export function ComposerModelPicker({
         });
         return;
       }
-      setOpen(false);
     } catch (cause) {
+      setOptimisticRegistration(null);
       setError(cause instanceof Error ? cause.message : String(cause));
+      setOpen(true);
     } finally {
       setSwitchingId(null);
     }
   };
 
-  const disabled = switchDisabled;
-  const shortName = (currentModel ?? "").split("/").pop() || copy.selectModel;
+  useEffect(() => {
+    if (
+      optimisticRegistration &&
+      optimisticRegistration.model === currentModel &&
+      (optimisticRegistration.provider === currentProvider || !currentProvider)
+    ) {
+      setOptimisticRegistration(null);
+    }
+  }, [currentModel, currentProvider, optimisticRegistration]);
+
+  const disabled = switchDisabled || Boolean(switchingId);
+  const displayedModel = optimisticRegistration?.model ?? currentModel;
+  const displayedProvider = optimisticRegistration?.provider ?? currentProvider;
+  const displayedModelIsUnique = registrations
+    ? registrations.filter((registration) => registration.model === displayedModel).length <= 1
+    : false;
+  const shortName = (displayedModel ?? "").split("/").pop() || copy.selectModel;
 
   const toggleOpen = () => {
     const next = !open;
@@ -136,7 +156,7 @@ export function ComposerModelPicker({
         className="flex h-7 max-w-36 items-center gap-1 rounded-full px-2 text-[0.6875rem] font-medium text-[#686d75] transition hover:bg-[#f0f1f3] disabled:cursor-not-allowed disabled:opacity-60 sm:max-w-48"
         disabled={disabled}
         onClick={toggleOpen}
-        title={currentModel}
+        title={displayedModel}
         type="button"
       >
         <span className="truncate">{shortName}</span>
@@ -181,12 +201,9 @@ export function ComposerModelPicker({
             // provider (e.g. bare "custom"), which need not equal the
             // registration's slug ("custom:kimi-code"). When the model id is
             // unique across registrations, a model match alone is enough.
-            const modelIsUnique = !registrations.some(
-              (other) => other !== registration && other.model === currentModel,
-            );
             const isCurrent =
-              registration.model === currentModel &&
-              (registration.provider === currentProvider || modelIsUnique);
+              registration.model === displayedModel &&
+              (registration.provider === displayedProvider || displayedModelIsUnique);
             const switching = switchingId === registration.id;
             return (
               <button

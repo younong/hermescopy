@@ -9,7 +9,7 @@ import { getHermesBrowserId } from "@/lib/browserIdentity";
 import type { GuiFrameQueueDiagnostic } from "@/lib/chatDiagnostics";
 import { createCollaborationApi, type CollaborationApi } from "@/features/collaboration/api";
 import { base64FromDataUrl, compressImageForUpload, readFileAsDataUrl } from "./attachments";
-import type { ReasoningLevel } from "@/lib/api";
+import type { ModelRegistration, ReasoningLevel } from "@/lib/api";
 import type {
   SessionAttachResponse,
   SessionCreateResponse,
@@ -116,10 +116,11 @@ export interface GuiChatConnection {
   stop(sessionId: string): Promise<void>;
   switchModel(
     sessionId: string,
-    provider: string,
-    model: string,
-    confirmExpensiveModel?: boolean,
-    persistGlobally?: boolean,
+    registration: Pick<ModelRegistration, "id" | "model" | "provider">,
+    options?: {
+      confirmExpensiveModel?: boolean;
+      persistGlobally?: boolean;
+    },
   ): Promise<GuiChatModelSwitchResponse>;
   setReasoningLevel(sessionId: string, level: ReasoningLevel): Promise<{ value?: string }>;
   respondToApproval(sessionId: string, request: unknown, approved: boolean): Promise<void>;
@@ -345,18 +346,13 @@ export function connectGuiChat(options: ConnectGuiChatOptions): GuiChatConnectio
         session_id: sessionId,
         value: level,
       }),
-    switchModel: (
-      sessionId,
-      provider,
-      model,
-      confirmExpensiveModel = false,
-      persistGlobally = false,
-    ) =>
+    switchModel: (sessionId, registration, options) =>
       client.request<GuiChatModelSwitchResponse>("config.set", {
-        confirm_expensive_model: confirmExpensiveModel,
+        confirm_expensive_model: options?.confirmExpensiveModel ?? false,
         key: "model",
+        registration_id: registration.id,
         session_id: sessionId,
-        value: `${model} --provider ${provider} ${persistGlobally ? "--global" : "--session"}`,
+        value: `${registration.model} --provider ${registration.provider} ${options?.persistGlobally ? "--global" : "--session"}`,
       }),
   };
 }

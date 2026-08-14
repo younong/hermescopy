@@ -791,6 +791,7 @@ class AIAgent:
         base_url='',
         api_mode='',
         relay_provider='',
+        route_only=False,
     ):
         """Forwarder — see ``agent.agent_runtime_helpers.switch_model``."""
         from agent.agent_runtime_helpers import switch_model
@@ -802,6 +803,7 @@ class AIAgent:
             base_url,
             api_mode,
             relay_provider,
+            route_only,
         )
 
     def _safe_print(self, *args, **kwargs):
@@ -3477,12 +3479,26 @@ class AIAgent:
         except Exception:
             pass
 
-        # Close the OpenAI/httpx client to release sockets immediately.
+        # Close every SDK client retained by route reuse.
         try:
-            client = getattr(self, "client", None)
-            if client is not None:
-                self._close_openai_client(client, reason="cache_evict", shared=True)
-                self.client = None
+            resources = [(getattr(self, "client", None), getattr(self, "_anthropic_client", None))]
+            cache = getattr(self, "_route_client_cache", None)
+            if cache:
+                resources.extend((entry[0], entry[1]) for entry in cache.values())
+                cache.clear()
+            seen = set()
+            for openai_client, anthropic_client in resources:
+                identity = (id(openai_client), id(anthropic_client))
+                if identity in seen:
+                    continue
+                seen.add(identity)
+                self._close_route_resources(
+                    openai_client,
+                    anthropic_client,
+                    reason="cache_evict",
+                )
+            self.client = None
+            self._anthropic_client = None
         except Exception:
             pass
 
@@ -3533,12 +3549,26 @@ class AIAgent:
         except Exception:
             pass
 
-        # 5. Close the OpenAI/httpx client
+        # 5. Close every SDK client retained by route reuse.
         try:
-            client = getattr(self, "client", None)
-            if client is not None:
-                self._close_openai_client(client, reason="agent_close", shared=True)
-                self.client = None
+            resources = [(getattr(self, "client", None), getattr(self, "_anthropic_client", None))]
+            cache = getattr(self, "_route_client_cache", None)
+            if cache:
+                resources.extend((entry[0], entry[1]) for entry in cache.values())
+                cache.clear()
+            seen = set()
+            for openai_client, anthropic_client in resources:
+                identity = (id(openai_client), id(anthropic_client))
+                if identity in seen:
+                    continue
+                seen.add(identity)
+                self._close_route_resources(
+                    openai_client,
+                    anthropic_client,
+                    reason="agent_close",
+                )
+            self.client = None
+            self._anthropic_client = None
         except Exception:
             pass
 
@@ -3974,6 +4004,21 @@ class AIAgent:
         """Forwarder — see ``agent.agent_runtime_helpers.create_openai_client``."""
         from agent.agent_runtime_helpers import create_openai_client
         return create_openai_client(self, client_kwargs, reason=reason, shared=shared)
+
+    def _close_route_resources(
+        self,
+        openai_client: Any,
+        anthropic_client: Any,
+        *,
+        reason: str,
+    ) -> None:
+        if openai_client is not None:
+            self._close_openai_client(openai_client, reason=reason, shared=True)
+        if anthropic_client is not None and anthropic_client is not openai_client:
+            try:
+                anthropic_client.close()
+            except Exception:
+                logger.debug("Anthropic client close failed (%s)", reason, exc_info=True)
 
     @staticmethod
     def _abort_tcp_sockets(client: Any) -> int:
@@ -4791,6 +4836,11 @@ class AIAgent:
         """Forwarder — see ``agent.agent_runtime_helpers.restore_primary_runtime``."""
         from agent.agent_runtime_helpers import restore_primary_runtime
         return restore_primary_runtime(self)
+
+    def _activate_pending_route(self) -> None:
+        """Forwarder — see ``agent.agent_runtime_helpers.activate_pending_route``."""
+        from agent.agent_runtime_helpers import activate_pending_route
+        activate_pending_route(self)
 
     def _try_recover_primary_transport(
         self, api_error: Exception, *, retry_count: int, max_retries: int,

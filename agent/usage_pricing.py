@@ -735,6 +735,8 @@ def get_pricing_entry(
     provider: Optional[str] = None,
     base_url: Optional[str] = None,
     api_key: Optional[str] = None,
+    *,
+    allow_network: bool = True,
 ) -> Optional[PricingEntry]:
     route = resolve_billing_route(model_name, provider=provider, base_url=base_url)
     if route.billing_mode == "subscription_included":
@@ -746,6 +748,8 @@ def get_pricing_entry(
             source="none",
             pricing_version="included-route",
         )
+    if not allow_network:
+        return _lookup_official_docs_pricing(route)
     if route.provider == "openrouter":
         return _openrouter_pricing_entry(route)
     if route.base_url:
