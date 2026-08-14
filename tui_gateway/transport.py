@@ -176,6 +176,106 @@ class StdioTransport:
         return None
 
 
+class FanoutTransport:
+    """Broadcasts session events to every currently attached peer.
+
+    The hub owns only its subscriber registry, not the underlying transports.
+    WebSocket lifecycle remains with ``handle_ws`` so detaching one browser tab
+    cannot close the sockets used by other sessions or clients.
+    """
+
+    __slots__ = (
+        "_closed",
+        "_generation",
+        "_lock",
+        "_on_detached",
+        "_subscribers",
+    )
+
+    def __init__(self) -> None:
+        self._closed = False
+        self._generation = 0
+        self._lock = threading.Lock()
+        self._on_detached: Callable[["FanoutTransport"], None] | None = None
+        self._subscribers: dict[Transport, int] = {}
+
+    def set_on_detached(
+        self, callback: Callable[["FanoutTransport"], None]
+    ) -> None:
+        """Register the lifecycle hook run when write failures empty the hub."""
+        with self._lock:
+            self._on_detached = callback
+
+    @property
+    def subscriber_count(self) -> int:
+        with self._lock:
+            return len(self._subscribers)
+
+    @property
+    def is_detached(self) -> bool:
+        with self._lock:
+            return self._closed or not self._subscribers
+
+    def attach(self, transport: Transport) -> bool:
+        """Attach *transport*, returning whether it was newly subscribed."""
+        with self._lock:
+            if self._closed or transport in self._subscribers:
+                return False
+            self._generation += 1
+            self._subscribers[transport] = self._generation
+            return True
+
+    def detach(self, transport: Transport) -> bool:
+        """Detach *transport*, returning whether it was subscribed."""
+        with self._lock:
+            return self._subscribers.pop(transport, None) is not None
+
+    def contains(self, transport: Transport) -> bool:
+        with self._lock:
+            return transport in self._subscribers
+
+    def write(self, obj: dict) -> bool:
+        with self._lock:
+            if self._closed:
+                return False
+            subscribers = tuple(self._subscribers.items())
+
+        delivered = False
+        failed: list[tuple[Transport, int]] = []
+        for transport, generation in subscribers:
+            try:
+                if transport.write(obj):
+                    delivered = True
+                else:
+                    failed.append((transport, generation))
+            except Exception:
+                logger.debug("FanoutTransport subscriber write failed", exc_info=True)
+                failed.append((transport, generation))
+
+        became_detached = False
+        if failed:
+            with self._lock:
+                had_subscribers = bool(self._subscribers)
+                for transport, generation in failed:
+                    if self._subscribers.get(transport) == generation:
+                        self._subscribers.pop(transport, None)
+                became_detached = had_subscribers and not self._subscribers
+        if became_detached:
+            with self._lock:
+                on_detached = self._on_detached
+            if on_detached is not None:
+                try:
+                    on_detached(self)
+                except Exception:
+                    logger.debug("FanoutTransport detach callback failed", exc_info=True)
+        return delivered
+
+    def close(self) -> None:
+        with self._lock:
+            self._closed = True
+            self._subscribers.clear()
+
+
 class TeeTransport:
     """Mirrors writes to one primary plus N best-effort secondaries.
 

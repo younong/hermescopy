@@ -18,6 +18,7 @@ from hermes_cli.owner_runtime import ensure_owner_runtime_dirs, owner_worker_run
 from hermes_session_queries import DB_PERSISTED_MARKER
 from hermes_state import SessionDB
 from tui_gateway import server
+from tui_gateway.transport import FanoutTransport
 
 
 @pytest.fixture()
@@ -71,6 +72,44 @@ def owner_gateway(monkeypatch, tmp_path):
     roots.close()
 
 
+def test_fanout_transport_broadcasts_and_isolates_failed_subscribers():
+    class _Sink:
+        def __init__(self, *, fail=False):
+            self.fail = fail
+            self.frames = []
+
+        def write(self, frame):
+            self.frames.append(frame)
+            return not self.fail
+
+        def close(self):
+            return None
+
+    first = _Sink()
+    second = _Sink()
+    failed = _Sink(fail=True)
+    fanout = FanoutTransport()
+
+    assert fanout.attach(first) is True
+    assert fanout.attach(first) is False
+    assert fanout.attach(second) is True
+    assert fanout.attach(failed) is True
+    assert fanout.subscriber_count == 3
+
+    frame = {"method": "event", "params": {"type": "message.delta"}}
+    assert fanout.write(frame) is True
+    assert first.frames == [frame]
+    assert second.frames == [frame]
+    assert failed.frames == [frame]
+    assert fanout.subscriber_count == 2
+    assert fanout.detach(failed) is False
+    assert fanout.detach(first) is True
+    assert fanout.is_detached is False
+    assert fanout.detach(second) is True
+    assert fanout.is_detached is True
+    assert fanout.write(frame) is False
+
+
 def _create_owned(
     db: SessionDB,
     workspace_root: str,
@@ -96,6 +135,59 @@ class _Transport:
         return True
 
     def close(self):
+        return None
+
+
+class _DashboardTransport(_Transport):
+    def __init__(self):
+        super().__init__("interactive")
+        self.frames = []
+        self.scope = None
+        self.generation = -1
+        self.active_session_id = None
+        self.pending = None
+
+    def write(self, obj):
+        self.frames.append(obj)
+        return True
+
+    def begin_dashboard_attach(
+        self, generation, *, browser_id, profile="", pending=True
+    ):
+        scope = (browser_id, profile)
+        if not browser_id:
+            return "browser_id required"
+        if self.scope is not None and self.scope != scope:
+            return "dashboard attach scope mismatch"
+        if generation <= self.generation:
+            return "session attach superseded"
+        self.scope = scope
+        self.generation = generation
+        self.pending = generation if pending else None
+        return None
+
+    def commit_dashboard_attach(self, generation, session_id, *, on_commit=None):
+        if generation != self.generation:
+            return False
+        if on_commit is not None and not on_commit():
+            return False
+        self.active_session_id = session_id
+        if self.pending == generation:
+            self.pending = None
+        return True
+
+    def abort_dashboard_attach(self, generation):
+        if self.pending == generation:
+            self.pending = None
+
+    def dashboard_attach_is_current(self, generation):
+        return generation == self.generation
+
+    def dashboard_mutation_error(self, session_id):
+        if self.pending is not None:
+            return "dashboard session switch in progress"
+        if session_id != self.active_session_id:
+            return "dashboard mutation targets an inactive session"
         return None
 
 
@@ -2073,6 +2165,152 @@ def test_verified_artifact_emits_before_complete_and_failed_turn_emits_none(
     assert relevant == ["artifact.created", "message.complete", "message.complete"]
     artifacts = [event for event in events if event["type"] == "artifact.created"]
     assert artifacts[0]["payload"]["id"] == "artifact-zip"
+
+
+def test_dashboard_session_fanout_supports_multiple_tabs_and_switching(
+    owner_gateway, monkeypatch
+):
+    _db, runtime, _workspace_root = owner_gateway
+    first = _DashboardTransport()
+    second = _DashboardTransport()
+    created = _call(
+        runtime,
+        "session.create",
+        {
+            "browser_id": "browser-a",
+            "source": "dashboard-gui",
+            "switch_generation": 1,
+        },
+        transport=first,
+    )
+    assert "error" not in created
+    sid = created["result"]["session_id"]
+    session = runtime.mutable_state.sessions[sid]
+    fanout = session["transport"]
+    assert isinstance(fanout, FanoutTransport)
+    assert fanout.contains(first) is True
+
+    with server.owner_worker_gateway_runtime(runtime):
+        second.begin_dashboard_attach(1, browser_id="browser-a")
+        response = server._commit_session_attach(
+            "attach-second",
+            transport=second,
+            generation=1,
+            response={
+                "jsonrpc": "2.0",
+                "id": "attach-second",
+                "result": {"session_id": sid, "_attach_live": True},
+            },
+        )
+        assert "error" not in response
+        assert fanout.subscriber_count == 2
+
+        server._emit("message.delta", sid, {"text": "hello"})
+        assert first.frames[-1]["params"]["payload"] == {"text": "hello"}
+        assert second.frames[-1]["params"]["payload"] == {"text": "hello"}
+
+        other_sid = "runtime-b"
+        other = {
+            "_finalized": False,
+            "history_lock": threading.Lock(),
+            "last_active": 0,
+            "session_key": "stored-b",
+            "transport": FanoutTransport(),
+        }
+        runtime.mutable_state.sessions[other_sid] = other
+        second.begin_dashboard_attach(2, browser_id="browser-a")
+        response = server._commit_session_attach(
+            "switch-second",
+            transport=second,
+            generation=2,
+            response={
+                "jsonrpc": "2.0",
+                "id": "switch-second",
+                "result": {"session_id": other_sid, "_attach_live": True},
+            },
+        )
+        assert "error" not in response
+        assert fanout.contains(first) is True
+        assert fanout.contains(second) is False
+        assert other["transport"].contains(second) is True
+
+        server._emit("message.complete", sid, {"text": "done"})
+        assert first.frames[-1]["params"]["type"] == "message.complete"
+        assert second.frames[-1]["params"]["type"] == "message.delta"
+
+
+def test_dashboard_fanout_keeps_rpc_response_on_request_transport(owner_gateway):
+    _db, runtime, _workspace_root = owner_gateway
+    first = _DashboardTransport()
+    second = _DashboardTransport()
+    fanout = FanoutTransport()
+    fanout.attach(first)
+    fanout.attach(second)
+    runtime.mutable_state.sessions["runtime-a"] = {
+        "_finalized": False,
+        "history_lock": threading.Lock(),
+        "last_active": 0,
+        "session_key": "stored-a",
+        "transport": fanout,
+    }
+
+    response = _call(runtime, "gateway.ping", transport=first)
+
+    assert response == {"jsonrpc": "2.0", "id": "request", "result": {"ok": True}}
+    assert first.frames == []
+    assert second.frames == []
+
+
+def test_dashboard_failed_final_subscriber_schedules_orphan_reap(
+    owner_gateway, monkeypatch
+):
+    _db, runtime, _workspace_root = owner_gateway
+    failed = _DashboardTransport()
+    failed.write = lambda _obj: False
+    fanout = FanoutTransport()
+    fanout.attach(failed)
+    session = {
+        "close_on_disconnect": False,
+        "running": False,
+        "transport": fanout,
+    }
+    runtime.mutable_state.sessions["runtime-a"] = session
+    scheduled = []
+    monkeypatch.setattr(server, "_schedule_ws_orphan_reap", scheduled.append)
+
+    with server.owner_worker_gateway_runtime(runtime):
+        server._configure_dashboard_fanout("runtime-a", fanout)
+        assert fanout.write({"method": "event"}) is False
+
+    assert fanout.is_detached is True
+    assert scheduled == ["runtime-a"]
+    assert server._ws_session_is_orphaned(session) is True
+
+
+def test_dashboard_disconnect_only_orphans_after_final_tab(owner_gateway, monkeypatch):
+    _db, runtime, _workspace_root = owner_gateway
+    first = _DashboardTransport()
+    second = _DashboardTransport()
+    fanout = FanoutTransport()
+    fanout.attach(first)
+    fanout.attach(second)
+    scheduled = []
+    session = {
+        "close_on_disconnect": False,
+        "running": False,
+        "transport": fanout,
+    }
+    runtime.mutable_state.sessions["runtime-a"] = session
+    monkeypatch.setattr(server, "_schedule_ws_orphan_reap", scheduled.append)
+
+    with server.owner_worker_gateway_runtime(runtime):
+        assert server._close_sessions_for_transport(first) == (0, 0)
+        assert fanout.subscriber_count == 1
+        assert scheduled == []
+        assert server._close_sessions_for_transport(second) == (0, 1)
+        assert fanout.is_detached is True
+        assert scheduled == ["runtime-a"]
+        assert server._ws_session_is_orphaned(session) is True
 
 
 def test_websocket_teardown_binds_owner_runtime(owner_gateway, monkeypatch):
