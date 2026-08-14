@@ -5669,6 +5669,11 @@ def _resolve_checkpoint_hash(mgr, cwd: str, ref: str) -> str:
     raise ValueError(f"Invalid checkpoint number. Use 1-{len(checkpoints)}.")
 
 
+def _model_visible_image_path(path: Path) -> str:
+    visible = _authenticated_visible_path(path)
+    return f"/workspace/{visible}" if visible is not None else str(path)
+
+
 def _enrich_with_attached_images(user_text: str, image_paths: list[str]) -> str:
     """Pre-analyze attached images via vision and prepend descriptions to user text."""
     import asyncio, json as _json
@@ -5685,7 +5690,8 @@ def _enrich_with_attached_images(user_text: str, image_paths: list[str]) -> str:
         p = Path(path)
         if not p.exists():
             continue
-        hint = f"[You can examine it with vision_analyze using image_url: {p}]"
+        hint_path = _model_visible_image_path(p)
+        hint = f"[You can examine it with vision_analyze using image_url: {hint_path}]"
         try:
             r = _json.loads(
                 asyncio.run(vision_analyze_tool(image_url=str(p), user_prompt=prompt))
@@ -10901,8 +10907,6 @@ def _run_prompt_submit(
                             _cfg,
                             deployment_supports_vision=_deployment_supports_vision,
                         )
-                    if getattr(agent, "api_mode", "") == "codex_app_server":
-                        _mode = "text"
                 except Exception as _img_exc:
                     print(
                         f"[tui_gateway] image_routing decision failed, defaulting to text: {_img_exc}",
@@ -10915,6 +10919,9 @@ def _run_prompt_submit(
                         _parts, _skipped = build_native_content_parts(
                             prompt,
                             images,
+                            image_path_hints=[
+                                _model_visible_image_path(Path(path)) for path in images
+                            ],
                         )
                         if _skipped:
                             print(

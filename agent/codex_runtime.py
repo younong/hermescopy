@@ -231,7 +231,7 @@ def _record_codex_app_server_usage(agent, turn) -> dict[str, Any]:
 def run_codex_app_server_turn(
     agent,
     *,
-    user_message: str,
+    user_message: Any,
     original_user_message: Any,
     messages: List[Dict[str, Any]],
     effective_task_id: str,

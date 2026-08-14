@@ -18,7 +18,7 @@ from agent.transports.codex_app_server_session import (
     CodexAppServerSession,
     _ServerRequestRouting,
     _approval_choice_to_codex_decision,
-    _coerce_turn_input_text,
+    _coerce_turn_input,
 )
 
 
@@ -128,12 +128,15 @@ class TestApprovalChoiceMapping:
 
 
 class TestTurnInputCoercion:
-    def test_list_content_keeps_text_and_marks_images(self):
-        text = _coerce_turn_input_text([
+    def test_list_content_keeps_text_and_inline_images(self):
+        turn_input = _coerce_turn_input([
             {"type": "text", "text": "caption"},
             {"type": "image_url", "image_url": {"url": "data:image/png;base64,abc"}},
         ])
-        assert text == "caption\n\n[image attached]"
+        assert turn_input == [
+            {"type": "text", "text": "caption"},
+            {"type": "image", "url": "data:image/png;base64,abc"},
+        ]
 
 
 # ---- lifecycle ----
@@ -230,7 +233,7 @@ class TestRunTurn:
         assert r.token_usage_total["totalTokens"] == 500
         assert r.model_context_window == 200000
 
-    def test_rich_content_turn_is_collapsed_to_text_payload(self):
+    def test_rich_content_turn_sends_inline_image_payload(self):
         client = FakeClient()
         client.queue_notification(
             "turn/completed",
@@ -254,10 +257,13 @@ class TestRunTurn:
         assert r.error is None
         method, params = next(req for req in client.requests if req[0] == "turn/start")
         assert method == "turn/start"
-        text = params["input"][0]["text"]
-        assert isinstance(text, str)
-        assert "[Image attached at: /tmp/a.png]" in text
-        assert "[image attached]" in text
+        assert params["input"] == [
+            {
+                "type": "text",
+                "text": "look at this\n\n[Image attached at: /tmp/a.png]",
+            },
+            {"type": "image", "url": "data:image/png;base64,abc"},
+        ]
 
     def test_tool_iteration_counter_ticks(self):
         client = FakeClient()
