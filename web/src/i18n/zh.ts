@@ -697,6 +697,7 @@ export const zh: Translations = {
       formerEmployee: "原员工",
       internalCollaboration: "内部协作",
       openGroup: "打开群组",
+      discussionRound: "第 {round}/{total} 轮",
       you: "你",
       loadingGroup: "正在加载群组…",
       startConversation: "开始群组对话",

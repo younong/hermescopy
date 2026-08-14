@@ -14,6 +14,7 @@ from hermes_cli.controlled_roots import RootKind
 from hermes_state import SessionDB
 
 from .agent_tools import CollaborationAgentContext
+from .parser import parse_discussion_round_count
 from .resolver import CollaborationEmployeeResolver, collaboration_member_policy
 from .store import CollaborationStore
 
@@ -253,6 +254,7 @@ class CollaborationService:
             mention_all=mention_all,
             attachment_ids=attachment_ids,
             client_idempotency_key=client_idempotency_key,
+            total_rounds=parse_discussion_round_count(text),
         )
         event = asdict(submitted.event)
         self.emit("collaboration.event.appended", event)

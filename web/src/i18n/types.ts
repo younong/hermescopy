@@ -194,6 +194,7 @@ export interface GuiChatTranslations {
     formerEmployee: string;
     internalCollaboration: string;
     openGroup: string;
+    discussionRound: string;
     you: string;
     loadingGroup: string;
     startConversation: string;

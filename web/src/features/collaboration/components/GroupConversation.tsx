@@ -49,7 +49,7 @@ export function GroupConversation({ employees, state }: GroupConversationProps) 
   if (state.error && events.length === 0) {
     return <div className="flex flex-1 items-center justify-center gap-2 p-6 text-sm text-[#b42318]"><AlertCircle /> {state.error}</div>;
   }
-  if (events.filter((event) => event.event_kind.startsWith("message.") || event.event_kind === "task.completed" || event.event_kind === "collaboration.origin.card").length === 0) {
+  if (events.filter((event) => event.event_kind.startsWith("message.") || event.event_kind === "discussion.round.started" || event.event_kind === "task.completed" || event.event_kind === "collaboration.origin.card").length === 0) {
     return (
       <div className="flex flex-1 flex-col items-center justify-center p-8 text-center">
         <span className="flex h-12 w-12 items-center justify-center rounded-2xl bg-[#eef3ff] text-[#3867ed]"><UsersRound /></span>
@@ -63,6 +63,16 @@ export function GroupConversation({ employees, state }: GroupConversationProps) 
     <div className="min-h-0 flex-1 overflow-y-auto px-4 py-5">
       <div className="mx-auto flex max-w-3xl flex-col gap-5">
         {events.map((event) => {
+          const round = discussionRound(event.body, copy.discussionRound);
+          if (event.event_kind === "discussion.round.started" && round) {
+            return (
+              <div className="flex items-center gap-3 text-[10px] font-medium text-[#969aa1]" key={event.event_id}>
+                <span className="h-px flex-1 bg-[#e5e7eb]" />
+                <span>{round}</span>
+                <span className="h-px flex-1 bg-[#e5e7eb]" />
+              </div>
+            );
+          }
           if (event.event_kind === "collaboration.origin.card") {
             const status = event.body.status === "completed" ? "completed" : "created";
             const completed = status === "completed";
@@ -108,6 +118,7 @@ export function GroupConversation({ employees, state }: GroupConversationProps) 
               </div>
               <div className={owner ? "rounded-2xl rounded-tr-sm bg-[#eef3ff] px-4 py-3 text-[#283f79]" : "pl-8 text-[#25282d]"}>
                 {mentions ? <p className="mb-1 text-xs font-semibold text-[#4d73e6]">{mentions}</p> : null}
+                {round ? <p className="mb-1 text-[10px] font-medium text-[#6f7fa8]">{round}</p> : null}
                 <Markdown content={text} />
                 {attachments.length > 0 ? (
                   <div className="mt-2 flex flex-wrap gap-1.5">
@@ -122,6 +133,16 @@ export function GroupConversation({ employees, state }: GroupConversationProps) 
       </div>
     </div>
   );
+}
+
+function discussionRound(
+  body: { discussion_round?: number; total_rounds?: number },
+  template: string,
+): string {
+  if (!body.discussion_round || !body.total_rounds) return "";
+  return template
+    .replace("{round}", String(body.discussion_round))
+    .replace("{total}", String(body.total_rounds));
 }
 
 function SpeakerAvatar({ employee }: { employee: CollaborationEmployeeIdentity }) {
