@@ -3104,6 +3104,12 @@ def _display_mouse_tracking(display: dict) -> str:
     return "all"
 
 
+def _employee_reasoning_config(employee_policy: dict[str, Any]) -> dict | None:
+    from hermes_constants import parse_reasoning_effort
+
+    return parse_reasoning_effort(employee_policy.get("reasoning_effort"))
+
+
 def _load_reasoning_config() -> dict | None:
     from hermes_constants import parse_reasoning_effort
 
@@ -5227,7 +5233,11 @@ def _make_agent(
         reasoning_config=(
             reasoning_config_override
             if reasoning_config_override is not None
-            else _load_reasoning_config()
+            else (
+                _employee_reasoning_config(employee_policy)
+                if employee_policy is not None
+                else _load_reasoning_config()
+            )
         ),
         service_tier=(
             service_tier_override
@@ -5426,8 +5436,24 @@ class CollaborationAgentRunner:
         except (TypeError, ValueError) as exc:
             raise RuntimeError("collaboration member policy is invalid") from exc
         persisted_policy = model_config.get(_EMPLOYEE_POLICY_CONFIG_KEY)
-        if not isinstance(persisted_policy, dict) or persisted_policy != employee_policy:
+        if not isinstance(persisted_policy, dict):
             raise RuntimeError("collaboration member policy snapshot is inconsistent")
+        from hermes_cli.employee_policy import normalize_employee_snapshot_for_resume
+
+        try:
+            normalized_persisted_policy = normalize_employee_snapshot_for_resume(
+                persisted_policy
+            )
+            normalized_employee_policy = normalize_employee_snapshot_for_resume(
+                employee_policy
+            )
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError(
+                "collaboration member policy snapshot is inconsistent"
+            ) from exc
+        if normalized_persisted_policy != normalized_employee_policy:
+            raise RuntimeError("collaboration member policy snapshot is inconsistent")
+        persisted_policy = normalized_persisted_policy
         with self._lock:
             agent = self._agents.get(hidden_session_id)
             if agent is None:

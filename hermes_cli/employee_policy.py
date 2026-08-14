@@ -58,7 +58,7 @@ def normalize_employee_source_policy(profile: Mapping[str, Any]) -> dict[str, An
         "knowledge_relative_paths",
         "max_iterations",
     }
-    optional = {"name", "role", "max_tokens"}
+    optional = {"name", "role", "max_tokens", "reasoning_effort"}
     unknown = set(profile) - required - optional
     missing = required - set(profile)
     if unknown or missing:
@@ -108,6 +108,12 @@ def normalize_employee_source_policy(profile: Mapping[str, Any]) -> dict[str, An
             raise EmployeePolicyInvalid("max_tokens must be an integer") from exc
         if isinstance(profile.get("max_tokens"), bool) or not 1 <= max_tokens <= _MAX_TOKENS:
             raise EmployeePolicyInvalid("max_tokens is outside the permitted bound")
+    reasoning_effort = str(profile.get("reasoning_effort") or "").strip().lower()
+    if reasoning_effort:
+        from hermes_constants import SELECTABLE_REASONING_LEVELS
+
+        if reasoning_effort not in SELECTABLE_REASONING_LEVELS:
+            raise EmployeePolicyInvalid("reasoning_effort is invalid")
     return {
         "schema_version": _SCHEMA_VERSION,
         "model_registration_id": model_registration_id,
@@ -119,6 +125,7 @@ def normalize_employee_source_policy(profile: Mapping[str, Any]) -> dict[str, An
         "knowledge_relative_paths": list(knowledge),
         "max_iterations": max_iterations,
         "max_tokens": max_tokens,
+        **({"reasoning_effort": reasoning_effort} if "reasoning_effort" in profile else {}),
         **({"name": str(profile.get("name") or "").strip()} if "name" in profile else {}),
         **({"role": str(profile.get("role") or "").strip()} if "role" in profile else {}),
     }
@@ -131,3 +138,17 @@ def canonical_employee_snapshot(snapshot: Mapping[str, Any]) -> tuple[dict[str, 
     fingerprint = "sha256:" + hashlib.sha256(payload.encode("utf-8")).hexdigest()
     normalized["snapshot_fingerprint"] = fingerprint
     return normalized, fingerprint
+
+
+def normalize_employee_snapshot_for_resume(snapshot: Mapping[str, Any]) -> dict[str, Any]:
+    """Canonicalize a retained snapshot with explicitly compatible defaults."""
+    normalized = dict(snapshot)
+    persisted_fingerprint = normalized.pop("snapshot_fingerprint", None)
+    canonical, fingerprint = canonical_employee_snapshot(normalized)
+    if persisted_fingerprint != fingerprint:
+        raise EmployeePolicyInvalid("employee snapshot fingerprint is invalid")
+    if "reasoning_effort" in canonical:
+        return canonical
+    canonical.pop("snapshot_fingerprint")
+    canonical["reasoning_effort"] = ""
+    return canonical_employee_snapshot(canonical)[0]

@@ -1541,6 +1541,7 @@ export interface EmployeePolicy {
   knowledge_relative_paths: string[];
   max_iterations: number;
   max_tokens?: number | null;
+  reasoning_effort?: ReasoningLevel | "";
 }
 
 export interface EmployeeCollaborationPolicy {
@@ -1570,7 +1571,7 @@ export interface Employee {
 }
 
 export interface EmployeeCatalog {
-  model_registrations: Array<{ id: string; name: string; provider?: string; model?: string }>;
+  model_registrations: Array<ModelRegistration & { reasoning_levels: ReasoningLevel[] }>;
   toolsets: Array<{ name: string; description: string }>;
   skills: Array<{ name: string; description: string }>;
   mcp_servers: string[];
