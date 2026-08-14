@@ -398,7 +398,7 @@ def normalize_provider(name: str) -> str:
     return ALIASES.get(key, key)
 
 
-def get_provider(name: str) -> Optional[ProviderDef]:
+def get_provider(name: str, *, allow_network: bool = True) -> Optional[ProviderDef]:
     """Look up a built-in provider by id or alias.
 
     Resolution order:
@@ -417,7 +417,7 @@ def get_provider(name: str) -> Optional[ProviderDef]:
     # Try to get models.dev data
     try:
         from agent.models_dev import get_provider_info as _mdev_provider
-        mdev_info = _mdev_provider(canonical)
+        mdev_info = _mdev_provider(canonical, allow_network=allow_network)
     except Exception:
         mdev_info = None
 
@@ -468,7 +468,7 @@ def get_provider(name: str) -> Optional[ProviderDef]:
     return None
 
 
-def get_label(provider_id: str) -> str:
+def get_label(provider_id: str, *, allow_network: bool = True) -> str:
     """Get a human-readable display name for a provider."""
     canonical = normalize_provider(provider_id)
 
@@ -477,7 +477,7 @@ def get_label(provider_id: str) -> str:
         return _LABEL_OVERRIDES[canonical]
 
     # Try models.dev
-    pdef = get_provider(canonical)
+    pdef = get_provider(canonical, allow_network=allow_network)
     if pdef:
         return pdef.name
 
@@ -726,6 +726,8 @@ def resolve_provider_full(
     name: str,
     user_providers: Optional[Dict[str, Any]] = None,
     custom_providers: Optional[List[Dict[str, Any]]] = None,
+    *,
+    allow_network: bool = True,
 ) -> Optional[ProviderDef]:
     """Full resolution chain: built-in → models.dev → user config.
 
@@ -735,6 +737,10 @@ def resolve_provider_full(
         name: Provider name or alias.
         user_providers: The ``providers:`` dict from config.yaml (optional).
         custom_providers: The ``custom_providers:`` list from config.yaml (optional).
+        allow_network: Whether the models.dev fallbacks may hit the network.
+            Callers resolving an already-validated registered selection pass
+            ``False`` so a blocked or slow catalog endpoint cannot stall the
+            switch path.
 
     Returns:
         ProviderDef if found, else None.
@@ -756,7 +762,7 @@ def resolve_provider_full(
             return user_pdef
 
     # 1. Built-in (models.dev + overlays)
-    pdef = get_provider(canonical)
+    pdef = get_provider(canonical, allow_network=allow_network)
     if pdef is not None:
         return pdef
 
@@ -779,7 +785,7 @@ def resolve_provider_full(
     # 3. Try models.dev directly (for providers not in our ALIASES)
     try:
         from agent.models_dev import get_provider_info as _mdev_provider
-        mdev_info = _mdev_provider(canonical)
+        mdev_info = _mdev_provider(canonical, allow_network=allow_network)
         if mdev_info is not None:
             return ProviderDef(
                 id=canonical,

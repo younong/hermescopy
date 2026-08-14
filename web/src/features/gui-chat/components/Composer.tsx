@@ -44,7 +44,7 @@ export function Composer({
     text: string,
     attachments: GuiComposerAttachment[],
     updateAttachment: (id: string, patch: Partial<GuiComposerAttachment>) => void,
-  ) => Promise<void>;
+  ) => Promise<boolean | void>;
   onStop: () => void;
 }) {
   const { t } = useI18n();
@@ -112,9 +112,15 @@ export function Composer({
     setLocalError(null);
     setIsSubmitting(true);
     try {
-      await onSend(next || copy.attachmentOnlyMessage, attachmentsToSend, updateAttachment);
-      setText("");
-      clearAttachments(attachmentsToSend, { revokePreviewUrls: false });
+      const accepted = await onSend(
+        next || copy.attachmentOnlyMessage,
+        attachmentsToSend,
+        updateAttachment,
+      );
+      if (accepted !== false) {
+        setText("");
+        clearAttachments(attachmentsToSend, { revokePreviewUrls: false });
+      }
     } catch (error) {
       setLocalError(error instanceof Error ? error.message : String(error));
     } finally {

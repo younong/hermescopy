@@ -2873,12 +2873,13 @@ def _stored_session_runtime_overrides(row: dict | None) -> dict:
     return overrides
 
 
-def _runtime_model_config(agent, existing: dict | None = None) -> dict:
+def _runtime_model_config(agent, existing: dict | None = None, *, route: dict | None = None) -> dict:
     config = dict(existing or {})
-    model = str(getattr(agent, "model", "") or "").strip()
-    provider = str(getattr(agent, "provider", "") or "").strip()
-    base_url = str(getattr(agent, "base_url", "") or "").strip()
-    api_mode = str(getattr(agent, "api_mode", "") or "").strip()
+    route = route or {}
+    model = str(route.get("model", getattr(agent, "model", "")) or "").strip()
+    provider = str(route.get("provider", getattr(agent, "provider", "")) or "").strip()
+    base_url = str(route.get("base_url", getattr(agent, "base_url", "")) or "").strip()
+    api_mode = str(route.get("api_mode", getattr(agent, "api_mode", "")) or "").strip()
     reasoning_config = getattr(agent, "reasoning_config", None)
     service_tier = getattr(agent, "service_tier", None)
 
@@ -2951,13 +2952,20 @@ def _runtime_model_config(agent, existing: dict | None = None) -> dict:
     return config
 
 
-def _persist_live_session_runtime(session: dict | None) -> None:
-    """Persist active session runtime so future resumes restore the same footer."""
+def _persist_live_session_runtime(
+    session: dict | None,
+    *,
+    route: dict | None = None,
+    generation: int | None = None,
+) -> None:
+    """Persist an immutable runtime snapshot without letting stale writes win."""
     if not session:
         return
     agent = session.get("agent")
     session_key = str(session.get("session_key") or "").strip()
     if agent is None or not session_key:
+        return
+    if generation is not None and generation != session.get("route_generation"):
         return
 
     db = getattr(agent, "_session_db", None) or _get_db()
@@ -2966,6 +2974,8 @@ def _persist_live_session_runtime(session: dict | None) -> None:
 
     try:
         row = db.get_session(session_key) or {}
+        if generation is not None and generation != session.get("route_generation"):
+            return
         raw_config = row.get("model_config")
         existing_config = {}
         if isinstance(raw_config, dict):
@@ -2974,14 +2984,38 @@ def _persist_live_session_runtime(session: dict | None) -> None:
             parsed = json.loads(raw_config)
             if isinstance(parsed, dict):
                 existing_config = parsed
-        model_config = _runtime_model_config(agent, existing_config)
-        model = str(getattr(agent, "model", "") or "").strip()
+        model_config = _runtime_model_config(agent, existing_config, route=route)
+        model = str((route or {}).get("model", getattr(agent, "model", "")) or "").strip()
+        if generation is not None and generation != session.get("route_generation"):
+            return
         if hasattr(db, "update_session_meta"):
             db.update_session_meta(session_key, json.dumps(model_config), model or None)
         elif model and hasattr(db, "update_session_model"):
             db.update_session_model(session_key, model)
+        if generation is None or generation == session.get("route_generation"):
+            try:
+                db.update_session_billing_route(
+                    session_key,
+                    provider=str((route or {}).get("provider", getattr(agent, "provider", "")) or ""),
+                    base_url=str((route or {}).get("base_url", getattr(agent, "base_url", "")) or ""),
+                    billing_mode=str((route or {}).get("api_mode", getattr(agent, "api_mode", "")) or ""),
+                )
+            except Exception:
+                logger.debug("failed to persist live billing route", exc_info=True)
     except Exception:
         logger.debug("failed to persist live session runtime", exc_info=True)
+
+
+def _schedule_live_session_runtime_persist(session: dict, route: dict) -> None:
+    generation = int(session.get("route_generation") or 0) + 1
+    session["route_generation"] = generation
+    snapshot = dict(route)
+    _rpc_pool().submit(
+        _persist_live_session_runtime,
+        session,
+        route=snapshot,
+        generation=generation,
+    )
 
 
 def _persist_live_session_system_prompt(session: dict | None) -> None:
@@ -3389,6 +3423,93 @@ def _persist_model_switch(result) -> None:
         set_config_value("model.base_url", "")
 
 
+def _resolve_submitted_chat_route(
+    registration_id: Any,
+    model: Any,
+    provider: Any,
+) -> dict | None:
+    """Resolve an optional stable Chat registration and verify its public identity."""
+    registration_id = str(registration_id or "").strip()
+    if not registration_id:
+        if str(model or "").strip() or str(provider or "").strip():
+            raise ValueError("registration_id is required for a submitted model route")
+        return None
+
+    from hermes_cli.model_registrations import resolve_chat_model_registration
+
+    registration = resolve_chat_model_registration(registration_id)
+    registered_model = str(registration.get("model") or "").strip()
+    registered_provider = str(registration.get("provider") or "").strip()
+    requested_model = str(model or "").strip()
+    requested_provider = str(provider or "").strip()
+    if (
+        requested_model != registered_model
+        or requested_provider.lower() != registered_provider.lower()
+    ):
+        raise ValueError("model registration does not match requested route")
+    return {
+        "registration_id": registration_id,
+        "model": registered_model,
+        "provider": registered_provider,
+    }
+
+
+def _preflight_submitted_chat_route(
+    route: dict | None,
+    *,
+    confirm_expensive_model: bool = False,
+) -> dict:
+    """Check a registered turn route without mutating a live session or agent."""
+    if route is None:
+        return {"confirm_required": False}
+    raw = f"{route['model']} --provider {route['provider']} --session"
+    return _apply_model_switch(
+        "",
+        {"agent": None},
+        raw,
+        confirm_expensive_model=confirm_expensive_model,
+        pin_session_override=False,
+        parsed_flags=(route["model"], route["provider"], False, False, True),
+        trusted_selection=True,
+    )
+
+
+def _apply_submitted_chat_route(
+    sid: str,
+    session: dict,
+    route: dict | None,
+) -> None:
+    """Install one admitted turn's immutable registered route before it runs."""
+    if route is None:
+        return
+    resolved = _resolve_submitted_chat_route(
+        route.get("registration_id"),
+        route.get("model"),
+        route.get("provider"),
+    )
+    raw = f"{resolved['model']} --provider {resolved['provider']} --session"
+    result = _apply_model_switch(
+        sid,
+        session,
+        raw,
+        confirm_expensive_model=True,
+        parsed_flags=(
+            resolved["model"],
+            resolved["provider"],
+            False,
+            False,
+            True,
+        ),
+        trusted_selection=True,
+    )
+    if result.get("confirm_required"):
+        raise ValueError(
+            result.get("confirm_message")
+            or result.get("warning")
+            or "This model requires confirmation before use"
+        )
+
+
 def _apply_model_switch(
     sid: str,
     session: dict,
@@ -3397,6 +3518,7 @@ def _apply_model_switch(
     confirm_expensive_model: bool = False,
     pin_session_override: bool = True,
     parsed_flags: tuple[str, str, bool, bool, bool] | None = None,
+    trusted_selection: bool = False,
 ) -> dict:
     from hermes_cli.model_switch import (
         parse_model_flags,
@@ -3467,11 +3589,12 @@ def _apply_model_switch(
         explicit_provider=explicit_provider,
         user_providers=user_provs,
         custom_providers=custom_provs,
+        trusted_selection=trusted_selection,
     )
     if not result.success:
         raise ValueError(result.error_message or "model switch failed")
 
-    if agent:
+    if agent and not trusted_selection:
         try:
             from hermes_cli.context_switch_guard import merge_preflight_compression_warning
 
@@ -3500,6 +3623,7 @@ def _apply_model_switch(
                 base_url=result.base_url or current_base_url,
                 api_key=result.api_key or current_api_key,
                 model_info=result.model_info,
+                allow_network=not trusted_selection,
             )
         except Exception:
             warning = None
@@ -3523,6 +3647,7 @@ def _apply_model_switch(
                 base_url=result.base_url,
                 api_mode=result.api_mode,
                 relay_provider=getattr(result, "relay_provider", ""),
+                route_only=trusted_selection,
             )
         except Exception as exc:
             # The in-place swap rolled the agent back to the old working
@@ -3537,12 +3662,19 @@ def _apply_model_switch(
                 f"Model switch to {result.new_model} failed ({exc}); "
                 f"staying on {getattr(agent, 'model', current_model)}."
             ) from exc
-        _persist_live_session_runtime(session)
-        _persist_live_session_system_prompt(session)
-        _append_model_switch_marker(
-            session, model=result.new_model, provider=result.target_provider
-        )
-        _emit("session.info", sid, _session_info(agent, session))
+        if trusted_selection:
+            _emit(
+                "session.info",
+                sid,
+                {"model": result.new_model, "provider": result.target_provider},
+            )
+        else:
+            _persist_live_session_runtime(session)
+            _persist_live_session_system_prompt(session)
+            _append_model_switch_marker(
+                session, model=result.new_model, provider=result.target_provider
+            )
+            _emit("session.info", sid, _session_info(agent, session))
 
     # Record the switch as a PER-SESSION override so a later rebuild of THIS
     # session (e.g. /new via _reset_session_agent, or resume) re-derives the
@@ -3566,6 +3698,16 @@ def _apply_model_switch(
             "api_key": None if getattr(result, "deployment_managed", False) else result.api_key,
             "api_mode": result.api_mode,
         }
+    if trusted_selection and agent and isinstance(session, dict):
+        _schedule_live_session_runtime_persist(
+            session,
+            {
+                "model": result.new_model,
+                "provider": result.target_provider,
+                "base_url": result.base_url,
+                "api_mode": result.api_mode,
+            },
+        )
     if persist_global:
         _persist_model_switch(result)
     return {
@@ -6002,7 +6144,12 @@ def _complete_prompt_turn_receipt(
         logger.warning("External turn receipt completion rejected: %s", exc)
 
 
-def _enqueue_prompt(session: dict, text: Any, transport: Any) -> None:
+def _enqueue_prompt(
+    session: dict,
+    text: Any,
+    transport: Any,
+    submitted_route: dict | None = None,
+) -> None:
     """Stash a message to run as the very next turn once the live one ends.
 
     Used when a prompt arrives mid-turn (see ``_handle_busy_submit``). A single
@@ -6023,10 +6170,18 @@ def _enqueue_prompt(session: dict, text: Any, transport: Any) -> None:
         "text": text,
         "transport": transport,
         "owner_generation": session.get("_active_turn_generation"),
+        "submitted_route": dict(submitted_route) if submitted_route else None,
     }
 
 
-def _handle_busy_submit(rid, sid: str, session: dict, text: Any, transport: Any) -> dict:
+def _handle_busy_submit(
+    rid,
+    sid: str,
+    session: dict,
+    text: Any,
+    transport: Any,
+    submitted_route: dict | None = None,
+) -> dict:
     """Apply the ``display.busy_input_mode`` policy to a prompt that lands while
     a turn is in flight, instead of rejecting it with ``session busy``.
 
@@ -6044,7 +6199,12 @@ def _handle_busy_submit(rid, sid: str, session: dict, text: Any, transport: Any)
     mode = _load_busy_input_mode()
     _clear_pending(sid, event="clarify.request")
     agent = session.get("agent")
-    if mode == "steer" and agent is not None and hasattr(agent, "steer"):
+    if (
+        mode == "steer"
+        and submitted_route is None
+        and agent is not None
+        and hasattr(agent, "steer")
+    ):
         try:
             if agent.steer(text):
                 session["last_active"] = time.time()
@@ -6056,7 +6216,7 @@ def _handle_busy_submit(rid, sid: str, session: dict, text: Any, transport: Any)
             agent.interrupt()
         except Exception:
             pass
-    _enqueue_prompt(session, text, transport)
+    _enqueue_prompt(session, text, transport, submitted_route)
     session["last_active"] = time.time()
     return _ok(rid, {"status": "queued"})
 
@@ -6080,7 +6240,12 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
             session["transport"] = queued["transport"]
     try:
         _run_prompt_submit(
-            rid, sid, session, queued["text"], generation=generation
+            rid,
+            sid,
+            session,
+            queued["text"],
+            generation=generation,
+            submitted_route=queued.get("submitted_route"),
         )
     except Exception as exc:
         print(
@@ -10453,6 +10618,35 @@ def _(rid, params: dict) -> dict:
 # ── Methods: prompt ──────────────────────────────────────────────────
 
 
+@method("prompt.model_preflight")
+def _(rid, params: dict) -> dict:
+    session, err = _sess_nowait(params, rid)
+    if err:
+        return err
+    if session.get("employee_policy") is not None:
+        return _err(rid, 4032, "configuration is pinned for this employee session")
+    try:
+        route = _resolve_submitted_chat_route(
+            params.get("registration_id"),
+            params.get("model"),
+            params.get("provider"),
+        )
+        result = _preflight_submitted_chat_route(
+            route,
+            confirm_expensive_model=bool(params.get("confirm_expensive_model", False)),
+        )
+        return _ok(rid, {
+            "value": route.get("model", "") if route else "",
+            "warning": result.get("warning", ""),
+            "confirm_required": result.get("confirm_required", False),
+            "confirm_message": result.get("confirm_message", ""),
+        })
+    except ValueError as exc:
+        return _err(rid, 4002, str(exc))
+    except Exception as exc:
+        return _err(rid, 5001, str(exc))
+
+
 @method("prompt.submit")
 def _(rid, params: dict) -> dict:
     sid, text = params.get("session_id", ""), params.get("text", "")
@@ -10460,6 +10654,38 @@ def _(rid, params: dict) -> dict:
     session, err = _sess_nowait(params, rid)
     if err:
         return err
+    try:
+        submitted_route = _resolve_submitted_chat_route(
+            params.get("registration_id"),
+            params.get("model"),
+            params.get("provider"),
+        )
+    except ValueError as exc:
+        return _err(rid, 4002, str(exc))
+    except Exception as exc:
+        return _err(rid, 5001, str(exc))
+    if submitted_route and session.get("employee_policy") is not None:
+        return _err(rid, 4032, "configuration is pinned for this employee session")
+    if submitted_route:
+        try:
+            preflight = _preflight_submitted_chat_route(
+                submitted_route,
+                confirm_expensive_model=bool(
+                    params.get("confirm_expensive_model", False)
+                ),
+            )
+        except ValueError as exc:
+            return _err(rid, 4002, str(exc))
+        except Exception as exc:
+            return _err(rid, 5001, str(exc))
+        if preflight.get("confirm_required"):
+            return _err(
+                rid,
+                4093,
+                preflight.get("confirm_message")
+                or preflight.get("warning")
+                or "This model requires confirmation before use",
+            )
     # Re-bind to the authenticated transport for this request so streaming
     # events leave through the active socket after a disconnect and reattach.
     if (t := current_transport()) is not None:
@@ -10472,7 +10698,14 @@ def _(rid, params: dict) -> dict:
             # interrupt the live turn) so it runs as the next turn. See
             # _handle_busy_submit for why the old "session busy" rejection
             # dropped messages when teardown outlived the client's retry window.
-            return _handle_busy_submit(rid, sid, session, text, t or session.get("transport"))
+            return _handle_busy_submit(
+                rid,
+                sid,
+                session,
+                text,
+                t or session.get("transport"),
+                submitted_route,
+            )
         # A watch session's run lives in the PARENT turn, so its own running
         # flag is False — without this, typing mid-run builds a second agent
         # racing the in-flight child on the same stored session (interleaved
@@ -10599,8 +10832,16 @@ def _(rid, params: dict) -> dict:
                 _drain_queued_prompt(rid, sid, session)
                 return
             _run_prompt_submit(
-                rid, sid, session, text, generation=generation
+                rid,
+                sid,
+                session,
+                text,
+                generation=generation,
+                submitted_route=submitted_route,
             )
+            turn_thread = session.get("_run_thread")
+            if turn_thread is not None and turn_thread is not threading.current_thread():
+                turn_thread.join()
         finally:
             _gateway_runtime.reset(runtime_token)
 
@@ -10956,6 +11197,7 @@ def _run_prompt_submit(
     text: Any,
     *,
     generation: int | None = None,
+    submitted_route: dict | None = None,
 ) -> None:
     if not _web_direct_binding_is_current(session):
         with session["history_lock"]:
@@ -11007,7 +11249,10 @@ def _run_prompt_submit(
             # the sudo.request overlay. (secret capture is a module global, so
             # re-running is a harmless no-op.)
             _wire_callbacks(sid)
-            _sync_agent_model_with_config(sid, session)
+            if submitted_route:
+                _apply_submitted_chat_route(sid, session, submitted_route)
+            else:
+                _sync_agent_model_with_config(sid, session)
             cwd = _session_cwd(session)
             _register_session_cwd(session)
             cols = session.get("cols", 80)
@@ -11536,8 +11781,8 @@ def _run_prompt_submit(
         target=_bind_owner_runtime_callback(run, runtime),
         daemon=True,
     )
-    session["_run_thread"] = run_thread
     run_thread.start()
+    session["_run_thread"] = run_thread
 
 
 @method("clipboard.paste")
@@ -12842,7 +13087,28 @@ def _(rid, params: dict) -> dict:
                 from hermes_cli.model_switch import parse_model_flags
 
                 parsed_flags = parse_model_flags(value)
-                _model_input, explicit_provider, _persist_global, _force_refresh, _is_session = parsed_flags
+                (
+                    model_input,
+                    explicit_provider,
+                    persist_global,
+                    force_refresh,
+                    is_session,
+                ) = parsed_flags
+                registration_id = str(params.get("registration_id") or "").strip()
+                trusted_selection = bool(registration_id)
+                if trusted_selection:
+                    registration = _resolve_submitted_chat_route(
+                        registration_id,
+                        model_input,
+                        explicit_provider,
+                    )
+                    parsed_flags = (
+                        registration["model"],
+                        registration["provider"],
+                        persist_global,
+                        force_refresh,
+                        is_session,
+                    )
                 if session.get("agent") is None and not explicit_provider.strip():
                     session_id = params.get("session_id", "")
                     _start_agent_build(session_id, session)
@@ -12859,6 +13125,7 @@ def _(rid, params: dict) -> dict:
                         params.get("confirm_expensive_model", False)
                     ),
                     parsed_flags=parsed_flags,
+                    trusted_selection=trusted_selection,
                 )
             else:
                 result = _apply_model_switch(
@@ -12879,6 +13146,8 @@ def _(rid, params: dict) -> dict:
                     "confirm_message": result.get("confirm_message", ""),
                 },
             )
+        except ValueError as e:
+            return _err(rid, 4002, str(e))
         except Exception as e:
             return _err(rid, 5001, str(e))
 

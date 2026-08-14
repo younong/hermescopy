@@ -715,7 +715,11 @@ def _parse_provider_info(provider_id: str, raw: Dict[str, Any]) -> ProviderInfo:
 # Provider-level queries
 # ---------------------------------------------------------------------------
 
-def get_provider_info(provider_id: str) -> Optional[ProviderInfo]:
+def get_provider_info(
+    provider_id: str,
+    *,
+    allow_network: bool = True,
+) -> Optional[ProviderInfo]:
     """Get full provider metadata from models.dev.
 
     Accepts either a Hermes provider ID (e.g. "kilocode") or a models.dev
@@ -724,7 +728,7 @@ def get_provider_info(provider_id: str) -> Optional[ProviderInfo]:
     # Resolve Hermes ID → models.dev ID
     mdev_id = PROVIDER_TO_MODELS_DEV.get(provider_id, provider_id)
 
-    data = fetch_models_dev()
+    data = fetch_models_dev(allow_network=allow_network)
     raw = data.get(mdev_id)
     if not isinstance(raw, dict):
         return None
@@ -737,7 +741,10 @@ def get_provider_info(provider_id: str) -> Optional[ProviderInfo]:
 # ---------------------------------------------------------------------------
 
 def get_model_info(
-    provider_id: str, model_id: str
+    provider_id: str,
+    model_id: str,
+    *,
+    allow_network: bool = True,
 ) -> Optional[ModelInfo]:
     """Get full model metadata from models.dev.
 
@@ -746,7 +753,7 @@ def get_model_info(
     """
     mdev_id = PROVIDER_TO_MODELS_DEV.get(provider_id, provider_id)
 
-    data = fetch_models_dev()
+    data = fetch_models_dev(allow_network=allow_network)
     pdata = data.get(mdev_id)
     if not isinstance(pdata, dict):
         return None

@@ -158,8 +158,10 @@ def build_turn_context(
     # Bind the skill write-origin ContextVar for this thread.
     set_current_write_origin(getattr(agent, "_memory_write_origin", "assistant_tool"))
 
-    # Restore the primary runtime if the previous turn activated fallback.
+    # Restore the primary runtime if the previous turn activated fallback, then
+    # activate any newly selected registered route outside the picker RPC.
     agent._restore_primary_runtime()
+    agent._activate_pending_route()
 
     # Between-turns MCP refresh: an MCP server that finished connecting since
     # the previous turn (slow HTTP/OAuth servers routinely take 2-6s on a cold

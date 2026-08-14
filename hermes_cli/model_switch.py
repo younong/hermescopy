@@ -765,6 +765,7 @@ def switch_model(
     explicit_provider: str = "",
     user_providers: dict = None,
     custom_providers: list | None = None,
+    trusted_selection: bool = False,
 ) -> ModelSwitchResult:
     """Core model-switching pipeline shared between CLI and gateway.
 
@@ -799,6 +800,8 @@ def switch_model(
         explicit_provider: From --provider flag (empty = no explicit provider).
         user_providers: The ``providers:`` dict from config.yaml (for user endpoints).
         custom_providers: The ``custom_providers:`` list from config.yaml.
+        trusted_selection: Skip remote catalog validation for a model-plane
+            registration that was already resolved locally.
 
     Returns:
         ModelSwitchResult with all information the caller needs.
@@ -826,6 +829,7 @@ def switch_model(
             explicit_provider,
             user_providers,
             custom_providers,
+            allow_network=not trusted_selection,
         )
         if pdef is None and explicit_provider.strip().lower() == "custom":
             pdef = _bare_custom_provider_def(current_base_url)
@@ -847,7 +851,7 @@ def switch_model(
                 if deployment_route is not None:
                     pdef = ProviderDef(
                         id=deployment_route.provider,
-                        name=deployment_route.name or get_label(deployment_route.provider),
+                        name=deployment_route.name or get_label(deployment_route.provider, allow_network=not trusted_selection),
                         transport=deployment_route.api_mode,
                         api_key_env_vars=(),
                         auth_type="deployment",
@@ -1140,7 +1144,7 @@ def switch_model(
     # =================================================================
 
     provider_changed = target_provider != current_provider
-    provider_label = get_label(target_provider)
+    provider_label = get_label(target_provider, allow_network=not trusted_selection)
     if target_provider == "custom" and current_base_url:
         provider_label = "Custom endpoint"
     if target_provider.startswith("custom:"):
@@ -1148,6 +1152,7 @@ def switch_model(
             target_provider,
             user_providers,
             custom_providers,
+            allow_network=not trusted_selection,
         )
         if custom_pdef is not None:
             provider_label = custom_pdef.name
@@ -1274,7 +1279,7 @@ def switch_model(
     # Deployment routes are an exact operator allowlist and the worker cannot
     # query their private upstream catalogs. Treat only that exact route as
     # validated; all ordinary providers retain normal catalog validation.
-    if deployment_managed:
+    if deployment_managed or trusted_selection:
         validation = {
             "accepted": True,
             "persist": True,
@@ -1381,11 +1386,18 @@ def switch_model(
     ):
         base_url = re.sub(r"/v1/?$", "", base_url)
 
-    # --- Get capabilities (legacy) ---
-    capabilities = get_model_capabilities(target_provider, new_model)
-
-    # --- Get full model info from models.dev ---
-    model_info = get_model_info(target_provider, new_model)
+    # Registered UI selections must not block on metadata refreshes. Cached
+    # metadata still powers the price guard and capability display when present.
+    capabilities = get_model_capabilities(
+        target_provider,
+        new_model,
+        allow_network=not trusted_selection,
+    )
+    model_info = get_model_info(
+        target_provider,
+        new_model,
+        allow_network=not trusted_selection,
+    )
 
     # --- Collect warnings ---
     warnings: list[str] = []

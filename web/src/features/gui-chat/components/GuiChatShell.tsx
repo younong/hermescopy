@@ -44,7 +44,11 @@ import { emitChatDiagnostic } from "@/lib/chatDiagnostics";
 import { dashboardAuthTransition } from "@/lib/dashboardAuthTransition";
 import { useDashboardAuthIdentity } from "@/lib/useDashboardAuthIdentity";
 import { cn } from "@/lib/utils";
-import { connectGuiChat, type GuiChatConnection } from "../api";
+import {
+  connectGuiChat,
+  type GuiChatConnection,
+  type GuiChatModelRegistration,
+} from "../api";
 import { buildSessionFileDownloadUrl, readSessionFile } from "../files";
 import { createGatewayEventFrameQueue } from "../gatewayEventFrameQueue";
 import {
@@ -67,6 +71,7 @@ import { ComposerModelPicker } from "./ComposerModelPicker";
 import { ComposerReasoningPicker } from "./ComposerReasoningPicker";
 import { GuiChatModelsPane } from "./GuiChatModelsPane";
 import { GuiChatScheduledTasksPane } from "./GuiChatScheduledTasksPane";
+import { GuiChatWorkspaceDialog } from "./GuiChatWorkspaceDialog";
 import { GuiChatSkillsPane } from "./GuiChatSkillsPane";
 import { MessageList } from "./MessageList";
 
@@ -128,6 +133,12 @@ export function GuiChatShell() {
   const switchTraceByGenerationRef = useRef(new Map<number, GuiChatLatencyTrace>());
   const [resumeNotice, setResumeNotice] = useState<string | null>(null);
   const [sendScrollNonce, setSendScrollNonce] = useState(0);
+  const [selectedChatRegistration, setSelectedChatRegistration] =
+    useState<GuiChatModelRegistration | null>(null);
+  const [pendingModelConfirmation, setPendingModelConfirmation] = useState<{
+    message: string;
+    resolve(confirmed: boolean): void;
+  } | null>(null);
   const [attachmentsToQueue, setAttachmentsToQueue] = useState<Array<{
     file: File;
     requestId: number;
@@ -653,6 +664,19 @@ export function GuiChatShell() {
     return () => mql.removeEventListener("change", onChange);
   }, []);
 
+  useEffect(() => {
+    setSelectedChatRegistration(null);
+    setPendingModelConfirmation((pending) => {
+      pending?.resolve(false);
+      return null;
+    });
+  }, [state.sessionId, state.switchGeneration]);
+
+  const confirmModelSend = useCallback((message: string) =>
+    new Promise<boolean>((resolve) => {
+      setPendingModelConfirmation({ message, resolve });
+    }), []);
+
   const disabled = state.connection !== "open" || !state.sessionId;
   const hasPendingClarification = state.clarificationOrder.some((id) =>
     ["pending", "submitting"].includes(state.clarifications[id]?.status ?? ""),
@@ -734,6 +758,26 @@ export function GuiChatShell() {
         }
 
         const promptText = appendFileReferences(text, fileRefs, copy.shell.attachmentReferences);
+        const registration = selectedChatRegistration
+          ? { ...selectedChatRegistration }
+          : undefined;
+        let confirmed = false;
+        if (registration) {
+          const preflight = await connection.preflightModel(sessionId, registration);
+          if (preflight.confirm_required) {
+            const generation = state.switchGeneration;
+            confirmed = await confirmModelSend(
+              preflight.confirm_message
+              || preflight.warning
+              || copy.composer.modelPicker.highPriceWarning,
+            );
+            if (
+              !confirmed
+              || stateRef.current.sessionId !== sessionId
+              || stateRef.current.switchGeneration !== generation
+            ) return false;
+          }
+        }
         setSendScrollNonce((n) => n + 1);
         dispatch({
           type: "user.sent",
@@ -741,7 +785,11 @@ export function GuiChatShell() {
           id: createClientId("user"),
           text,
         });
-        await connection.send(sessionId, promptText);
+        await connection.send(sessionId, promptText, {
+          confirmExpensiveModel: confirmed,
+          modelRegistration: registration,
+        });
+        return true;
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
         if (error instanceof AttachmentError) {
@@ -751,7 +799,16 @@ export function GuiChatShell() {
         throw error;
       }
     },
-    [copy.shell.attachFailed, copy.shell.attachmentReferences, state.cwd, state.sessionId],
+    [
+      confirmModelSend,
+      copy.composer.modelPicker.highPriceWarning,
+      copy.shell.attachFailed,
+      copy.shell.attachmentReferences,
+      selectedChatRegistration,
+      state.cwd,
+      state.sessionId,
+      state.switchGeneration,
+    ],
   );
 
   const useAttachmentAgain = useCallback(async (attachment: MessageAttachmentState) => {
@@ -816,11 +873,18 @@ export function GuiChatShell() {
     [copy.shell.connectionNotReady, updateSearchParams],
   );
 
-  const switchChatModel = useCallback(
+  const selectChatModel = useCallback((registration: GuiChatModelRegistration) => {
+    setSelectedChatRegistration({
+      id: registration.id,
+      model: registration.model,
+      provider: registration.provider,
+    });
+  }, []);
+
+  const setDefaultChatModel = useCallback(
     async (
-      registration: { model: string; provider: string },
+      registration: GuiChatModelRegistration,
       confirmExpensiveModel = false,
-      persistGlobally = false,
     ) => {
       const sessionId = state.sessionId;
       const connection = connectionRef.current;
@@ -828,13 +892,9 @@ export function GuiChatShell() {
       if (state.isGenerating) {
         throw new Error(copy.shell.stopBeforeSwitchingModels);
       }
-      return connection.switchModel(
-        sessionId,
-        registration.provider,
-        registration.model,
+      return connection.setDefaultModel(sessionId, registration, {
         confirmExpensiveModel,
-        persistGlobally,
-      );
+      });
     },
     [copy.shell.noActiveConversation, copy.shell.stopBeforeSwitchingModels, state.isGenerating, state.sessionId],
   );
@@ -1113,14 +1173,11 @@ export function GuiChatShell() {
           isGenerating={state.isGenerating}
           modelPicker={
             <ComposerModelPicker
-              busy={state.isGenerating}
-              canSwitch={Boolean(state.sessionId && state.connection === "open")}
-              currentModel={state.model}
-              currentProvider={state.provider}
+              canSelect={Boolean(state.sessionId && state.connection === "open")}
+              currentModel={selectedChatRegistration?.model ?? state.model}
+              currentProvider={selectedChatRegistration?.provider ?? state.provider}
               onManageModels={() => navigate("/chat/models")}
-              onSwitchChat={(registration, confirmExpensiveModel) =>
-                switchChatModel(registration, confirmExpensiveModel)
-              }
+              onSelect={selectChatModel}
             />
           }
           onAttachmentQueued={(requestId) => {
@@ -1142,6 +1199,39 @@ export function GuiChatShell() {
           onSend={send}
           onStop={stop}
         />
+        {pendingModelConfirmation ? (
+          <GuiChatWorkspaceDialog
+            busy={false}
+            description={pendingModelConfirmation.message}
+            onClose={() => {
+              pendingModelConfirmation.resolve(false);
+              setPendingModelConfirmation(null);
+            }}
+            title={copy.composer.modelPicker.highPriceWarning}
+          >
+            <div className="gui-chat-workspace-dialog-actions">
+              <button
+                onClick={() => {
+                  pendingModelConfirmation.resolve(false);
+                  setPendingModelConfirmation(null);
+                }}
+                type="button"
+              >
+                {t.common.cancel}
+              </button>
+              <button
+                className="is-destructive"
+                onClick={() => {
+                  pendingModelConfirmation.resolve(true);
+                  setPendingModelConfirmation(null);
+                }}
+                type="button"
+              >
+                {copy.composer.modelPicker.useModel}
+              </button>
+            </div>
+          </GuiChatWorkspaceDialog>
+        ) : null}
       </div>
     </>
   );
@@ -1330,10 +1420,11 @@ export function GuiChatShell() {
           <GuiChatModelsPane
             busy={state.isGenerating}
             canSwitchChat={Boolean(state.sessionId && state.connection === "open")}
-            currentModel={state.model}
-            currentProvider={state.provider}
+            currentModel={selectedChatRegistration?.model ?? state.model}
+            currentProvider={selectedChatRegistration?.provider ?? state.provider}
             onActivateCode={activateCodeModel}
-            onSwitchChat={switchChatModel}
+            onSelectChat={selectChatModel}
+            onSetDefaultChat={setDefaultChatModel}
           />
         ) : groupId ? (
           <GroupChatView
