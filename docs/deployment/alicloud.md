@@ -367,6 +367,14 @@ npm run deploy -- --tag v2026.7.4 --keep-releases 8
 npm run deploy -- --tag v2026.7.4 --no-prune-releases
 ```
 
+部署事务提交后，工具还会自动回收 `/opt/hermes/runtimes/python` 中未被运行进程引用的旧 immutable Python runtime。候选 runtime 无条件保留；其他 runtime 只要仍被进程的 executable、cwd、root、open fd、memory map 或 mount 引用就会保留。检查 `/proc` 时遇到权限或读取错误会 fail closed，保留相关 runtime；因此清理不会影响当前服务或尚未退出的旧进程。旧 tag 回滚如果对应 runtime 已回收，会根据 release lock、Node/PowerPoint host 输入和 sandbox profile 重新构建，回滚耗时会增加。
+
+需要保留全部 runtime 进行调查时可显式禁用：
+
+```bash
+npm run deploy -- --tag v2026.7.4 --no-prune-runtimes
+```
+
 ## 新 tag Git 失败处理
 
 - 工作区不干净：人工选择要提交的文件并 commit，或自行 stash；发布工具不会自动处理。
@@ -435,6 +443,7 @@ APIYI 图像模型专项 smoke 不是发布脚本必跑步骤；需要验证图�
 --force                  已废弃并拒绝；不可变 release 不会被替换
 --keep-releases <n>      成功部署后保留最近 n 个 release，默认 5
 --no-prune-releases      不自动清理旧 release 目录
+--no-prune-runtimes      不自动清理未被进程引用的旧 Python runtime
 --allow-dirty            允许工作区有改动时部署已有 tag
 --dashboard-public-url   trusted loopback proxy 的公开 URL
 --migrate-nginx-hermes   显式迁移已识别的旧 Hermes Nginx auth block

@@ -53,6 +53,7 @@ Options:
   --force                  Deprecated and rejected; immutable releases are never replaced.
   --keep-releases <n>      Keep the newest n remote releases after deploy. Default: ${DEFAULT_KEEP_RELEASES}
   --no-prune-releases      Do not delete old remote release directories.
+  --no-prune-runtimes      Do not delete unused immutable Python runtimes.
   --dashboard-public-url <url>
                            Public dashboard URL used by the trusted loopback proxy.
                            Default: ${DEFAULT_DASHBOARD_PUBLIC_URL}
@@ -90,6 +91,7 @@ function parseArgs(argv) {
     force: false,
     keepReleases: DEFAULT_KEEP_RELEASES,
     pruneReleases: true,
+    pruneRuntimes: true,
     dashboardPublicUrl:
       process.env.HERMES_DEPLOY_DASHBOARD_PUBLIC_URL || DEFAULT_DASHBOARD_PUBLIC_URL,
     migrateNginxHermes: false,
@@ -148,6 +150,9 @@ function parseArgs(argv) {
         break;
       case "--no-prune-releases":
         args.pruneReleases = false;
+        break;
+      case "--no-prune-runtimes":
+        args.pruneRuntimes = false;
         break;
       case "--dashboard-public-url":
         args.dashboardPublicUrl = next();
@@ -670,6 +675,7 @@ migrate_nginx_hermes="${"${"}10}"
 dashboard_public_host="${"${"}11}"
 provision_powerpoint_deps="${"${"}12}"
 python_package_index="${"${"}13}"
+prune_runtimes="${"${"}14}"
 tmp_dir="$remote_root/tmp"
 releases_dir="$remote_root/releases"
 release="$releases_dir/$release_id"
@@ -711,6 +717,7 @@ reader_smoke_result=""
 conversation_smoke_result=""
 powerpoint_smoke_owner=""
 authority_snapshot=""
+runtime_pruning_status="disabled"
 
 gateway_unit="/etc/systemd/system/hermes-gateway.service"
 dashboard_unit="/etc/systemd/system/hermes-dashboard.service"
@@ -927,6 +934,21 @@ prune_old_releases() {
   done < <(printf '%s\n' "${"${"}ordered[@]}" | sort -rn)
 }
 
+prune_unused_runtimes() {
+  if [ "$prune_runtimes" != "1" ]; then
+    echo "Runtime pruning disabled; keeping all directories under $runtimes_dir"
+    return
+  fi
+  if "$venv/bin/python" "$release/deploy/prune-unused-runtimes.py" \
+    --runtimes-dir "$runtimes_dir" \
+    --keep-runtime "$venv"; then
+    runtime_pruning_status="completed"
+  else
+    runtime_pruning_status="failed (deployment remains committed)"
+    echo "Runtime pruning failed after deployment commit; inspect runtimes manually" >&2
+  fi
+}
+
 if ! is_release_name "$release_id"; then
   echo "Invalid release ID on remote: $release_id" >&2
   exit 1
@@ -957,6 +979,10 @@ if [[ "$migrate_nginx_hermes" != "0" && "$migrate_nginx_hermes" != "1" ]]; then
 fi
 if [[ "$provision_powerpoint_deps" != "0" && "$provision_powerpoint_deps" != "1" ]]; then
   echo "Invalid PowerPoint provisioning mode" >&2
+  exit 1
+fi
+if [[ "$prune_runtimes" != "0" && "$prune_runtimes" != "1" ]]; then
+  echo "Invalid runtime pruning mode" >&2
   exit 1
 fi
 if [[ "$python_package_index" != https://* ]]; then
@@ -1691,6 +1717,7 @@ action="reconcile"
 deployment_committed="1"
 echo "HERMES_DEPLOY_STAGE deployment=committed"
 prune_old_releases
+prune_unused_runtimes
 
 echo "Hermes deployed from $source_kind source $source_commit at $release"
 echo "Remote archive cleaned: $archive"
@@ -1699,6 +1726,7 @@ if [ "$prune_releases" = "1" ]; then
 else
   echo "Release retention: pruning disabled"
 fi
+echo "Runtime retention: $runtime_pruning_status"
 `;
 }
 
@@ -1728,6 +1756,7 @@ function deployArchive(args, archivePath) {
       args.dashboardPublicHost,
       args.provisionPowerpointDeps ? "1" : "0",
       DEFAULT_PYTHON_PACKAGE_INDEX,
+      args.pruneRuntimes ? "1" : "0",
     ],
     { input: remoteDeployScript() },
   );
@@ -1914,6 +1943,11 @@ function printSummary(args, result) {
     args.pruneReleases
       ? `Release retention: keep newest ${args.keepReleases} releases plus protected current/deployed releases`
       : `Release retention: disabled (--no-prune-releases)`,
+  );
+  console.log(
+    args.pruneRuntimes
+      ? "Runtime retention: remove managed runtimes not referenced by running processes"
+      : "Runtime retention: disabled (--no-prune-runtimes)",
   );
   console.log(`Status: ssh ${target} 'systemctl status --no-pager hermes-dashboard'`);
   console.log("Rollback example: npm run deploy -- --tag <previous-tag>");

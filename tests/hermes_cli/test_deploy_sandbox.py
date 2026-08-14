@@ -42,6 +42,14 @@ def test_deploy_uses_nonroot_service_immutable_runtime_and_host_policy():
         "sqlite-libs",
     } <= powerpoint_packages
     assert 'venv="$shared/venv"' not in source
+    assert '"$venv/bin/python" "$release/deploy/prune-unused-runtimes.py"' in source
+    assert '--runtimes-dir "$runtimes_dir"' in source
+    assert '--keep-runtime "$venv"' in source
+    commit = source.index('deployment_committed="1"')
+    runtime_prune = source.index("prune_unused_runtimes", commit)
+    assert commit < runtime_prune
+    assert 'runtime_pruning_status="failed (deployment remains committed)"' in source
+    assert "Runtime pruning failed after deployment commit" in source
     assert 'service_user="hermes"' in source
     assert 'service_group="hermes"' in source
     assert 'chown -R "$service_user:$service_group" "$hermes_home"' in source
