@@ -91,37 +91,45 @@ class TurnResult:
 _TURN_ABORTED_MARKERS = ("<turn_aborted>", "<turn_aborted/>")
 
 
-def _coerce_turn_input_text(user_input: Any) -> str:
-    """Collapse Hermes/OpenAI rich content into app-server text input.
-
-    The current `turn/start` path sends text items only. TUI image attachment
-    can hand us OpenAI-style content parts, so keep the text/path hints and
-    replace opaque image payloads with a small marker instead of putting a
-    Python list into the `text` field.
-    """
+def _coerce_turn_input(user_input: Any) -> list[dict[str, str]]:
+    """Translate Hermes/OpenAI content into Codex app-server turn input."""
     if isinstance(user_input, str):
-        return user_input
-    if isinstance(user_input, list):
-        parts: list[str] = []
-        for item in user_input:
-            if isinstance(item, str):
-                if item.strip():
-                    parts.append(item)
-                continue
-            if not isinstance(item, dict):
-                if item is not None:
-                    parts.append(str(item))
-                continue
-            item_type = item.get("type")
-            if item_type in {"text", "input_text"}:
-                text = item.get("text") or item.get("content") or ""
-                if text:
-                    parts.append(str(text))
-            elif item_type in {"image", "image_url", "input_image"}:
-                parts.append("[image attached]")
-        text = "\n\n".join(p for p in parts if p).strip()
-        return text or "What do you see in this image?"
-    return "" if user_input is None else str(user_input)
+        return [{"type": "text", "text": user_input}]
+    if not isinstance(user_input, list):
+        text = "" if user_input is None else str(user_input)
+        return [{"type": "text", "text": text}]
+
+    inputs: list[dict[str, str]] = []
+    for item in user_input:
+        if isinstance(item, str):
+            if item.strip():
+                inputs.append({"type": "text", "text": item})
+            continue
+        if not isinstance(item, dict):
+            if item is not None:
+                inputs.append({"type": "text", "text": str(item)})
+            continue
+
+        item_type = item.get("type")
+        if item_type in {"text", "input_text"}:
+            text = item.get("text") or item.get("content") or ""
+            if text:
+                inputs.append({"type": "text", "text": str(text)})
+            continue
+        if item_type not in {"image", "image_url", "input_image"}:
+            continue
+
+        image = item.get("image_url")
+        image_url = image.get("url", "") if isinstance(image, dict) else image
+        if not image_url:
+            image_url = item.get("url") or item.get("imageUrl") or ""
+        image_url = str(image_url)
+        if image_url.startswith("data:image/"):
+            inputs.append({"type": "image", "url": image_url})
+        elif image_url:
+            inputs.append({"type": "text", "text": f"[Image attached: {image_url}]"})
+
+    return inputs or [{"type": "text", "text": "What do you see in this image?"}]
 
 
 # Substrings in codex stderr / JSON-RPC error messages that signal the
@@ -402,16 +410,14 @@ class CodexAppServerSession:
         self._interrupt_event.clear()
         projector = CodexEventProjector()
 
-        user_input_text = _coerce_turn_input_text(user_input)
+        turn_input = _coerce_turn_input(user_input)
 
-        # Send turn/start with the user input. Text-only for now (codex
-        # supports rich content but Hermes' text path is the common case).
         try:
             ts = self._client.request(
                 "turn/start",
                 {
                     "threadId": self._thread_id,
-                    "input": [{"type": "text", "text": user_input_text}],
+                    "input": turn_input,
                 },
                 timeout=10,
             )

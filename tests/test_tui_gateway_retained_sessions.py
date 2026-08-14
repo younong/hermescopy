@@ -167,6 +167,129 @@ def test_authenticated_image_attach_materializes_durable_upload(owner_gateway, m
     assert session["pending_attachments"][0]["path"] == session["attached_images"][0]
 
 
+def test_authenticated_image_hint_uses_tool_visible_workspace_path(
+    owner_gateway, monkeypatch
+):
+    _db, runtime, workspace_root = owner_gateway
+    image = Path(workspace_root) / "default" / "uploads" / "attached.png"
+    image.parent.mkdir(parents=True)
+    image.write_bytes(b"\x89PNG\r\n\x1a\nvalid-test-image")
+    monkeypatch.setattr(
+        "tools.vision_tools.vision_analyze_tool",
+        lambda **_kwargs: asyncio.sleep(0, result='{"success":false}'),
+    )
+
+    with server.owner_worker_gateway_runtime(runtime):
+        enriched = server._enrich_with_attached_images("describe it", [str(image)])
+
+    assert "/workspace/uploads/attached.png" in enriched
+    assert str(image) not in enriched
+
+
+def test_owner_worker_codex_prompt_uses_deployment_native_vision(
+    owner_gateway, monkeypatch
+):
+    from hermes_cli.controlled_roots import RootKind
+    from hermes_cli.deployment_inference import DeploymentInferenceDescriptor
+
+    _db, runtime, _workspace_root = owner_gateway
+    transport = _CollaborationTransport()
+    image = runtime.filesystem_context.workspace_path / "uploads" / "attached.png"
+    runtime.filesystem_context.roots.replace_bytes(
+        RootKind.WORKSPACE,
+        "default/uploads/attached.png",
+        b"\x89PNG\r\n\x1a\nvalid-test-image",
+    )
+    captured = {}
+    turn_started = threading.Event()
+
+    class _Agent:
+        provider = "custom:codex"
+        model = "gpt-5.6-sol"
+        api_mode = "codex_app_server"
+        session_id = "stored-image"
+
+        def clear_interrupt(self):
+            return None
+
+        def run_conversation(self, message, **_kwargs):
+            captured["message"] = message
+            turn_started.set()
+            return {
+                "final_response": "visible",
+                "messages": [{"role": "assistant", "content": "visible"}],
+            }
+
+    session = {
+        "agent": _Agent(),
+        "agent_ready": threading.Event(),
+        "session_key": "stored-image",
+        "history": [],
+        "history_lock": threading.Lock(),
+        "history_version": 0,
+        "inflight_turn": None,
+        "running": False,
+        "attached_images": [str(image)],
+        "pending_attachments": [],
+        "cwd": str(runtime.filesystem_context.workspace_path),
+        "cols": 80,
+        "transport": transport,
+        "source": "dashboard-gui",
+    }
+    session["agent_ready"].set()
+    runtime.mutable_state.sessions["live-image"] = session
+    descriptor = DeploymentInferenceDescriptor(
+        provider="custom:codex",
+        model="gpt-5.6-sol",
+        api_mode="chat_completions",
+        policy_id="policy-v1",
+        allowed_models=("gpt-5.6-sol",),
+        supports_vision=True,
+    )
+    monkeypatch.setattr(server, "_emit", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(server, "_sync_agent_model_with_config", lambda *_args: None)
+    monkeypatch.setattr(server, "_register_session_cwd", lambda *_args: None)
+    monkeypatch.setattr(server, "_complete_prompt_turn_receipt", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(server, "_session_info", lambda *_args: {})
+    monkeypatch.setattr(server, "_get_usage", lambda *_args: {})
+    monkeypatch.setattr(server, "render_message", lambda *_args: "")
+    monkeypatch.setattr(server, "_voice_tts_enabled", lambda: False)
+    monkeypatch.setattr("hermes_cli.config.load_config", lambda: {})
+    monkeypatch.setattr(
+        "hermes_cli.deployment_inference.deployment_descriptor_from_environment",
+        lambda: descriptor,
+    )
+    monkeypatch.setattr(
+        server,
+        "_enrich_with_attached_images",
+        lambda *_args: (_ for _ in ()).throw(AssertionError("aux vision must not run")),
+    )
+    monkeypatch.setattr(
+        "tools.process_registry.process_registry.drain_notifications",
+        lambda: [],
+    )
+
+    try:
+        response = _call(
+            runtime,
+            "prompt.submit",
+            {"session_id": "live-image", "text": "describe it"},
+            transport=transport,
+        )
+        assert response["result"] == {"status": "streaming"}
+        assert turn_started.wait(timeout=2)
+        session["_run_thread"].join(timeout=2)
+        assert not session["_run_thread"].is_alive()
+    finally:
+        runtime.mutable_state.sessions.pop("live-image", None)
+
+    assert isinstance(captured["message"], list)
+    assert any(part.get("type") == "image_url" for part in captured["message"])
+    text_part = next(part for part in captured["message"] if part.get("type") == "text")
+    assert "/workspace/uploads/attached.png" in text_part["text"]
+    assert str(image) not in text_part["text"]
+
+
 def test_authenticated_image_attach_rejects_stale_workspace_path(owner_gateway, monkeypatch):
     _db, runtime, workspace_root = owner_gateway
     session = {"attached_images": [], "pending_attachments": []}
