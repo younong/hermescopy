@@ -417,6 +417,10 @@ def test_authenticated_employee_avatar_routes_are_control_plane_routes(method):
         ("POST", "/api/employees"),
         ("GET", "/api/employees/emp-id"),
         ("PUT", "/api/employees/emp-id/profile"),
+        (
+            "PUT",
+            "/api/employees/emp-id/builtin-assistant-personalization",
+        ),
         ("PUT", "/api/employees/emp-id/collaboration-policy"),
         ("PUT", "/api/employees/emp-id/lifecycle"),
         ("POST", "/api/employees/emp-id/rollover"),
@@ -456,6 +460,24 @@ def test_authenticated_employee_routes_are_method_and_path_exact(method, path):
     decision = classify_authenticated_api(path, method=method)
     assert decision.allowed is False
     assert decision.bucket == AuthenticatedApiBucket.LOCAL_ONLY_OR_UNAVAILABLE
+
+
+@pytest.mark.parametrize("method", ["GET", "PUT"])
+def test_builtin_assistant_policy_is_exact_control_plane_route(method):
+    from hermes_cli.dashboard_auth.api_availability import (
+        AuthenticatedApiBucket,
+        classify_authenticated_api,
+    )
+
+    decision = classify_authenticated_api(
+        "/api/system/builtin-assistant-policy", method=method
+    )
+    assert decision.allowed is True
+    assert decision.bucket == AuthenticatedApiBucket.CONTROL_PLANE_AUTH
+    denied = classify_authenticated_api(
+        "/api/system/builtin-assistant-policy/private", method=method
+    )
+    assert denied.allowed is False
 
 
 def test_authenticated_webhook_provisioning_is_exact_control_plane_route():

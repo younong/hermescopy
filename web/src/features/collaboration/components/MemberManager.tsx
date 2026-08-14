@@ -3,7 +3,7 @@ import { Spinner } from "@nous-research/ui/ui/components/spinner";
 import { UserRoundCog, X } from "lucide-react";
 import { useMemo, useState } from "react";
 import { guiChatTranslations, useI18n } from "@/i18n";
-import type { Employee } from "@/lib/api";
+import { employeeDisplayName, employeeDisplayRole, type Employee } from "@/lib/api";
 import type { CollaborationMembership } from "../types";
 
 interface MemberManagerProps {
@@ -24,8 +24,7 @@ export function MemberManager({ employees, memberships, onClose, onSave }: Membe
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const selectable = employees.filter((employee) =>
-    employee.profile !== null &&
-    (employee.collaboration_policy.may_participate || initial.includes(employee.employee_id))
+    employee.collaboration_policy.may_participate || initial.includes(employee.employee_id)
   );
 
   const save = async () => {
@@ -62,8 +61,8 @@ export function MemberManager({ employees, memberships, onClose, onSave }: Membe
                   type="checkbox"
                 />
                 <span className="min-w-0 flex-1">
-                  <span className="block truncate text-sm font-medium">{employee.profile?.name || copy.unnamedEmployee}</span>
-                  <span className="block truncate text-[11px] text-[#969aa1]">{employee.profile?.role || copy.aiEmployee}{revoked ? ` · ${copy.participationRevoked}` : ""}</span>
+                  <span className="block truncate text-sm font-medium">{employeeDisplayName(employee, copy.builtinAssistant, copy.unnamedEmployee)}</span>
+                  <span className="block truncate text-[11px] text-[#969aa1]">{employeeDisplayRole(employee, copy.builtinDescription, copy.aiEmployee)}{revoked ? ` · ${copy.participationRevoked}` : ""}</span>
                 </span>
               </label>
             );

@@ -186,6 +186,8 @@ export interface GuiChatTranslations {
     noEligibleEmployees: string;
     unnamedEmployee: string;
     aiEmployee: string;
+    builtinAssistant: string;
+    builtinDescription: string;
     participationRevoked: string;
     manageMembers: string;
     groupMembers: string;
@@ -469,6 +471,17 @@ export interface GuiChatTranslations {
     builtin: string;
     builtinDescription: string;
     builtinManaged: string;
+    builtinPersonalizationHelp: string;
+    nickname: string;
+    nicknamePlaceholder: string;
+    nicknameRequired: string;
+    personalPreference: string;
+    personalPreferencePlaceholder: string;
+    personalPreferenceHelp: string;
+    savePersonalization: string;
+    personalizationSaved: string;
+    personalizationSaveFailed: string;
+    avatarSaveFailed: string;
     manageDescription: string;
     addTitle: string;
     editTitle: string;

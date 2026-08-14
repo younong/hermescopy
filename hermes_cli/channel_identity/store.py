@@ -13,7 +13,7 @@ from typing import Iterator
 
 from .crypto import ChannelCrypto
 
-SCHEMA_VERSION = 16
+SCHEMA_VERSION = 17
 ACCOUNT_CREDENTIAL_AAD_TABLE = "ilink_accounts"
 EMPLOYEE_PROFILE_AAD_TABLE = "employee_profiles"
 _DB_FILENAME = "channel_identities.sqlite3"
@@ -168,6 +168,15 @@ BEFORE UPDATE OF employee_id, created_at ON employee_collaboration_policies
 BEGIN
     SELECT RAISE(ABORT, 'employee collaboration policy identity is immutable');
 END;
+CREATE TABLE IF NOT EXISTS builtin_assistant_policy (
+    singleton INTEGER PRIMARY KEY CHECK(singleton=1),
+    model_registration_id TEXT NOT NULL CHECK(length(trim(model_registration_id)) > 0),
+    reasoning_effort TEXT NOT NULL,
+    revision INTEGER NOT NULL CHECK(revision >= 1),
+    updated_by_account_id TEXT NOT NULL CHECK(length(trim(updated_by_account_id)) > 0),
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL
+);
 CREATE TABLE IF NOT EXISTS employee_profiles (
     employee_id TEXT NOT NULL REFERENCES employees(employee_id),
     revision INTEGER NOT NULL CHECK(revision >= 1),
@@ -540,6 +549,9 @@ class ChannelIdentityStore:
                         elif version == 15:
                             self._migrate_v15_to_v16(conn)
                             version = 16
+                        elif version == 16:
+                            self._migrate_v16_to_v17(conn)
+                            version = 17
                         else:
                             raise RuntimeError(
                                 "channel identity database schema is older than supported"
@@ -1259,6 +1271,27 @@ class ChannelIdentityStore:
             raise RuntimeError("builtin assistant employee migration is inconsistent")
         conn.execute(
             "UPDATE channel_identity_meta SET value='16' WHERE key='schema_version'"
+        )
+
+    @staticmethod
+    def _migrate_v16_to_v17(conn: sqlite3.Connection) -> None:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS builtin_assistant_policy (
+                singleton INTEGER PRIMARY KEY CHECK(singleton=1),
+                model_registration_id TEXT NOT NULL
+                    CHECK(length(trim(model_registration_id)) > 0),
+                reasoning_effort TEXT NOT NULL,
+                revision INTEGER NOT NULL CHECK(revision >= 1),
+                updated_by_account_id TEXT NOT NULL
+                    CHECK(length(trim(updated_by_account_id)) > 0),
+                created_at REAL NOT NULL,
+                updated_at REAL NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            "UPDATE channel_identity_meta SET value='17' WHERE key='schema_version'"
         )
 
     @staticmethod

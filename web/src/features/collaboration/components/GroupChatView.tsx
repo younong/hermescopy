@@ -1,7 +1,7 @@
 import { Archive, RefreshCw, UserRoundCog } from "lucide-react";
 import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from "react";
 import { guiChatTranslations, useI18n } from "@/i18n";
-import type { Employee } from "@/lib/api";
+import { employeeDisplayName, employeeDisplayRole, type Employee } from "@/lib/api";
 import type { CollaborationApi } from "../api";
 import { collaborationReducer } from "../reducer";
 import { defaultMentionSelection } from "../mentions";
@@ -77,10 +77,10 @@ export function GroupChatView({ api, connection, employees, groupId, onArchive, 
       employeeId: employee.employee_id,
       available: employee.lifecycle_status === "active" && employee.collaboration_policy.may_participate,
       avatarUrl: employee.avatar_url ?? undefined,
-      name: employee.profile?.name || copy.unnamedEmployee,
-      role: employee.profile?.role,
+      name: employeeDisplayName(employee, copy.builtinAssistant, copy.unnamedEmployee),
+      role: employeeDisplayRole(employee, copy.builtinDescription),
     })),
-    [copy.unnamedEmployee, employees],
+    [copy.builtinAssistant, copy.builtinDescription, copy.unnamedEmployee, employees],
   );
   const employeeName = useCallback((employeeId: string) =>
     identities.find((employee) => employee.employeeId === employeeId)?.name ?? copy.formerEmployee, [copy.formerEmployee, identities]);

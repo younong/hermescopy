@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import pytest
 from fastapi.testclient import TestClient
+from types import SimpleNamespace
 
 from hermes_cli import web_server
 from hermes_cli.dashboard_auth import (
@@ -44,6 +45,84 @@ def _login(client: TestClient, username: str, password: str):
         "/auth/password-login",
         json={"provider": "basic", "username": username, "password": password},
     )
+
+
+def test_builtin_assistant_policy_requires_admin_and_uses_shared_store(
+    local_basic_client, tmp_path, monkeypatch
+):
+    from hermes_cli.channel_identity import ChannelCrypto, ChannelIdentityStore, Keyring
+
+    client, users = local_basic_client
+    users.create_account(username="admin", password="admin-password", role="admin")
+    users.create_account(username="member", password="member-password")
+    store = ChannelIdentityStore(
+        ChannelCrypto(
+            lookup=Keyring(keys={1: b"l" * 32}, active_version=1),
+            encryption=Keyring(keys={1: b"e" * 32}, active_version=1),
+        ),
+        tmp_path / "channels",
+        global_home=tmp_path,
+    )
+    previous_runtime = getattr(web_server.app.state, "channel_connector_runtime", None)
+    web_server.app.state.channel_connector_runtime = SimpleNamespace(store=store)
+    monkeypatch.setattr(
+        "hermes_cli.model_registrations.admin_chat_registrations_payload",
+        lambda: [{"id": "admin-chat-a", "kind": "chat", "scope": "admin"}],
+    )
+    monkeypatch.setattr(
+        "hermes_cli.model_registrations.resolve_admin_chat_model_registration",
+        lambda registration_id: {
+            "registration_id": registration_id,
+            "provider": "deployment-provider",
+            "model": "deployment-model",
+            "selection_source": "deployment",
+        }
+        if registration_id == "admin-chat-a"
+        else (_ for _ in ()).throw(ValueError("unknown registration")),
+    )
+    try:
+        assert _login(client, "member", "member-password").status_code == 200
+        assert client.get("/api/system/builtin-assistant-policy").status_code == 403
+        client.cookies.clear()
+        assert _login(client, "admin", "admin-password").status_code == 200
+        initial = client.get("/api/system/builtin-assistant-policy")
+        assert initial.status_code == 200
+        assert initial.json() == {
+            "policy": None,
+            "admin_chat_registrations": [
+                {"id": "admin-chat-a", "kind": "chat", "scope": "admin"}
+            ],
+        }
+        updated = client.put(
+            "/api/system/builtin-assistant-policy",
+            json={
+                "model_registration_id": "admin-chat-a",
+                "reasoning_effort": "high",
+                "expected_revision": 0,
+            },
+        )
+        assert updated.status_code == 200
+        assert updated.json()["policy"]["model_registration_id"] == "admin-chat-a"
+        assert updated.json()["policy"]["reasoning_effort"] == "high"
+        assert updated.json()["policy"]["revision"] == 1
+        stale = client.put(
+            "/api/system/builtin-assistant-policy",
+            json={
+                "model_registration_id": "admin-chat-a",
+                "reasoning_effort": "max",
+                "expected_revision": 0,
+            },
+        )
+        assert stale.status_code == 409
+        assert stale.json() == {
+            "detail": "builtin_assistant_policy_revision_conflict"
+        }
+        with store.read() as conn:
+            assert conn.execute(
+                "SELECT updated_by_account_id FROM builtin_assistant_policy"
+            ).fetchone()["updated_by_account_id"]
+    finally:
+        web_server.app.state.channel_connector_runtime = previous_runtime
 
 
 def test_admin_management_requires_durable_local_basic(local_basic_client):

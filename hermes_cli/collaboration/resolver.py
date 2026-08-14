@@ -9,17 +9,27 @@ from typing import Any
 from hermes_cli.channel_connectors.bootstrap import build_channel_identity_store
 from hermes_cli.channel_identity import (
     ChannelIdentityStore,
+    builtin_assistant_personalization_payload,
+    resolve_builtin_assistant_personalization,
+    resolve_builtin_assistant_policy,
     resolve_employee,
     resolve_employee_profile,
 )
 from hermes_cli.dashboard_auth.owner_context import owner_context_from_owner_key
-from hermes_cli.employee_catalog import BUILTIN_ASSISTANT_SYSTEM_PROMPT
+from hermes_cli.employee_catalog import (
+    BUILTIN_ASSISTANT_SYSTEM_PROMPT,
+    BUILTIN_ASSISTANT_TOOLSETS,
+    builtin_assistant_system_prompt,
+)
 from hermes_cli.employee_policy import (
     canonical_employee_snapshot,
     effective_employee_workspace,
     normalize_employee_source_policy,
 )
-from hermes_cli.model_registrations import resolve_chat_model_registration
+from hermes_cli.model_registrations import (
+    resolve_admin_chat_model_registration,
+    resolve_chat_model_registration,
+)
 
 from .models import CollaborationMemberProfile
 
@@ -27,6 +37,9 @@ from .models import CollaborationMemberProfile
 def collaboration_attachment_prefix(membership_id: str) -> str:
     """Return one membership's read-only attachment capability root."""
     return f"collaboration-attachments/{membership_id}"
+
+
+_LEGACY_BUILTIN_ASSISTANT_PROFILE_FINGERPRINT = "builtin-assistant-v1"
 
 
 def collaboration_member_policy(
@@ -169,13 +182,11 @@ class CollaborationEmployeeResolver:
         """Resolve an immutable profile revision while rechecking live authority."""
         managed = self._resolve_live_authority(employee_id)
         if managed.employee_kind == "builtin_assistant":
-            resolved = self._resolved_builtin(managed)
-            if (
-                resolved.member.profile_revision != int(profile_revision)
-                or resolved.member.profile_fingerprint != str(profile_fingerprint)
-            ):
-                raise RuntimeError("collaboration member profile fingerprint is inconsistent")
-            return resolved
+            return self._resolved_builtin(
+                managed,
+                profile_revision=int(profile_revision),
+                profile_fingerprint=str(profile_fingerprint),
+            )
         if not managed.collaboration_policy.may_participate:
             raise RuntimeError("collaboration participation is revoked")
         profile = resolve_employee_profile(
@@ -198,44 +209,68 @@ class CollaborationEmployeeResolver:
             raise RuntimeError("employee is unavailable")
         return employee
 
-    def _resolved_builtin(self, managed) -> ResolvedCollaborationEmployee:
-        from hermes_cli.config import load_config
-        from hermes_cli.model_registrations import get_model_registrations_payload
-        from hermes_cli.tools_config import _get_platform_tools, enabled_mcp_server_names
-
-        config = load_config()
-        registrations = get_model_registrations_payload()
-        active_chat = dict(registrations.get("active", {}).get("chat") or {})
-        registration_id = str(active_chat.get("registration_id") or "").strip()
-        if not registration_id:
-            raise RuntimeError("active Chat model registration is unavailable")
-        model = resolve_chat_model_registration(registration_id)
-        toolsets = sorted(
-            _get_platform_tools(config, "cli", include_default_mcp_servers=False)
-            | {"project"}
+    def _resolved_builtin(
+        self,
+        managed,
+        *,
+        profile_revision: int | None = None,
+        profile_fingerprint: str | None = None,
+    ) -> ResolvedCollaborationEmployee:
+        store = self._authority_store()
+        global_policy = resolve_builtin_assistant_policy(store)
+        model = resolve_admin_chat_model_registration(
+            global_policy.model_registration_id
         )
+        personalization = resolve_builtin_assistant_personalization(
+            store,
+            owner=self.owner,
+            employee_id=managed.employee_id,
+            revision=profile_revision,
+        )
+        if profile_revision is not None:
+            if (
+                personalization.fingerprint != profile_fingerprint
+                and not (
+                    profile_revision == 1
+                    and profile_fingerprint
+                    == _LEGACY_BUILTIN_ASSISTANT_PROFILE_FINGERPRINT
+                )
+            ):
+                raise RuntimeError(
+                    "collaboration member profile fingerprint is inconsistent"
+                )
+        personalized = builtin_assistant_personalization_payload(personalization)
         snapshot = {
             "schema_version": 1,
             "employee_id": managed.employee_id,
-            "profile_revision": 1,
-            "source_profile_fingerprint": "builtin-assistant-v1",
-            "system_prompt": BUILTIN_ASSISTANT_SYSTEM_PROMPT,
+            "profile_revision": personalization.revision,
+            "source_profile_fingerprint": personalization.fingerprint,
+            "global_policy_revision": global_policy.revision,
+            "system_prompt": builtin_assistant_system_prompt(
+                personalized["personal_preference"]
+            ),
             "model": model,
-            "toolsets": toolsets,
+            "toolsets": list(BUILTIN_ASSISTANT_TOOLSETS),
             "skills": [],
-            "mcp_servers": sorted(enabled_mcp_server_names(config)),
+            "mcp_servers": [],
             "workspace_relative_path": "",
             "knowledge_relative_paths": [],
             "max_iterations": 90,
             "max_tokens": None,
+            "reasoning_effort": global_policy.reasoning_effort,
+            "name": personalized["nickname"],
             "builtin_assistant": True,
         }
         policy, _ = canonical_employee_snapshot(snapshot)
         return ResolvedCollaborationEmployee(
             member=CollaborationMemberProfile(
                 employee_id=managed.employee_id,
-                profile_revision=1,
-                profile_fingerprint="builtin-assistant-v1",
+                profile_revision=personalization.revision,
+                profile_fingerprint=(
+                    str(profile_fingerprint)
+                    if profile_revision is not None
+                    else personalization.fingerprint
+                ),
             ),
             employee_policy=policy,
             may_participate=True,

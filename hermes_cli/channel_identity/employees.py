@@ -197,6 +197,53 @@ def set_employee_status(
     return resolve_employee(store, owner=owner, employee_id=employee_id)
 
 
+def _append_profile_revision(
+    store: ChannelIdentityStore,
+    conn,
+    *,
+    employee_id: str,
+    expected_revision: int,
+    normalized_profile: dict[str, Any],
+    profile_payload: str,
+    fingerprint: str,
+    now: float,
+) -> EmployeeProfile:
+    current = conn.execute(
+        "SELECT revision FROM employee_profiles "
+        "WHERE employee_id=? AND lifecycle_status='active'",
+        (employee_id,),
+    ).fetchone()
+    current_revision = int(current["revision"]) if current is not None else 0
+    if current_revision != expected_revision:
+        raise EmployeeProfileRevisionConflict(
+            f"employee profile revision changed from "
+            f"{expected_revision} to {current_revision}"
+        )
+    revision = current_revision + 1
+    if current is not None:
+        conn.execute(
+            "UPDATE employee_profiles SET lifecycle_status='superseded', updated_at=? "
+            "WHERE employee_id=? AND revision=?",
+            (now, employee_id, current_revision),
+        )
+    _insert_profile_revision(
+        store,
+        conn,
+        employee_id=employee_id,
+        revision=revision,
+        profile_payload=profile_payload,
+        profile_fingerprint=fingerprint,
+        now=now,
+    )
+    return EmployeeProfile(
+        employee_id=employee_id,
+        revision=revision,
+        fingerprint=fingerprint,
+        lifecycle_status="active",
+        profile=normalized_profile,
+    )
+
+
 def update_employee_profile(
     store: ChannelIdentityStore,
     *,
@@ -244,29 +291,16 @@ def update_employee_profile(
             current_workspace=current_workspace,
         )
         normalized_profile, profile_payload, fingerprint = _canonical_profile(source_policy)
-        revision = current_revision + 1
-        if current is not None:
-            conn.execute(
-                "UPDATE employee_profiles SET lifecycle_status='superseded', updated_at=? "
-                "WHERE employee_id=? AND revision=?",
-                (now, employee_id, current_revision),
-            )
-        _insert_profile_revision(
+        return _append_profile_revision(
             store,
             conn,
             employee_id=employee_id,
-            revision=revision,
+            expected_revision=expected_revision,
+            normalized_profile=normalized_profile,
             profile_payload=profile_payload,
-            profile_fingerprint=fingerprint,
+            fingerprint=fingerprint,
             now=now,
         )
-    return EmployeeProfile(
-        employee_id=employee_id,
-        revision=revision,
-        fingerprint=fingerprint,
-        lifecycle_status="active",
-        profile=normalized_profile,
-    )
 
 
 def resolve_employee_profile(

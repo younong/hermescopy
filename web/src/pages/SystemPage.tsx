@@ -20,6 +20,7 @@ import {
   Share2,
   ShieldCheck,
   Sparkles,
+  UserRoundCog,
   Stethoscope,
   Terminal,
   Trash2,
@@ -58,9 +59,12 @@ import type {
   PortalStatus,
   DebugShareResponse,
   AuthMeResponse,
+  BuiltinAssistantPolicyResponse,
   LocalAccount,
   LocalAccountRole,
+  ReasoningLevel,
 } from "@/lib/api";
+import { REASONING_LEVEL_LABELS } from "@/lib/reasoning-level";
 
 function formatBytes(n: number): string {
   if (n < 1024) return `${n} B`;
@@ -191,6 +195,13 @@ export default function SystemPage() {
   const [localAccounts, setLocalAccounts] = useState<LocalAccount[]>([]);
   const [localAccountsCount, setLocalAccountsCount] = useState(0);
   const [localAccountsMax, setLocalAccountsMax] = useState(0);
+  const [builtinAssistantPolicy, setBuiltinAssistantPolicy] =
+    useState<BuiltinAssistantPolicyResponse | null>(null);
+  const [builtinAssistantModelId, setBuiltinAssistantModelId] = useState("");
+  const [builtinAssistantReasoning, setBuiltinAssistantReasoning] =
+    useState<ReasoningLevel>("high");
+  const [savingBuiltinAssistantPolicy, setSavingBuiltinAssistantPolicy] =
+    useState(false);
   const [loading, setLoading] = useState(true);
 
   const [currentPassword, setCurrentPassword] = useState("");
@@ -252,6 +263,26 @@ export default function SystemPage() {
   const [checkingUpdate, setCheckingUpdate] = useState(false);
   const [updateConfirmOpen, setUpdateConfirmOpen] = useState(false);
 
+  const applyBuiltinAssistantPolicy = useCallback(
+    (payload: BuiltinAssistantPolicyResponse) => {
+      setBuiltinAssistantPolicy(payload);
+      setBuiltinAssistantModelId(
+        payload.policy?.model_registration_id ??
+          payload.admin_chat_registrations[0]?.id ??
+          "",
+      );
+      setBuiltinAssistantReasoning(
+        payload.policy?.reasoning_effort ?? "high",
+      );
+    },
+    [],
+  );
+
+  const loadBuiltinAssistantPolicy = useCallback(async () => {
+    const payload = await api.getBuiltinAssistantPolicy();
+    applyBuiltinAssistantPolicy(payload);
+  }, [applyBuiltinAssistantPolicy]);
+
   const loadAll = useCallback(() => {
     Promise.allSettled([
       api.getStatus(),
@@ -284,17 +315,17 @@ export default function SystemPage() {
               setLocalAccountsCount(users.count);
               setLocalAccountsMax(users.max_accounts);
             });
+            void loadBuiltinAssistantPolicy().catch(() => undefined);
           }
         }
         if (upd.status === "fulfilled") setUpdateInfo(upd.value);
       })
       .finally(() => setLoading(false));
-  }, []);
+  }, [loadBuiltinAssistantPolicy]);
 
   useEffect(() => {
     loadAll();
   }, [loadAll]);
-
 
   const loadLocalUsers = useCallback(async () => {
     const users = await api.getLocalUsers();
@@ -302,6 +333,35 @@ export default function SystemPage() {
     setLocalAccountsCount(users.count);
     setLocalAccountsMax(users.max_accounts);
   }, []);
+
+  const saveBuiltinAssistantPolicy = async () => {
+    if (!builtinAssistantModelId) {
+      showToast("Select a model for the built-in assistant", "error");
+      return;
+    }
+    setSavingBuiltinAssistantPolicy(true);
+    try {
+      const payload = await api.updateBuiltinAssistantPolicy({
+        model_registration_id: builtinAssistantModelId,
+        reasoning_effort: builtinAssistantReasoning,
+        expected_revision: builtinAssistantPolicy?.policy?.revision ?? 0,
+      });
+      applyBuiltinAssistantPolicy(payload);
+      showToast("Built-in assistant policy updated", "success");
+    } catch (error) {
+      showToast(`Built-in assistant policy update failed: ${error}`, "error");
+      try {
+        await loadBuiltinAssistantPolicy();
+      } catch (reloadError) {
+        showToast(
+          `Built-in assistant policy reload failed: ${reloadError}`,
+          "error",
+        );
+      }
+    } finally {
+      setSavingBuiltinAssistantPolicy(false);
+    }
+  };
 
   const changeOwnPassword = async () => {
     if (!currentPassword || !newPassword || !newPasswordConfirmation) {
@@ -1137,6 +1197,80 @@ export default function SystemPage() {
                 ))}
                 {localAccounts.length === 0 && <p className="py-3 text-sm text-muted-foreground">No local accounts found.</p>}
               </div>
+            </CardContent>
+          </Card>
+        </section>
+      )}
+
+      {/* ── Built-in assistant policy ──────────────────────────────── */}
+      {authMe?.local_user_management?.enabled && authMe.local_user_management.is_admin && (
+        <section className="flex flex-col gap-3">
+          <H2 variant="sm" className="flex items-center gap-2 text-muted-foreground">
+            <UserRoundCog className="h-4 w-4" /> Built-in assistant
+          </H2>
+          <Card>
+            <CardContent className="flex flex-col gap-4 py-4">
+              <div className="max-w-prose">
+                <p className="text-sm font-medium">Global conversation policy</p>
+                <p className="mt-1 text-xs text-muted-foreground">
+                  Sets the model and reasoning level for all users&apos; new or reconstructed built-in assistant conversations. Existing conversations are unchanged, and ordinary chat model selection is unaffected.
+                </p>
+              </div>
+              {builtinAssistantPolicy ? (
+                <div className="grid grid-cols-1 gap-3 sm:grid-cols-[minmax(0,1fr)_minmax(9rem,0.4fr)_auto] sm:items-end">
+                  <div className="grid gap-2">
+                    <Label htmlFor="builtin-assistant-model">Model</Label>
+                    <Select
+                      id="builtin-assistant-model"
+                      value={builtinAssistantModelId}
+                      onValueChange={setBuiltinAssistantModelId}
+                    >
+                      {builtinAssistantPolicy.admin_chat_registrations.map((registration) => (
+                        <SelectOption key={registration.id} value={registration.id}>
+                          {registration.name}
+                        </SelectOption>
+                      ))}
+                    </Select>
+                  </div>
+                  <div className="grid gap-2">
+                    <Label htmlFor="builtin-assistant-reasoning">Reasoning</Label>
+                    <Select
+                      id="builtin-assistant-reasoning"
+                      value={builtinAssistantReasoning}
+                      onValueChange={(value) =>
+                        setBuiltinAssistantReasoning(value as ReasoningLevel)
+                      }
+                    >
+                      {(Object.keys(REASONING_LEVEL_LABELS) as ReasoningLevel[]).map((level) => (
+                        <SelectOption key={level} value={level}>
+                          {REASONING_LEVEL_LABELS[level]}
+                        </SelectOption>
+                      ))}
+                    </Select>
+                  </div>
+                  <Button
+                    size="sm"
+                    className="uppercase"
+                    disabled={
+                      savingBuiltinAssistantPolicy ||
+                      builtinAssistantPolicy.admin_chat_registrations.length === 0
+                    }
+                    prefix={savingBuiltinAssistantPolicy ? <Spinner /> : undefined}
+                    onClick={() => void saveBuiltinAssistantPolicy()}
+                  >
+                    Save policy
+                  </Button>
+                </div>
+              ) : (
+                <div className="flex items-center gap-2 text-sm text-muted-foreground">
+                  <Spinner className="h-4 w-4" /> Loading policy…
+                </div>
+              )}
+              {builtinAssistantPolicy?.admin_chat_registrations.length === 0 && (
+                <p className="text-xs text-warning">
+                  No administrator-managed chat models are available.
+                </p>
+              )}
             </CardContent>
           </Card>
         </section>

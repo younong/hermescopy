@@ -26,6 +26,8 @@ CONTROL_PLANE_AUTH_PATHS: frozenset[str] = frozenset({
     "/api/auth/ws-ticket",
 })
 CONTROL_PLANE_AUTH_ROUTES: frozenset[tuple[str, str]] = frozenset({
+    ("GET", "/api/system/builtin-assistant-policy"),
+    ("PUT", "/api/system/builtin-assistant-policy"),
     ("POST", "/api/messaging/webhook/accounts"),
     ("GET", "/api/employees"),
     ("POST", "/api/employees"),
@@ -72,6 +74,7 @@ OWNER_WORKER_PATHS: frozenset[str] = frozenset(path for _method, path in OWNER_W
 _EMPLOYEE_ACTION_METHODS: dict[str, frozenset[str]] = {
     "avatar": frozenset({"GET", "PUT", "DELETE"}),
     "profile": frozenset({"PUT"}),
+    "builtin-assistant-personalization": frozenset({"PUT"}),
     "collaboration-policy": frozenset({"PUT"}),
     "lifecycle": frozenset({"PUT"}),
     "rollover": frozenset({"POST"}),

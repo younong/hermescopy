@@ -124,6 +124,11 @@ def test_create_without_channel_and_list_detail_are_owner_scoped(authenticated_c
     assert builtin["protected"] is True
     assert builtin["chat_eligible"] is True
     assert builtin["profile"] is None
+    assert builtin["profile_revision"] == 1
+    assert builtin["builtin_assistant_personalization"] == {
+        "nickname": "AI 助手",
+        "personal_preference": "",
+    }
     assert builtin["collaboration_policy"] == {
         "may_participate": True,
         "may_create_groups": True,
@@ -272,10 +277,6 @@ def test_builtin_employee_mutation_routes_return_protected_conflict(
     employee_id = builtin["employee_id"]
     requests = (
         client.put(
-            f"/api/employees/{employee_id}/profile",
-            json={"expected_revision": 0, "profile": _policy()},
-        ),
-        client.put(
             f"/api/employees/{employee_id}/collaboration-policy",
             json={
                 "may_participate": False,
@@ -292,15 +293,43 @@ def test_builtin_employee_mutation_routes_return_protected_conflict(
             f"/api/employees/{employee_id}/channels/feishu",
             json={"app_id": "app-a", "app_secret": "secret"},
         ),
-        client.put(
-            f"/api/employees/{employee_id}/avatar",
-            files={"file": ("avatar.png", _image_bytes(), "image/png")},
-        ),
-        client.delete(f"/api/employees/{employee_id}/avatar"),
     )
     for response in requests:
         assert response.status_code == 409
         assert response.json() == {"detail": "builtin_employee_protected"}
+
+    protected_profile = client.put(
+        f"/api/employees/{employee_id}/profile",
+        json={"expected_revision": 1, "profile": _policy()},
+    )
+    assert protected_profile.status_code == 409
+    assert protected_profile.json() == {"detail": "builtin_employee_protected"}
+    personalized = client.put(
+        f"/api/employees/{employee_id}/builtin-assistant-personalization",
+        json={
+            "expected_revision": 1,
+            "nickname": "我的助手",
+            "personal_preference": "请优先使用中文。",
+        },
+    )
+    assert personalized.status_code == 200
+    assert personalized.json()["profile"] is None
+    assert personalized.json()["builtin_assistant_personalization"] == {
+        "nickname": "我的助手",
+        "personal_preference": "请优先使用中文。",
+    }
+    avatar = client.put(
+        f"/api/employees/{employee_id}/avatar",
+        files={"file": ("avatar.png", _image_bytes(), "image/png")},
+    )
+    assert avatar.status_code == 200
+    assert avatar.json()["avatar_url"].startswith(
+        f"/api/employees/{employee_id}/avatar?v="
+    )
+    assert client.delete(f"/api/employees/{employee_id}/avatar").json() == {
+        "ok": True,
+        "deleted": True,
+    }
 
 
 def _image_bytes(format="PNG", color="red"):

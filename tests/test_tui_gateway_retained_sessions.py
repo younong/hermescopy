@@ -630,7 +630,7 @@ def test_builtin_web_direct_policy_pins_tool_snapshot_and_rechecks_authority(
         "source_profile_fingerprint": "builtin-assistant-v1",
         "system_prompt": "Built-in prompt",
         "model": {"provider": "openai", "model": "test-model"},
-        "toolsets": [],
+        "toolsets": ["hermes-cli", "project"],
         "skills": [],
         "mcp_servers": [],
         "workspace_relative_path": "",
@@ -687,10 +687,6 @@ def test_builtin_web_direct_policy_pins_tool_snapshot_and_rechecks_authority(
     monkeypatch.setattr(
         server, "_dashboard_attach_transport", lambda: _DashboardTransport()
     )
-    monkeypatch.setattr(
-        server, "_load_enabled_toolsets", lambda: ["terminal", "project"]
-    )
-
     response = _call(
         runtime,
         "session.create",
@@ -704,7 +700,7 @@ def test_builtin_web_direct_policy_pins_tool_snapshot_and_rechecks_authority(
     assert "error" not in response
     session = runtime.mutable_state.sessions[response["result"]["session_id"]]
     pinned_policy = session["employee_policy"]
-    assert pinned_policy["runtime_toolsets"] == ["terminal", "project"]
+    assert pinned_policy["runtime_toolsets"] == ["hermes-cli", "project"]
     assert pinned_policy["system_prompt"] == "Built-in prompt"
     server._ensure_session_db_row(session)
     row = _db.get_session(response["result"]["stored_session_id"])
@@ -712,7 +708,7 @@ def test_builtin_web_direct_policy_pins_tool_snapshot_and_rechecks_authority(
         restored = server._stored_session_runtime_overrides(row)
     assert restored["employee_policy"] == pinned_policy
     assert restored["employee_policy"]["runtime_toolsets"] == [
-        "terminal",
+        "hermes-cli",
         "project",
     ]
     assert restored["collaboration_context"].may_manage_employees is True
@@ -1291,7 +1287,7 @@ def test_builtin_web_direct_reopen_does_not_perpetually_repin(
         "source_profile_fingerprint": "builtin-assistant-v1",
         "system_prompt": "Built-in prompt",
         "model": {"provider": "openai", "model": "test-model"},
-        "toolsets": [],
+        "toolsets": ["hermes-cli", "project"],
         "skills": [],
         "mcp_servers": [],
         "workspace_relative_path": "",
@@ -1332,15 +1328,12 @@ def test_builtin_web_direct_reopen_does_not_perpetually_repin(
     server.bind_collaboration_service(runtime, service)
     transport = _EmployeeDashboardTransport()
     monkeypatch.setattr(server, "_reopen_resume_session", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(
-        server, "_load_enabled_toolsets", lambda: ["terminal", "project"]
-    )
 
     first = _open_employee(runtime, transport, "builtin-a", 1)
     sid = first["result"]["session_id"]
     session = runtime.mutable_state.sessions[sid]
     pinned = session["employee_policy"]
-    assert pinned["runtime_toolsets"] == ["terminal", "project"]
+    assert pinned["runtime_toolsets"] == ["hermes-cli", "project"]
 
     meta_writes = []
     monkeypatch.setattr(
@@ -2041,7 +2034,7 @@ def test_verified_artifact_emits_before_complete_and_failed_turn_emits_none(
     }
     session["agent_ready"].set()
     runtime.mutable_state.sessions["live-artifact"] = session
-    monkeypatch.setattr(server, "_required_gateway_transport", lambda: transport)
+    monkeypatch.setattr(server, "write_json", transport.write)
     monkeypatch.setattr(server, "_sync_agent_model_with_config", lambda *_args: None)
     monkeypatch.setattr(server, "_register_session_cwd", lambda *_args: None)
     monkeypatch.setattr(server, "_complete_prompt_turn_receipt", lambda *_args, **_kwargs: None)
@@ -2433,6 +2426,98 @@ def test_collaboration_runner_rebuilds_from_matching_persisted_policy(
             on_delta=lambda _text: None,
             on_approval=lambda _data: None,
         )
+    runner.close()
+
+
+def test_collaboration_runner_retains_builtin_policy_across_global_update(
+    owner_gateway, monkeypatch
+):
+    db, runtime, _workspace_root = owner_gateway
+    from hermes_cli.collaboration.models import CollaborationMembership
+    from hermes_cli.employee_policy import canonical_employee_snapshot
+
+    membership = CollaborationMembership(
+        membership_id="membership-a",
+        group_id="group-a",
+        employee_id="builtin-a",
+        profile_revision=1,
+        profile_fingerprint="builtin-assistant-v1",
+        hidden_session_id="hidden-a",
+        stored_session_id="stored-a",
+        role="member",
+        join_sequence=1,
+        leave_sequence=None,
+        created_at=1.0,
+        left_at=None,
+        current_session_generation=1,
+    )
+    base = {
+        "schema_version": 1,
+        "employee_id": "builtin-a",
+        "profile_revision": 1,
+        "source_profile_fingerprint": "builtin-assistant-v1",
+        "global_policy_revision": 1,
+        "system_prompt": "Original built-in policy",
+        "model": {"provider": "openai", "model": "model-a"},
+        "toolsets": ["hermes-cli", "project"],
+        "runtime_toolsets": ["hermes-cli", "project"],
+        "skills": [],
+        "mcp_servers": [],
+        "workspace_relative_path": "",
+        "knowledge_relative_paths": ["collaboration-attachments/membership-a"],
+        "max_iterations": 90,
+        "max_tokens": None,
+        "reasoning_effort": "high",
+        "name": "AI 助手",
+        "builtin_assistant": True,
+    }
+    retained_policy = canonical_employee_snapshot(base)[0]
+    current_policy = canonical_employee_snapshot(
+        {
+            **base,
+            "source_profile_fingerprint": "sha256:" + "a" * 64,
+            "global_policy_revision": 2,
+            "system_prompt": "Updated built-in policy",
+            "model": {"provider": "openai", "model": "model-b"},
+            "reasoning_effort": "max",
+        }
+    )[0]
+    runner = server.CollaborationAgentRunner(db, runtime)
+    runner.ensure_member_session(
+        membership=membership,
+        employee_policy=retained_policy,
+    )
+    built = []
+
+    class _Agent:
+        def run_conversation(self, *_args, **_kwargs):
+            return {"final_response": "done"}
+
+        def close(self):
+            return None
+
+        def interrupt(self):
+            return None
+
+    monkeypatch.setattr(
+        server,
+        "_make_agent",
+        lambda *_args, **kwargs: (built.append(kwargs["employee_policy"]) or _Agent()),
+    )
+
+    result = runner.run(
+        stored_session_id="stored-a",
+        hidden_session_id="hidden-a",
+        employee_policy=current_policy,
+        prompt="continue",
+        target_id="target-a",
+        external_receipt_key="receipt-a",
+        on_delta=lambda _text: None,
+        on_approval=lambda _data: None,
+    )
+
+    assert result == {"status": "complete", "text": "done"}
+    assert built == [retained_policy]
     runner.close()
 
 

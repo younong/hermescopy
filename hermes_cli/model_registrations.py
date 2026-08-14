@@ -115,11 +115,43 @@ def _deployment_route_kind(route: Any) -> str:
     return "chat"
 
 
-def _admin_registrations() -> dict[str, dict[str, Any]]:
-    from hermes_cli.deployment_inference import route_descriptors_from_control_plane
+def _admin_chat_route_descriptors():
+    """Return deployment Chat descriptors in Control Plane and Owner Workers."""
+    from hermes_cli.deployment_inference import (
+        DeploymentInferenceRouteDescriptor,
+        deployment_descriptor_from_environment,
+        policy_from_control_plane_environment,
+        route_descriptors_from_control_plane,
+    )
+    from hermes_cli.owner_runtime import is_owner_worker_env
 
+    relayed = route_descriptors_from_control_plane()
+    if relayed:
+        return relayed
+    if is_owner_worker_env():
+        descriptor = deployment_descriptor_from_environment()
+        if descriptor is None:
+            return ()
+        # The compact startup descriptor preserves only the default route's
+        # provider and API mode. Additional allowed models can belong to exact
+        # routes with different providers, so never manufacture identities for
+        # them when the private route projection is unavailable.
+        return (
+            DeploymentInferenceRouteDescriptor(
+                provider=descriptor.provider,
+                model=descriptor.model,
+                api_mode=descriptor.api_mode,
+            ),
+        )
+    try:
+        return policy_from_control_plane_environment().route_descriptors()
+    except Exception:
+        return ()
+
+
+def _admin_registrations() -> dict[str, dict[str, Any]]:
     registrations: dict[str, dict[str, Any]] = {}
-    for route in route_descriptors_from_control_plane():
+    for route in _admin_chat_route_descriptors():
         kind = _deployment_route_kind(route)
         registration_id = _admin_registration_id(kind, route.provider, route.model)
         registrations[registration_id] = {
@@ -491,6 +523,33 @@ def _resolve_registered_model(registration_id: str, *, kind: str) -> dict[str, s
 def resolve_chat_model_registration(registration_id: str) -> dict[str, str]:
     """Resolve one stable Chat registration to non-secret runtime identity."""
     return _resolve_registered_model(registration_id, kind="chat")
+
+
+def resolve_admin_chat_model_registration(registration_id: str) -> dict[str, str]:
+    """Resolve one exact deployment-owned Chat registration."""
+    registration_id = str(registration_id or "").strip()
+    if not _ID_RE.fullmatch(registration_id):
+        raise ModelRegistrationNotFound("Administrator Chat registration not found")
+    item = _admin_registrations().get(registration_id)
+    if not isinstance(item, dict) or item.get("kind") != "chat":
+        raise ModelRegistrationNotFound("Administrator Chat registration not found")
+    return {
+        "registration_id": registration_id,
+        "provider": _text(item.get("provider"), "provider"),
+        "model": _text(item.get("model"), "model"),
+        "source": str(item.get("source") or "catalog").strip().lower(),
+        "selection_source": "deployment",
+    }
+
+
+def admin_chat_registrations_payload() -> list[dict[str, Any]]:
+    """Return the selectable deployment-owned Chat registrations."""
+    env = load_env()
+    return [
+        _public_registration(registration_id, item, env)
+        for registration_id, item in _admin_registrations().items()
+        if item.get("kind") == "chat"
+    ]
 
 
 def resolve_code_model_registration(registration_id: str) -> dict[str, str]:

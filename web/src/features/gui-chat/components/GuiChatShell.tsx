@@ -38,7 +38,13 @@ import { PageHeaderContext } from "@/contexts/page-header-context";
 import { GuiChatFilesPane } from "@/features/files/components/GuiChatFilesPane";
 import { guiChatTranslations, useI18n } from "@/i18n";
 import SessionsPage from "@/pages/SessionsPage";
-import { api, type Employee, type ReasoningLevel } from "@/lib/api";
+import {
+  api,
+  employeeDisplayName,
+  employeeDisplayRole,
+  type Employee,
+  type ReasoningLevel,
+} from "@/lib/api";
 import { JsonRpcGatewayError, type GatewayEvent } from "@/lib/gatewayClient";
 import { emitChatDiagnostic } from "@/lib/chatDiagnostics";
 import { dashboardAuthTransition } from "@/lib/dashboardAuthTransition";
@@ -989,9 +995,16 @@ export function GuiChatShell() {
   const conversationTitle = groupId
     ? activeGroup?.name ?? copy.shell.group
     : activeSessionTitle ?? (activeSessionId ? copy.shell.conversation : copy.shell.newChat);
-  const contactTitle = selectedEmployee?.employee_kind === "builtin_assistant"
-    ? copy.employees.aiAssistant
-    : selectedEmployee?.profile?.name ?? copy.shell.contacts;
+  const contactTitle = selectedEmployee
+    ? employeeDisplayName(selectedEmployee, copy.employees.aiAssistant, copy.employees.unnamed)
+    : copy.shell.contacts;
+  const contactRole = selectedEmployee
+    ? employeeDisplayRole(
+        selectedEmployee,
+        copy.employees.builtinDescription,
+        copy.shell.unnamedEmployee,
+      )
+    : copy.shell.unnamedEmployee;
   const conversationSurfaceOpen = !workspacePaneOpen || (contactsOpen && selectedEmployeeAvailable);
   const accountLabel = authMe?.display_name || authMe?.email || copy.shell.workspaceAccount;
   const handleLogout = () => {
@@ -1339,7 +1352,7 @@ export function GuiChatShell() {
               {contactsOpen
                 ? selectedEmployee
                   ? copy.shell.contactSummary
-                      .replace("{role}", selectedEmployee.profile?.role || copy.shell.unnamedEmployee)
+                      .replace("{role}", contactRole)
                       .replace("{connection}", state.connection)
                   : copy.shell.selectContact
                 : workspacePaneOpen

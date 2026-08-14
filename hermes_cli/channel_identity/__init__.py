@@ -1,5 +1,16 @@
 """Trusted channel identity, employee authority, and durable queue storage."""
 
+from .builtin_assistant import (
+    BuiltinAssistantPolicy,
+    BuiltinAssistantPolicyRevisionConflict,
+    BuiltinAssistantPolicyUnavailable,
+    DEFAULT_BUILTIN_ASSISTANT_NICKNAME,
+    builtin_assistant_personalization_payload,
+    resolve_builtin_assistant_personalization,
+    resolve_builtin_assistant_policy,
+    update_builtin_assistant_personalization,
+    update_builtin_assistant_policy,
+)
 from .crypto import ChannelCrypto, Keyring
 from .employees import (
     BuiltinEmployeeProtected,
@@ -45,6 +56,9 @@ from .registration import (
 from .store import ChannelIdentityStore
 
 __all__ = [
+    "BuiltinAssistantPolicy",
+    "BuiltinAssistantPolicyRevisionConflict",
+    "BuiltinAssistantPolicyUnavailable",
     "ChannelCrypto",
     "ChannelIdentityOwnershipConflict",
     "ChannelIdentityStore",
@@ -54,12 +68,14 @@ __all__ = [
     "EmployeeCollaborationPolicy",
     "EmployeeProfile",
     "EmployeeProfileRevisionConflict",
+    "DEFAULT_BUILTIN_ASSISTANT_NICKNAME",
     "FeishuCredentialRevisionConflict",
     "Keyring",
     "RegisteredChannel",
     "ResolvedChannelOwner",
     "ResolvedConnectorAccount",
     "activate_weixin_identity",
+    "builtin_assistant_personalization_payload",
     "create_employee",
     "employee_profile_fingerprint",
     "ensure_employee_feishu_conversation_binding",
@@ -72,6 +88,8 @@ __all__ = [
     "register_weixin_identity",
     "register_weixin_identity_for_owner",
     "resolve_binding",
+    "resolve_builtin_assistant_personalization",
+    "resolve_builtin_assistant_policy",
     "resolve_connector_account",
     "resolve_employee",
     "resolve_employee_collaboration_policy",
@@ -82,6 +100,8 @@ __all__ = [
     "rotate_employee_feishu_credentials",
     "set_employee_feishu_binding_status",
     "set_employee_status",
+    "update_builtin_assistant_personalization",
+    "update_builtin_assistant_policy",
     "update_employee_collaboration_policy",
     "update_employee_profile",
 ]

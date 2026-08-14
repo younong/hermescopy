@@ -5545,6 +5545,31 @@ def _inject_collaboration_agent_tools(agent, context) -> None:
             existing.add(name)
 
 
+def _retained_builtin_policy_matches_identity(
+    persisted: dict[str, Any],
+    current: dict[str, Any],
+) -> bool:
+    """Allow a built-in session snapshot to outlive global policy updates."""
+    if (
+        persisted.get("builtin_assistant") is not True
+        or current.get("builtin_assistant") is not True
+    ):
+        return False
+    for field in (
+        "employee_id",
+        "profile_revision",
+        "knowledge_relative_paths",
+    ):
+        if persisted.get(field) != current.get(field):
+            return False
+    persisted_fingerprint = persisted.get("source_profile_fingerprint")
+    current_fingerprint = current.get("source_profile_fingerprint")
+    return persisted_fingerprint == current_fingerprint or (
+        persisted.get("profile_revision") == 1
+        and persisted_fingerprint == "builtin-assistant-v1"
+    )
+
+
 class CollaborationAgentRunner:
     """Internal-only adapter over the trusted Gateway employee Agent builder."""
 
@@ -5679,7 +5704,13 @@ class CollaborationAgentRunner:
             raise RuntimeError(
                 "collaboration member policy snapshot is inconsistent"
             ) from exc
-        if normalized_persisted_policy != normalized_employee_policy:
+        if (
+            normalized_persisted_policy != normalized_employee_policy
+            and not _retained_builtin_policy_matches_identity(
+                normalized_persisted_policy,
+                normalized_employee_policy,
+            )
+        ):
             raise RuntimeError("collaboration member policy snapshot is inconsistent")
         persisted_policy = normalized_persisted_policy
         with self._lock:
@@ -6518,7 +6549,7 @@ def _resolve_current_web_direct_policy(
 
         snapshot = dict(employee_policy)
         snapshot.pop("snapshot_fingerprint", None)
-        snapshot["runtime_toolsets"] = _load_enabled_toolsets()
+        snapshot["runtime_toolsets"] = list(employee_policy["toolsets"])
         employee_policy, _ = canonical_employee_snapshot(snapshot)
     return employee_policy
 

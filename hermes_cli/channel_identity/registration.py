@@ -46,9 +46,28 @@ def ensure_owner_binding(
     """Return the random channel-registry identity for one trusted Owner."""
     now = time.time()
     if conn is not None:
-        return _ensure_owner_binding(conn, owner=owner, now=now)
+        canonical_user_id = _ensure_owner_binding(conn, owner=owner, now=now)
+        _ensure_builtin_personalization(store, conn, canonical_user_id, now=now)
+        return canonical_user_id
     with store.write() as write_conn:
-        return _ensure_owner_binding(write_conn, owner=owner, now=now)
+        canonical_user_id = _ensure_owner_binding(write_conn, owner=owner, now=now)
+        _ensure_builtin_personalization(
+            store, write_conn, canonical_user_id, now=now
+        )
+        return canonical_user_id
+
+
+def _ensure_builtin_personalization(
+    store: ChannelIdentityStore, conn, canonical_user_id: str, *, now: float
+) -> None:
+    from .builtin_assistant import ensure_builtin_assistant_personalization
+
+    ensure_builtin_assistant_personalization(
+        store,
+        conn,
+        employee_id=_builtin_assistant_employee_id(canonical_user_id),
+        now=now,
+    )
 
 
 def _ensure_owner_binding(conn, *, owner: OwnerContext, now: float) -> str:
@@ -176,7 +195,7 @@ def register_connector_binding_for_owner(
     )
 
     with store.write() as conn:
-        canonical_user_id = _ensure_owner_binding(conn, owner=owner, now=now)
+        canonical_user_id = ensure_owner_binding(store, owner, conn=conn)
         existing_identity = conn.execute(
             """
             SELECT external_identity_id, canonical_user_id

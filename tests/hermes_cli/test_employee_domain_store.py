@@ -12,6 +12,7 @@ import pytest
 from hermes_cli.channel_identity import (
     ChannelCrypto,
     BuiltinEmployeeProtected,
+    BuiltinAssistantPolicyUnavailable,
     ChannelIdentityStore,
     EmployeeProfileRevisionConflict,
     FeishuCredentialRevisionConflict,
@@ -22,12 +23,16 @@ from hermes_cli.channel_identity import (
     list_employees,
     reconcile_employee_workspaces,
     register_employee_feishu_binding,
+    resolve_builtin_assistant_personalization,
+    resolve_builtin_assistant_policy,
     resolve_employee,
     resolve_employee_feishu_credentials,
     resolve_employee_profile,
     rotate_employee_feishu_credentials,
     set_employee_feishu_binding_status,
     set_employee_status,
+    update_builtin_assistant_personalization,
+    update_builtin_assistant_policy,
     update_employee_collaboration_policy,
     update_employee_profile,
 )
@@ -91,8 +96,9 @@ def test_fresh_schema_only_contains_generic_employee_tables(store):
         version = conn.execute(
             "SELECT value FROM channel_identity_meta WHERE key='schema_version'"
         ).fetchone()["value"]
-    assert version == "16"
+    assert version == "17"
     assert {
+        "builtin_assistant_policy",
         "employees",
         "employee_profiles",
         "employee_collaboration_policies",
@@ -188,14 +194,18 @@ def test_builtin_assistant_is_deterministic_self_healing_and_protected(store):
     assert first.lifecycle_status == "active"
     assert first.protected is True
     assert first.chat_eligible is True
-    assert first.profile_revision is None
-    assert first.profile_fingerprint is None
+    assert first.profile_revision == 1
+    assert first.profile_fingerprint is not None
     assert first.collaboration_policy.may_participate is True
     assert first.collaboration_policy.may_create_groups is True
     assert first.collaboration_policy.invite_quota is None
 
     with store.write() as conn:
         conn.execute("DROP TRIGGER builtin_assistant_delete_protected")
+        conn.execute(
+            "DELETE FROM employee_profiles WHERE employee_id=?",
+            (first.employee_id,),
+        )
         conn.execute("DELETE FROM employees WHERE employee_id=?", (first.employee_id,))
         ChannelIdentityStore._execute_schema(conn)
     repaired = list_employees(store, owner=owner)[0]
@@ -237,10 +247,9 @@ def test_builtin_assistant_is_deterministic_self_healing_and_protected(store):
         save_employee_avatar,
     )
 
-    with pytest.raises(BuiltinEmployeeProtected):
+    with pytest.raises(ValueError, match="avatar is invalid"):
         save_employee_avatar(store, first.employee_id, b"invalid")
-    with pytest.raises(BuiltinEmployeeProtected):
-        delete_employee_avatar(store, first.employee_id)
+    assert delete_employee_avatar(store, first.employee_id) is False
 
     with pytest.raises(sqlite3.IntegrityError, match="builtin employee is protected"):
         with store.write() as conn:
@@ -251,6 +260,84 @@ def test_builtin_assistant_is_deterministic_self_healing_and_protected(store):
     with pytest.raises(sqlite3.IntegrityError, match="builtin employee is protected"):
         with store.write() as conn:
             conn.execute("DELETE FROM employees WHERE employee_id=?", (first.employee_id,))
+
+
+def test_global_policy_has_no_owner_fallback_and_personalization_is_scoped(
+    store, monkeypatch
+):
+    owner = _owner("owner-a")
+    other = _owner("owner-b")
+    builtin = list_employees(store, owner=owner)[0]
+    other_builtin = list_employees(store, owner=other)[0]
+
+    with pytest.raises(BuiltinAssistantPolicyUnavailable):
+        resolve_builtin_assistant_policy(store)
+
+    monkeypatch.setattr(
+        "hermes_cli.model_registrations.resolve_admin_chat_model_registration",
+        lambda registration_id: {
+            "registration_id": registration_id,
+            "provider": "deployment-provider",
+            "model": "deployment-model",
+            "selection_source": "deployment",
+        },
+    )
+    policy = update_builtin_assistant_policy(
+        store,
+        model_registration_id="admin-chat-a",
+        reasoning_effort="high",
+        expected_revision=0,
+        updated_by_account_id="account-admin",
+    )
+    assert policy.model_registration_id == "admin-chat-a"
+    assert policy.revision == 1
+    assert resolve_builtin_assistant_policy(store).reasoning_effort == "high"
+
+    default_profile = resolve_builtin_assistant_personalization(
+        store, owner=owner, employee_id=builtin.employee_id
+    )
+    assert default_profile.revision == 1
+    assert default_profile.profile == {
+        "schema_version": 1,
+        "nickname": "AI 助手",
+        "personal_preference": "",
+    }
+    personalized = update_builtin_assistant_personalization(
+        store,
+        owner=owner,
+        employee_id=builtin.employee_id,
+        expected_revision=1,
+        nickname="小助手",
+        personal_preference="请用中文简洁回答。",
+    )
+    assert personalized.revision == 2
+    assert personalized.profile == {
+        "schema_version": 1,
+        "nickname": "小助手",
+        "personal_preference": "请用中文简洁回答。",
+    }
+    other_profile = resolve_builtin_assistant_personalization(
+        store, owner=other, employee_id=other_builtin.employee_id
+    )
+    assert other_profile.profile == {
+        "schema_version": 1,
+        "nickname": "AI 助手",
+        "personal_preference": "",
+    }
+    with pytest.raises(RuntimeError, match="unavailable"):
+        resolve_builtin_assistant_personalization(
+            store, owner=other, employee_id=builtin.employee_id
+        )
+    with pytest.raises(TypeError):
+        update_builtin_assistant_personalization(
+            store,
+            owner=owner,
+            employee_id=builtin.employee_id,
+            expected_revision=2,
+            nickname="Nope",
+            personal_preference="",
+            system_prompt="override",
+        )
 
 
 def test_v15_upgrade_backfills_builtin_for_existing_owner(
@@ -264,6 +351,10 @@ def test_v15_upgrade_backfills_builtin_for_existing_owner(
         conn.execute("DROP TRIGGER builtin_assistant_delete_protected")
         conn.execute("DROP TRIGGER builtin_assistant_identity_protected")
         conn.execute("DROP INDEX idx_employees_builtin_assistant_owner")
+        conn.execute(
+            "DELETE FROM employee_profiles WHERE employee_id IN "
+            "(SELECT employee_id FROM employees WHERE employee_kind='builtin_assistant')"
+        )
         conn.execute("DELETE FROM employees WHERE employee_kind='builtin_assistant'")
         conn.execute(
             "UPDATE channel_identity_meta SET value='15' WHERE key='schema_version'"

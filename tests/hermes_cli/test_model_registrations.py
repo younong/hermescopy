@@ -219,6 +219,45 @@ def test_deployment_route_kind_is_model_scoped(monkeypatch):
     ) == "code"
 
 
+def test_admin_chat_registration_resolves_from_owner_worker_descriptor(monkeypatch):
+    from hermes_cli.deployment_inference import DeploymentInferenceDescriptor
+
+    monkeypatch.setattr(
+        "hermes_cli.owner_runtime.is_owner_worker_env",
+        lambda: True,
+    )
+    monkeypatch.setattr(
+        "hermes_cli.deployment_inference.route_descriptors_from_control_plane",
+        lambda: (),
+    )
+    monkeypatch.setattr(
+        "hermes_cli.deployment_inference.deployment_descriptor_from_environment",
+        lambda: DeploymentInferenceDescriptor(
+            provider="deployment-provider",
+            model="model-a",
+            api_mode="anthropic_messages",
+            policy_id="policy-a",
+            allowed_models=("model-a", "model-b"),
+        ),
+    )
+    monkeypatch.setattr(
+        "hermes_cli.model_registrations._admin_media_descriptor",
+        lambda: None,
+    )
+
+    registrations = model_registrations.admin_chat_registrations_payload()
+    by_model = {item["model"]: item for item in registrations}
+    selected = by_model["model-a"]
+    resolved = model_registrations.resolve_admin_chat_model_registration(
+        selected["id"]
+    )
+
+    assert set(by_model) == {"model-a"}
+    assert resolved["provider"] == "deployment-provider"
+    assert resolved["model"] == "model-a"
+    assert resolved["selection_source"] == "deployment"
+
+
 def test_admin_registrations_control_plane_derives_media_from_policy(monkeypatch):
     """The Control Plane needs no policy-id env to surface media routes."""
     monkeypatch.setenv(
