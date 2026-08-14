@@ -1,5 +1,5 @@
-import { useCallback, useEffect, useState } from "react";
-import { Bot, Link2, Plus, X } from "lucide-react";
+import { memo, useCallback, useEffect, useMemo, useState } from "react";
+import { AlertCircle, Bot, Link2, Plus, Search, Settings } from "lucide-react";
 import { Button } from "@nous-research/ui/ui/components/button";
 import { Input } from "@nous-research/ui/ui/components/input";
 import { Label } from "@nous-research/ui/ui/components/label";
@@ -8,7 +8,6 @@ import { Switch } from "@nous-research/ui/ui/components/switch";
 import { Toast } from "@nous-research/ui/ui/components/toast";
 import { useToast } from "@nous-research/ui/hooks/use-toast";
 import { NameCheckboxPicker } from "@/components/NameCheckboxPicker";
-import { useModalBehavior } from "@/hooks/useModalBehavior";
 import { guiChatTranslations, useI18n } from "@/i18n";
 import {
   api,
@@ -22,13 +21,10 @@ import {
 } from "@/lib/api";
 import { REASONING_LEVEL_LABELS } from "@/lib/reasoning-level";
 import { cn } from "@/lib/utils";
+import { GuiChatWorkspaceDialog } from "./GuiChatWorkspaceDialog";
 
 type EmployeeEditor = { mode: "create" } | { mode: "profile"; employee: Employee };
 type BindingEditor = { mode: "create" | "credentials"; employee: Employee };
-
-interface EmployeeDraft {
-  policy: EmployeePolicy;
-}
 
 interface BindingDraft {
   appId: string;
@@ -81,17 +77,33 @@ const EMPTY_BINDING: BindingDraft = {
   verificationToken: "",
 };
 
-export function EmployeeManagementPane({ onEmployeesChanged }: { onEmployeesChanged?(employees: Employee[]): void } = {}) {
+export type EmployeeContactsLoadStatus = "loading" | "ready" | "error";
+
+export interface EmployeeContactsPaneProps {
+  employees: Employee[];
+  loadStatus: EmployeeContactsLoadStatus;
+  selectedEmployeeId: string | null;
+  onEmployeeSelect(employeeId: string): void;
+  onRefresh(): void | Promise<void>;
+}
+
+export const EmployeeContactsPane = memo(function EmployeeContactsPane({
+  employees,
+  loadStatus,
+  selectedEmployeeId,
+  onEmployeeSelect,
+  onRefresh,
+}: EmployeeContactsPaneProps) {
   const { t } = useI18n();
-  const text = guiChatTranslations(t).employees;
+  const copy = guiChatTranslations(t);
+  const text = copy.employees;
   const common = t.common;
-  const [employees, setEmployees] = useState<Employee[]>([]);
   const [catalog, setCatalog] = useState<EmployeeCatalog | null>(null);
-  const [loading, setLoading] = useState(true);
+  const [query, setQuery] = useState("");
   const [editor, setEditor] = useState<EmployeeEditor | null>(null);
   const [managedEmployeeId, setManagedEmployeeId] = useState<string | null>(null);
   const [bindingEditor, setBindingEditor] = useState<BindingEditor | null>(null);
-  const [employeeDraft, setEmployeeDraft] = useState<EmployeeDraft>({ policy: emptyPolicy(null) });
+  const [employeeDraft, setEmployeeDraft] = useState<EmployeePolicy>(() => emptyPolicy(null));
   const [bindingDraft, setBindingDraft] = useState<BindingDraft>(EMPTY_BINDING);
   const [avatarFile, setAvatarFile] = useState<File | null>(null);
   const [avatarPreview, setAvatarPreview] = useState<string | null>(null);
@@ -103,12 +115,6 @@ export function EmployeeManagementPane({ onEmployeesChanged }: { onEmployeesChan
   const closeEditor = useCallback(() => setEditor(null), []);
   const closeManagement = useCallback(() => setManagedEmployeeId(null), []);
   const closeBindingEditor = useCallback(() => setBindingEditor(null), []);
-  const editorRef = useModalBehavior({ onClose: closeEditor, open: editor !== null });
-  const managementRef = useModalBehavior({ onClose: closeManagement, open: managedEmployeeId !== null });
-  const bindingEditorRef = useModalBehavior({
-    onClose: closeBindingEditor,
-    open: bindingEditor !== null,
-  });
 
   useEffect(() => {
     if (!avatarFile) return;
@@ -118,17 +124,33 @@ export function EmployeeManagementPane({ onEmployeesChanged }: { onEmployeesChan
   }, [avatarFile]);
 
   const refreshEmployees = useCallback(async () => {
-    const response = await api.getEmployees();
-    setEmployees(response.employees);
     setCollaborationDrafts({});
-    onEmployeesChanged?.(response.employees);
-  }, [onEmployeesChanged]);
+    await onRefresh();
+  }, [onRefresh]);
 
-  useEffect(() => {
-    void Promise.all([refreshEmployees(), api.getEmployeeCatalog().then(setCatalog)])
-      .catch((error: unknown) => showToast(text.loadFailed.replace("{error}", String(error)), "error"))
-      .finally(() => setLoading(false));
-  }, [refreshEmployees, showToast, text.loadFailed]);
+  const ensureCatalog = useCallback(async () => {
+    if (catalog) return catalog;
+    try {
+      const response = await api.getEmployeeCatalog();
+      setCatalog(response);
+      return response;
+    } catch (error) {
+      showToast(text.loadFailed.replace("{error}", String(error)), "error");
+      return null;
+    }
+  }, [catalog, showToast, text.loadFailed]);
+
+  const visibleEmployees = useMemo(() => {
+    const normalizedQuery = query.trim().toLocaleLowerCase();
+    if (!normalizedQuery) return employees;
+    return employees.filter((employee) =>
+      [employee.profile?.name, employee.profile?.role]
+        .filter(Boolean)
+        .join("\n")
+        .toLocaleLowerCase()
+        .includes(normalizedQuery),
+    );
+  }, [employees, query]);
 
   const resetAvatar = (preview: string | null = null) => {
     setAvatarFile(null);
@@ -136,19 +158,21 @@ export function EmployeeManagementPane({ onEmployeesChanged }: { onEmployeesChan
     setAvatarRemoved(false);
   };
 
-  const openCreate = () => {
+  const openCreate = async () => {
+    const nextCatalog = await ensureCatalog();
+    if (!nextCatalog) return;
     resetAvatar();
-    setEmployeeDraft({ policy: emptyPolicy(catalog) });
+    setEmployeeDraft(emptyPolicy(nextCatalog));
     setEditor({ mode: "create" });
   };
 
-  const openProfile = (employee: Employee) => {
+  const openProfile = async (employee: Employee) => {
+    const nextCatalog = await ensureCatalog();
+    if (!nextCatalog) return;
     resetAvatar(employee.avatar_url);
-    setEmployeeDraft({
-      policy: employee.profile
-        ? { ...employee.profile, toolsets: allToolsets(catalog) }
-        : emptyPolicy(catalog),
-    });
+    setEmployeeDraft(employee.profile
+      ? { ...employee.profile, toolsets: allToolsets(nextCatalog) }
+      : emptyPolicy(nextCatalog));
     setEditor({ employee, mode: "profile" });
   };
 
@@ -160,7 +184,7 @@ export function EmployeeManagementPane({ onEmployeesChanged }: { onEmployeesChan
 
   const saveEmployee = async () => {
     if (!editor) return;
-    const policy = employeeDraft.policy;
+    const policy = employeeDraft;
     if (!policy.name?.trim() || !policy.model_registration_id || !policy.system_prompt.trim()) {
       showToast(text.policyRequired, "error");
       return;
@@ -293,126 +317,162 @@ export function EmployeeManagementPane({ onEmployeesChanged }: { onEmployeesChan
     }
   };
 
-  if (loading) {
-    return <div className="flex min-h-48 items-center justify-center"><Spinner /></div>;
-  }
-
   const managedEmployee = employees.find((employee) => employee.employee_id === managedEmployeeId) ?? null;
 
   return (
-    <section data-employee-management-pane className="mx-auto flex w-full max-w-4xl flex-col gap-4 px-4 py-5 sm:px-6">
+    <section
+      aria-label={copy.shell.contacts}
+      className="flex h-full min-h-0 w-full min-w-0 flex-col overflow-hidden bg-[#f7f7f8]"
+      data-employee-contacts-pane
+    >
       <Toast toast={toast} />
-      <div className="flex items-start justify-between gap-4">
-        <div>
-          <h2 className="text-[15px] font-semibold text-[#25282d]">{text.title}</h2>
-          <p className="mt-1 text-xs text-[#777c84]">{text.description}</p>
+      <header className="flex items-center justify-between gap-2 border-b border-black/[0.06] px-3 py-3">
+        <div className="min-w-0">
+          <h2 className="truncate text-[14px] font-semibold text-[#202124]">{copy.shell.contacts}</h2>
+          <p className="truncate text-[11px] text-[#85888e]">{copy.shell.selectContact}</p>
         </div>
-        <Button className="gui-chat-workspace-primary-button" onClick={openCreate} size="sm" prefix={<Plus className="h-4 w-4" />}>{text.add}</Button>
+        <Button
+          aria-label={text.add}
+          className="h-8 w-8 shrink-0 rounded-lg"
+          ghost
+          onClick={() => void openCreate()}
+          size="icon"
+          title={text.add}
+        >
+          <Plus className="h-4 w-4" />
+        </Button>
+      </header>
+
+      <div className="px-3 py-2.5">
+        <label className="flex h-9 items-center gap-2 rounded-lg border border-black/[0.08] bg-white px-3 text-[#85888e] focus-within:border-black/20">
+          <Search aria-hidden className="h-3.5 w-3.5 shrink-0" />
+          <input
+            aria-label={common.search}
+            className="min-w-0 flex-1 bg-transparent text-[13px] text-[#202124] outline-none placeholder:text-[#a0a3a8]"
+            onChange={(event) => setQuery(event.target.value)}
+            placeholder={common.search}
+            value={query}
+          />
+        </label>
       </div>
 
-      {employees.length === 0 ? (
-        <div className="rounded-xl border border-dashed border-[#dfe2e7] px-5 py-10 text-center">
-          <Bot className="mx-auto h-6 w-6 text-[#969aa1]" />
-          <p className="mt-2 text-sm font-medium">{text.none}</p>
-          <p className="mt-1 text-xs text-[#969aa1]">{text.emptyHint}</p>
-        </div>
-      ) : (
-        <div className="overflow-hidden rounded-lg border border-[#e1e3e7] bg-white">
-          <div aria-hidden className="hidden grid-cols-[minmax(0,1fr)_7rem_9rem_5rem] gap-4 border-b border-[#e1e3e7] bg-[#f8f9fa] px-4 py-2 text-[11px] font-medium text-[#777c84] sm:grid">
-            <span>{text.title}</span><span>{text.status}</span><span>{text.channel}</span><span className="text-right">{text.actions}</span>
+      <div className="min-h-0 flex-1 overflow-y-auto px-2 pb-3">
+        {loadStatus === "loading" ? (
+          <div className="flex items-center justify-center gap-2 px-3 py-10 text-xs text-[#85888e]" role="status">
+            <Spinner /> {common.loading}
           </div>
-          <ul aria-label={text.listLabel} className="divide-y divide-[#e8eaed]" role="list">
-            {employees.map((employee) => (
-              <EmployeeListItem employee={employee} key={employee.employee_id} onManage={() => setManagedEmployeeId(employee.employee_id)} text={text} />
-            ))}
-          </ul>
-        </div>
-      )}
-
-      {managedEmployee ? (
-        <div aria-label={text.manageNamed.replace("{name}", managedEmployee.profile?.name || text.unnamed)} aria-modal="true" className="fixed inset-0 z-[100] flex items-center justify-center bg-black/35 p-4" ref={managementRef} role="dialog">
-          <div className="relative flex max-h-[92vh] w-full max-w-2xl flex-col rounded-xl border border-[#e1e3e7] bg-white shadow-2xl">
-            <button aria-label={common.close} className="gui-chat-icon-button absolute right-3 top-3" onClick={closeManagement} type="button"><X /></button>
-            <div className="border-b border-[#ebecef] px-5 py-4">
-              <h3 className="text-[15px] font-semibold">{managedEmployee.profile?.name || text.unnamed}</h3>
-              <p className="mt-1 text-[11px] text-[#969aa1]">{text.manageDescription}</p>
-            </div>
-            <div className="min-h-0 overflow-y-auto p-5">
-              <EmployeeManagementDetails
-                busy={busy}
-                collaborationPolicy={collaborationDrafts[managedEmployee.employee_id] ?? managedEmployee.collaboration_policy}
-                employee={managedEmployee}
-                onBinding={() => openBinding(managedEmployee)}
-                onBindingAction={(action) => void runBindingAction(managedEmployee, action)}
-                onCollaborationChange={(policy) => setCollaborationDrafts((current) => ({
-                  ...current,
-                  [managedEmployee.employee_id]: policy,
-                }))}
-                onCollaborationSave={() => void saveCollaboration(managedEmployee)}
-                onEmployeeAction={(action) => void runEmployeeAction(managedEmployee, action)}
-                onProfile={() => openProfile(managedEmployee)}
-                savingLabel={common.saving}
+        ) : loadStatus === "error" ? (
+          <div className="flex flex-col items-center gap-3 px-4 py-10 text-center text-xs" role="alert">
+            <AlertCircle className="h-5 w-5 text-[#a8322d]" />
+            <span className="text-[#777c84]">{text.loadFailed.replace("{error}", "").replace(/[:：]\s*$/, "")}</span>
+            <Button onClick={() => void onRefresh()} outlined size="sm">{common.retry}</Button>
+          </div>
+        ) : employees.length === 0 ? (
+          <div className="px-4 py-10 text-center text-xs text-[#85888e]">
+            <Bot className="mx-auto mb-2 h-5 w-5" />
+            <strong className="block font-medium text-[#4d5055]">{text.none}</strong>
+            <span className="mt-1 block">{text.emptyHint}</span>
+          </div>
+        ) : visibleEmployees.length === 0 ? (
+          <div className="px-4 py-10 text-center text-xs text-[#85888e]">{common.noResults}</div>
+        ) : (
+          <ul aria-label={text.listLabel} className="flex flex-col gap-1" role="list">
+            {visibleEmployees.map((employee) => (
+              <EmployeeContactRow
+                employee={employee}
+                key={employee.employee_id}
+                onManage={() => setManagedEmployeeId(employee.employee_id)}
+                onSelect={() => onEmployeeSelect(employee.employee_id)}
+                selected={employee.employee_id === selectedEmployeeId}
                 text={text}
               />
-            </div>
+            ))}
+          </ul>
+        )}
+      </div>
+
+      {managedEmployee ? (
+        <GuiChatWorkspaceDialog
+          busy={busy !== null}
+          description={text.manageDescription}
+          onClose={closeManagement}
+          title={managedEmployee.profile?.name || text.unnamed}
+          wide
+        >
+          <div className="max-h-[72vh] overflow-y-auto">
+            <EmployeeManagementDetails
+              busy={busy}
+              collaborationPolicy={collaborationDrafts[managedEmployee.employee_id] ?? managedEmployee.collaboration_policy}
+              employee={managedEmployee}
+              onBinding={() => openBinding(managedEmployee)}
+              onBindingAction={(action) => void runBindingAction(managedEmployee, action)}
+              onCollaborationChange={(policy) => setCollaborationDrafts((current) => ({
+                ...current,
+                [managedEmployee.employee_id]: policy,
+              }))}
+              onCollaborationSave={() => void saveCollaboration(managedEmployee)}
+              onEmployeeAction={(action) => void runEmployeeAction(managedEmployee, action)}
+              onProfile={() => void openProfile(managedEmployee)}
+              savingLabel={common.saving}
+              text={text}
+            />
           </div>
-        </div>
+        </GuiChatWorkspaceDialog>
       ) : null}
 
       {editor ? (
-        <div aria-label={editor.mode === "create" ? text.addTitle : text.editTitle} aria-modal="true" className="fixed inset-0 z-[100] flex items-center justify-center bg-black/35 p-4" ref={editorRef} role="dialog">
-          <div className="relative flex max-h-[92vh] w-full max-w-2xl flex-col rounded-xl border border-[#e1e3e7] bg-white shadow-2xl">
-            <button aria-label={common.close} className="gui-chat-icon-button absolute right-3 top-3" onClick={closeEditor} type="button"><X /></button>
-            <div className="border-b border-[#ebecef] px-5 py-4">
-              <h3 className="text-[15px] font-semibold">{editor.mode === "create" ? text.addTitle : text.editTitle}</h3>
-              <p className="mt-1 text-[11px] text-[#969aa1]">{text.revisionHint}</p>
-            </div>
-            <div className="min-h-0 overflow-y-auto p-5">
-              <PolicyEditor
-                avatarPreview={avatarPreview}
-                catalog={catalog}
-                onAvatarChange={(file) => { setAvatarFile(file); setAvatarRemoved(false); }}
-                onAvatarRemove={() => { setAvatarFile(null); setAvatarPreview(null); setAvatarRemoved(true); }}
-                onChange={(policy) => setEmployeeDraft({ policy })}
-                policy={employeeDraft.policy}
-                text={text}
-              />
-              <div className="mt-5 flex justify-end gap-2">
-                <Button ghost onClick={closeEditor} size="sm">{common.cancel}</Button>
-                <Button disabled={busy === "employee:save"} onClick={() => void saveEmployee()} size="sm">{busy === "employee:save" ? common.saving : common.save}</Button>
-              </div>
+        <GuiChatWorkspaceDialog
+          busy={busy === "employee:save"}
+          description={text.revisionHint}
+          onClose={closeEditor}
+          title={editor.mode === "create" ? text.addTitle : text.editTitle}
+          wide
+        >
+          <div className="max-h-[72vh] overflow-y-auto">
+            <PolicyEditor
+              avatarPreview={avatarPreview}
+              catalog={catalog}
+              onAvatarChange={(file) => { setAvatarFile(file); setAvatarRemoved(false); }}
+              onAvatarRemove={() => { setAvatarFile(null); setAvatarPreview(null); setAvatarRemoved(true); }}
+              onChange={setEmployeeDraft}
+              policy={employeeDraft}
+              text={text}
+            />
+            <div className="mt-5 flex justify-end gap-2">
+              <Button ghost onClick={closeEditor} size="sm">{common.cancel}</Button>
+              <Button disabled={busy === "employee:save"} onClick={() => void saveEmployee()} size="sm">{busy === "employee:save" ? common.saving : common.save}</Button>
             </div>
           </div>
-        </div>
+        </GuiChatWorkspaceDialog>
       ) : null}
 
       {bindingEditor ? (
-        <div aria-label={text.bindingTitle} aria-modal="true" className="fixed inset-0 z-[100] flex items-center justify-center bg-black/35 p-4" ref={bindingEditorRef} role="dialog">
-          <div className="relative w-full max-w-lg rounded-xl border border-[#e1e3e7] bg-white p-5 shadow-2xl">
-            <button aria-label={common.close} className="gui-chat-icon-button absolute right-3 top-3" onClick={closeBindingEditor} type="button"><X /></button>
-            <h3 className="text-[15px] font-semibold">{bindingEditor.mode === "create" ? text.connectBinding : text.updateBinding}</h3>
-            <p className="mt-1 text-[11px] text-[#969aa1]">{text.bindingHint}</p>
-            <div className="mt-4 grid gap-3">
-              {bindingEditor.mode === "create" ? (
-                <>
-                  <Field label={text.appId}><Input value={bindingDraft.appId} onChange={(event) => setBindingDraft((current) => ({ ...current, appId: event.target.value }))} /></Field>
-                  <Field label={text.platform}><select className="h-9 rounded-md border border-[#dfe2e7] bg-white px-3 text-sm" value={bindingDraft.domain} onChange={(event) => setBindingDraft((current) => ({ ...current, domain: event.target.value as "feishu" | "lark" }))}><option value="feishu">{text.feishuPlatform}</option><option value="lark">Lark</option></select></Field>
-                </>
-              ) : null}
-              <Field label={bindingEditor.mode === "create" ? text.appSecret : text.newAppSecret}><Input type="password" value={bindingDraft.appSecret} onChange={(event) => setBindingDraft((current) => ({ ...current, appSecret: event.target.value }))} /></Field>
-              <Field label={text.encryptKey}><Input type="password" value={bindingDraft.encryptKey} onChange={(event) => setBindingDraft((current) => ({ ...current, encryptKey: event.target.value }))} /></Field>
-              <Field label={text.verificationToken}><Input type="password" value={bindingDraft.verificationToken} onChange={(event) => setBindingDraft((current) => ({ ...current, verificationToken: event.target.value }))} /></Field>
-            </div>
-            <div className="mt-5 flex justify-end gap-2">
-              <Button ghost onClick={closeBindingEditor} size="sm">{common.cancel}</Button>
-              <Button disabled={busy === "binding:save"} onClick={() => void saveBinding()} size="sm">{busy === "binding:save" ? common.saving : common.save}</Button>
-            </div>
+        <GuiChatWorkspaceDialog
+          busy={busy === "binding:save"}
+          description={text.bindingHint}
+          onClose={closeBindingEditor}
+          title={bindingEditor.mode === "create" ? text.connectBinding : text.updateBinding}
+        >
+          <div className="grid gap-3">
+            {bindingEditor.mode === "create" ? (
+              <>
+                <Field label={text.appId}><Input value={bindingDraft.appId} onChange={(event) => setBindingDraft((current) => ({ ...current, appId: event.target.value }))} /></Field>
+                <Field label={text.platform}><select className="h-9 rounded-md border border-[#dfe2e7] bg-white px-3 text-sm" value={bindingDraft.domain} onChange={(event) => setBindingDraft((current) => ({ ...current, domain: event.target.value as "feishu" | "lark" }))}><option value="feishu">{text.feishuPlatform}</option><option value="lark">Lark</option></select></Field>
+              </>
+            ) : null}
+            <Field label={bindingEditor.mode === "create" ? text.appSecret : text.newAppSecret}><Input type="password" value={bindingDraft.appSecret} onChange={(event) => setBindingDraft((current) => ({ ...current, appSecret: event.target.value }))} /></Field>
+            <Field label={text.encryptKey}><Input type="password" value={bindingDraft.encryptKey} onChange={(event) => setBindingDraft((current) => ({ ...current, encryptKey: event.target.value }))} /></Field>
+            <Field label={text.verificationToken}><Input type="password" value={bindingDraft.verificationToken} onChange={(event) => setBindingDraft((current) => ({ ...current, verificationToken: event.target.value }))} /></Field>
           </div>
-        </div>
+          <div className="mt-5 flex justify-end gap-2">
+            <Button ghost onClick={closeBindingEditor} size="sm">{common.cancel}</Button>
+            <Button disabled={busy === "binding:save"} onClick={() => void saveBinding()} size="sm">{busy === "binding:save" ? common.saving : common.save}</Button>
+          </div>
+        </GuiChatWorkspaceDialog>
       ) : null}
     </section>
   );
-}
+});
 
 function Field({ children, label }: { children: React.ReactNode; label: string }) {
   return <div className="grid gap-1.5"><Label>{label}</Label>{children}</div>;
@@ -502,23 +562,57 @@ function PolicyEditor({
   );
 }
 
-function EmployeeListItem({ employee, onManage, text }: { employee: Employee; onManage(): void; text: EmployeeText }) {
-  const binding = employee.channels.feishu;
+function EmployeeContactRow({
+  employee,
+  onManage,
+  onSelect,
+  selected,
+  text,
+}: {
+  employee: Employee;
+  onManage(): void;
+  onSelect(): void;
+  selected: boolean;
+  text: EmployeeText;
+}) {
+  const unavailable = employee.lifecycle_status !== "active";
+  const name = employee.profile?.name || text.unnamed;
   return (
-    <li className="grid min-h-16 items-center gap-3 px-4 py-3 sm:grid-cols-[minmax(0,1fr)_7rem_9rem_5rem] sm:gap-4" role="listitem">
-      <div className="flex min-w-0 items-center gap-3">
+    <li className="group relative" role="listitem">
+      <button
+        aria-current={selected ? "true" : undefined}
+        aria-disabled={unavailable || undefined}
+        className={cn(
+          "flex min-h-14 w-full items-center gap-3 rounded-[10px] px-2.5 py-2 pr-11 text-left transition-colors",
+          selected ? "bg-white text-black shadow-sm" : "text-[#33363b] hover:bg-black/[0.04]",
+          unavailable && "cursor-not-allowed opacity-55",
+        )}
+        onClick={() => {
+          if (!unavailable) onSelect();
+        }}
+        type="button"
+      >
         <EmployeeAvatar employee={employee} />
-        <div className="min-w-0">
-          <h3 className="truncate text-sm font-medium">{employee.profile?.name || text.unnamed}</h3>
-          <p className="truncate text-[11px] text-[#969aa1]">{employee.profile?.role || text.aiEmployee} · {text.profileRevision.replace("{revision}", String(employee.profile_revision ?? "—"))}</p>
-        </div>
-      </div>
-      <div><StatusPill status={employee.lifecycle_status} text={text} /></div>
-      <div className="flex items-center gap-2 text-xs text-[#777c84]">
-        <Link2 className="h-3.5 w-3.5 shrink-0" />
-        <span className="truncate">{binding ? bindingRuntimeLabel(binding.runtime_state, text) : text.notConnected}</span>
-      </div>
-      <div className="sm:text-right"><Button ghost onClick={onManage} size="sm">{text.manage}</Button></div>
+        <span className="min-w-0 flex-1">
+          <span className="block truncate text-[14px] font-medium leading-5">{name}</span>
+          <span className="flex items-center gap-1.5 truncate text-[11px] leading-4 text-[#85888e]">
+            <span className="truncate">{employee.profile?.role || text.aiEmployee}</span>
+            {unavailable ? <StatusPill status={employee.lifecycle_status} text={text} /> : null}
+          </span>
+        </span>
+      </button>
+      <button
+        aria-label={text.manageNamed.replace("{name}", name)}
+        className="absolute right-2 top-1/2 flex h-7 w-7 -translate-y-1/2 items-center justify-center rounded-md text-[#85888e] opacity-70 hover:bg-black/[0.06] hover:text-[#33363b] focus:opacity-100 group-hover:opacity-100"
+        onClick={(event) => {
+          event.stopPropagation();
+          onManage();
+        }}
+        title={text.manage}
+        type="button"
+      >
+        <Settings aria-hidden className="h-3.5 w-3.5" />
+      </button>
     </li>
   );
 }

@@ -7,6 +7,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { GuiChatConnection } from "../api";
 import type { ConnectionState } from "@/lib/gatewayClient";
+import type { Employee } from "@/lib/api";
 import {
   DashboardAuthIdentityProvider,
   useDashboardAuthIdentity,
@@ -341,7 +342,7 @@ describe("GuiChatShell", () => {
     expect(document.querySelector("[data-composer-reused-file]")?.textContent).toBe("notes.txt");
   });
 
-  it("renders the dedicated workspace navigation", async () => {
+  it("renders one Contacts entry in the dedicated workspace navigation", async () => {
     const connection = createConnection();
     mocks.getAuthMe.mockResolvedValue(authIdentity());
     mocks.connectGuiChat.mockReturnValue(connection);
@@ -354,7 +355,11 @@ describe("GuiChatShell", () => {
     const sidebar = document.querySelector('aside[aria-label="Chat workspace"]');
     expect(sidebar).not.toBeNull();
     expect(sidebar?.querySelector('[aria-label="Manage models"]')?.textContent).toContain("Models");
-    expect(sidebar?.querySelector('[aria-label="Employees"]')?.textContent).toContain("Employees");
+    const contactsEntries = sidebar?.querySelectorAll('[aria-label="Contacts"]') ?? [];
+    expect(contactsEntries).toHaveLength(1);
+    expect(contactsEntries[0]?.textContent).toContain("Contacts");
+    expect(sidebar?.querySelector('[aria-label="Employees"]')).toBeNull();
+    expect(sidebar?.querySelector('[aria-label="Start employee chat"]')).toBeNull();
     expect(sidebar?.querySelector('[aria-label="Message composition statistics"]')?.textContent).toContain("Message statistics");
     const languageSwitcher = sidebar?.querySelector<HTMLButtonElement>('[aria-label="Switch language"]');
     expect(languageSwitcher?.textContent).toContain("简体中文");
@@ -364,98 +369,11 @@ describe("GuiChatShell", () => {
     expect(document.querySelector('[aria-label="Log out"]')).not.toBeNull();
   });
 
-  it("explains how to make an unavailable employee chat available", async () => {
+  it("opens the controlled contacts list without creating an untargeted session", async () => {
     const connection = createConnection();
     mocks.getAuthMe.mockResolvedValue(authIdentity());
     mocks.connectGuiChat.mockReturnValue(connection);
-
-    await renderShell(<GuiChatShell />);
-    const employeeChatButton = document.querySelector<HTMLButtonElement>(
-      '[aria-label="Start employee chat"]',
-    );
-
-    expect(employeeChatButton?.disabled).toBe(true);
-    expect(employeeChatButton?.getAttribute("aria-describedby")).toBe("employee-chat-notice");
-    expect(document.querySelector('[role="status"]')?.textContent).toContain(
-      "No available AI employees",
-    );
-    expect(document.querySelector('[role="status"]')?.textContent).toContain("Employee management");
-    expect(document.querySelector('[role="status"]')?.className).toContain("text-red-600");
-  });
-
-  it("explains when the employee list could not be loaded", async () => {
-    const connection = createConnection();
-    mocks.getAuthMe.mockResolvedValue(authIdentity());
-    mocks.connectGuiChat.mockReturnValue(connection);
-    mocks.getEmployees.mockRejectedValue(new Error("Unavailable"));
-
-    await renderShell(<GuiChatShell />);
-
-    expect(
-      document.querySelector<HTMLButtonElement>('[aria-label="Start employee chat"]')?.disabled,
-    ).toBe(true);
-    expect(document.querySelector('[role="status"]')?.textContent).toContain(
-      "AI employees could not be loaded",
-    );
-  });
-
-  it("starts an active employee direct chat even when group participation is disabled", async () => {
-    const connection = createConnection();
-    mocks.getAuthMe.mockResolvedValue(authIdentity());
-    mocks.connectGuiChat.mockReturnValue(connection);
-    mocks.getEmployees.mockResolvedValue({
-      employees: [
-        {
-          employee_id: "employee-a",
-          avatar_url: null,
-          channels: {},
-          collaboration_policy: {
-            invite_quota: 5,
-            may_create_groups: true,
-            may_participate: false,
-          },
-          lifecycle_status: "active",
-          profile: {
-            knowledge_relative_paths: [],
-            max_iterations: 20,
-            mcp_servers: [],
-            model_registration_id: "chat-a",
-            name: "Researcher",
-            schema_version: 1,
-            skills: [],
-            system_prompt: "Server policy",
-            toolsets: [],
-            workspace_relative_path: "employees/researcher",
-          },
-          profile_fingerprint: "sha256:pinned",
-          profile_revision: 3,
-        },
-      ],
-    });
-
-    await renderShell(<GuiChatShell />);
-    await act(async () => {
-      document.querySelector<HTMLButtonElement>('[aria-label="Start employee chat"]')?.click();
-      await Promise.resolve();
-      const employeeButton = Array.from(document.querySelectorAll<HTMLButtonElement>("button"))
-        .find((button) => button.textContent?.trim() === "Researcher");
-      employeeButton?.click();
-      await Promise.resolve();
-    });
-
-    expect(connection.createOrAttach).toHaveBeenLastCalledWith(
-      null,
-      expect.any(Number),
-      expect.any(AbortSignal),
-      undefined,
-      { employeeId: "employee-a" },
-    );
-  });
-
-  it("opens employee management inside the dedicated workspace", async () => {
-    const connection = createConnection();
-    mocks.getAuthMe.mockResolvedValue(authIdentity());
-    mocks.connectGuiChat.mockReturnValue(connection);
+    mocks.getEmployees.mockResolvedValue({ employees: [employee()] });
 
     await renderShell(
       <>
@@ -463,28 +381,122 @@ describe("GuiChatShell", () => {
         <GuiChatShell />
       </>,
     );
+    expect(connection.createOrAttach).toHaveBeenCalledOnce();
+
     await act(async () => {
-      document.querySelector<HTMLButtonElement>('[aria-label="Employees"]')?.click();
+      document.querySelector<HTMLButtonElement>('[aria-label="Contacts"]')?.click();
+      await Promise.resolve();
       await Promise.resolve();
     });
 
-    expect(document.querySelector("[data-location]")?.textContent).toBe("/chat/robots");
-    const robotsPane = document.querySelector("[data-robots-pane]");
-    expect(robotsPane).not.toBeNull();
-    expect(robotsPane?.getAttribute("data-theme")).toBe("chat-workspace");
-    expect(document.body.textContent).toContain("Employees");
-    expect(
-      robotsPane?.querySelector("button.gui-chat-workspace-primary-button")
-        ?.textContent,
-    ).toBe("Add employee");
-    expect(robotsPane?.querySelector("[data-employee-management-pane]")).not.toBeNull();
+    expect(document.querySelector("[data-location]")?.textContent).toBe("/chat/contacts");
+    expect(document.querySelector("[data-employee-contacts-pane]")).not.toBeNull();
+    expect(document.querySelector('[role="list"][aria-label="Employee list"]')?.textContent)
+      .toContain("Researcher");
+    expect(document.body.textContent).toContain("Choose a contact to start a conversation");
     expect(document.querySelector("[data-composer-send]")).toBeNull();
-    expect(
-      document.querySelector<HTMLButtonElement>('[aria-label="Employees"]')
-        ?.getAttribute("aria-current"),
-    ).toBe("page");
-    expect(mocks.getMessagingPlatforms).not.toHaveBeenCalled();
-    expect(mocks.getEmployeeCatalog).toHaveBeenCalled();
+    expect(document.querySelector('[aria-label="Contacts"]')?.getAttribute("aria-current"))
+      .toBe("page");
+    expect(connection.createOrAttach).toHaveBeenCalledOnce();
+  });
+
+  it("routes an active contact to its conversation and starts the employee target", async () => {
+    const connection = createConnection();
+    mocks.getAuthMe.mockResolvedValue(authIdentity());
+    mocks.connectGuiChat.mockReturnValue(connection);
+    mocks.getEmployees.mockResolvedValue({ employees: [employee()] });
+
+    await renderShellAt(
+      "/chat/contacts",
+      <>
+        <LocationProbe />
+        <GuiChatShell />
+      </>,
+    );
+    expect(connection.createOrAttach).not.toHaveBeenCalled();
+
+    await act(async () => {
+      Array.from(document.querySelectorAll<HTMLButtonElement>("button"))
+        .find((button) => button.textContent?.includes("Researcher") && !button.hasAttribute("aria-label"))
+        ?.click();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(document.querySelector("[data-location]")?.textContent).toBe("/chat/contacts/employee-a");
+    expect(connection.createOrAttach).toHaveBeenCalledOnce();
+    expect(connection.createOrAttach).toHaveBeenLastCalledWith(
+      null,
+      expect.any(Number),
+      expect.any(AbortSignal),
+      undefined,
+      { employeeId: "employee-a" },
+    );
+    expect(document.querySelector("[data-composer-send]")).not.toBeNull();
+  });
+
+  it("does not start unavailable contacts or select a contact from its settings button", async () => {
+    const connection = createConnection();
+    mocks.getAuthMe.mockResolvedValue(authIdentity());
+    mocks.connectGuiChat.mockReturnValue(connection);
+    mocks.getEmployees.mockResolvedValue({
+      employees: [employee(), employee({ employee_id: "employee-b", lifecycle_status: "suspended", name: "Writer" })],
+    });
+
+    await renderShellAt(
+      "/chat/contacts",
+      <>
+        <LocationProbe />
+        <GuiChatShell />
+      </>,
+    );
+
+    const unavailable = Array.from(document.querySelectorAll<HTMLButtonElement>("button"))
+      .find((button) => button.textContent?.includes("Writer") && !button.hasAttribute("aria-label"));
+    expect(unavailable?.getAttribute("aria-disabled")).toBe("true");
+    await act(async () => unavailable?.click());
+    expect(document.querySelector("[data-location]")?.textContent).toBe("/chat/contacts");
+    expect(connection.createOrAttach).not.toHaveBeenCalled();
+
+    await act(async () => {
+      document.querySelector<HTMLButtonElement>('[aria-label="Manage employee: Researcher"]')?.click();
+      await Promise.resolve();
+    });
+    expect(document.querySelector("[data-location]")?.textContent).toBe("/chat/contacts");
+    expect(connection.createOrAttach).not.toHaveBeenCalled();
+    expect(Array.from(document.querySelectorAll('[role="dialog"]'))
+      .find((dialog) => dialog.textContent?.includes("Manage the employee profile")))
+      .not.toBeUndefined();
+  });
+
+  it("shows Back to contacts for a selected contact on mobile", async () => {
+    const connection = createConnection();
+    mocks.getAuthMe.mockResolvedValue(authIdentity());
+    mocks.connectGuiChat.mockReturnValue(connection);
+    mocks.getEmployees.mockResolvedValue({ employees: [employee()] });
+    window.matchMedia = vi.fn().mockImplementation((query: string) => ({
+      addEventListener: vi.fn(),
+      matches: query === "(max-width: 1023px)",
+      media: query,
+      removeEventListener: vi.fn(),
+    }));
+
+    await renderShellAt(
+      "/chat/contacts/employee-a",
+      <>
+        <LocationProbe />
+        <GuiChatShell />
+      </>,
+    );
+
+    const back = document.querySelector<HTMLButtonElement>('[aria-label="Back to contacts"]');
+    expect(back).not.toBeNull();
+    expect(document.querySelector("[data-employee-contacts-pane]")).toBeNull();
+    await act(async () => {
+      back?.click();
+      await Promise.resolve();
+    });
+    expect(document.querySelector("[data-location]")?.textContent).toBe("/chat/contacts");
   });
 
   it("opens message statistics inside the dedicated workspace", async () => {
@@ -1315,6 +1327,41 @@ interface AuthIdentity {
   provider: string;
   tenant_id: string;
   user_id: string;
+}
+
+function employee(overrides: {
+  employee_id?: string;
+  lifecycle_status?: Employee["lifecycle_status"];
+  name?: string;
+} = {}): Employee {
+  const employeeId = overrides.employee_id ?? "employee-a";
+  return {
+    avatar_url: null,
+    channels: {},
+    collaboration_policy: {
+      invite_quota: 5,
+      may_create_groups: true,
+      may_participate: false,
+    },
+    employee_id: employeeId,
+    lifecycle_status: overrides.lifecycle_status ?? "active",
+    profile: {
+      knowledge_relative_paths: [],
+      max_iterations: 20,
+      max_tokens: null,
+      mcp_servers: [],
+      model_registration_id: "chat-a",
+      name: overrides.name ?? "Researcher",
+      role: "Analyst",
+      schema_version: 1,
+      skills: [],
+      system_prompt: "Server policy",
+      toolsets: [],
+      workspace_relative_path: `employees/${employeeId}`,
+    },
+    profile_fingerprint: "sha256:pinned",
+    profile_revision: 3,
+  };
 }
 
 function authIdentity(): AuthIdentity {

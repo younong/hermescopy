@@ -4,18 +4,18 @@ import { useLocation, useNavigate, useSearchParams } from "react-router-dom";
 import { Button } from "@nous-research/ui/ui/components/button";
 import {
   AlertCircle,
+  ArrowLeft,
   CalendarClock,
   CircleHelp,
+  ContactRound,
   FolderOpen,
   LogOut,
   Menu,
   MessageSquarePlus,
-  Bot,
   PieChart,
   RefreshCw,
   Search,
   QrCode,
-  Radio,
   Settings2,
   UsersRound,
   SlidersHorizontal,
@@ -58,7 +58,7 @@ import {
   type MessageAttachmentState,
 } from "../types";
 import { Composer } from "./Composer";
-import { EmployeeManagementPane } from "./EmployeeManagementPane";
+import { EmployeeContactsPane } from "./EmployeeContactsPane";
 import { ComposerModelPicker } from "./ComposerModelPicker";
 import { ComposerReasoningPicker } from "./ComposerReasoningPicker";
 import { GuiChatModelsPane } from "./GuiChatModelsPane";
@@ -82,14 +82,17 @@ export function GuiChatShell() {
   const groupId = routeTarget.kind === "group" ? routeTarget.id : null;
   const resumeSessionId = routeTarget.kind === "direct" ? routeTarget.id : null;
   const mockMode = searchParams.get("mock") === "1";
+  const contactsSearch = mockMode ? "?mock=1" : "";
   const workspacePath = location.pathname.replace(/\/$/, "");
   const statisticsOpen = workspacePath === "/chat/statistics";
   const filesOpen = workspacePath === "/chat/files";
   const skillsOpen = workspacePath === "/chat/skills";
   const scheduledTasksOpen = workspacePath === "/chat/scheduled-tasks";
-  const robotsOpen = workspacePath === "/chat/robots";
+  const contactsMatch = workspacePath.match(/^\/chat\/contacts(?:\/([^/]+))?$/);
+  const contactsOpen = contactsMatch !== null;
+  const selectedEmployeeId = contactsMatch?.[1] ?? null;
   const modelsOpen = workspacePath === "/chat/models";
-  const workspacePaneOpen = statisticsOpen || filesOpen || skillsOpen || scheduledTasksOpen || robotsOpen || modelsOpen;
+  const workspacePaneOpen = statisticsOpen || filesOpen || skillsOpen || scheduledTasksOpen || contactsOpen || modelsOpen;
   const [state, dispatch] = useReducer(guiChatReducer, initialGuiChatState);
   const connectionRef = useRef<GuiChatConnection | null>(null);
   const historyAbortRef = useRef<AbortController | null>(null);
@@ -135,7 +138,7 @@ export function GuiChatShell() {
   const [createGroupOpen, setCreateGroupOpen] = useState(false);
   const [employees, setEmployees] = useState<Employee[]>([]);
   const [employeeLoadStatus, setEmployeeLoadStatus] = useState<"loading" | "ready" | "error">("loading");
-  const [employeeChatOpen, setEmployeeChatOpen] = useState(false);
+  const contactTargetRef = useRef<string | null>(null);
   const { authMe, authRequired, ownerKey, ready: authIdentityReady } = useDashboardAuthIdentity();
   const weChatStatus = authMe?.feature_status?.weixin_ilink_connect;
   const weChatReady = Boolean(authMe?.features?.weixin_ilink_connect);
@@ -150,12 +153,16 @@ export function GuiChatShell() {
   const navigateRef = useRef(navigate);
   const groupIdRef = useRef(groupId);
   const resumeSessionIdRef = useRef(resumeSessionId);
+  const contactsOpenRef = useRef(contactsOpen);
+  const selectedEmployeeIdRef = useRef(selectedEmployeeId);
   const setSearchParamsRef = useRef(setSearchParams);
   stateRef.current = state;
   workspacePaneOpenRef.current = workspacePaneOpen;
   navigateRef.current = navigate;
   groupIdRef.current = groupId;
   resumeSessionIdRef.current = resumeSessionId;
+  contactsOpenRef.current = contactsOpen;
+  selectedEmployeeIdRef.current = selectedEmployeeId;
   setSearchParamsRef.current = setSearchParams;
   const updateSearchParams = useCallback(
     (
@@ -230,34 +237,6 @@ export function GuiChatShell() {
     }
   }, [updateSearchParams]);
 
-  const startEmployeeChat = (employeeId: string) => {
-    const employee = employees.find((item) => item.employee_id === employeeId);
-    if (!employee || employee.lifecycle_status !== "active" || !employee.profile) {
-      dispatch({ type: "error", message: copy.shell.employeeUnavailable });
-      return;
-    }
-    setEmployeeChatOpen(false);
-    historyAbortRef.current?.abort();
-    setAttachmentsToQueue([]);
-    reconnectLifecycleRef.current?.cancelRecovery();
-    setResumeNotice(null);
-    skipClearedRouteRef.current = true;
-    updateSearchParams((prev) => {
-      const next = new URLSearchParams(prev);
-      next.delete("resume");
-      next.delete("group");
-      return next;
-    }, { replace: true });
-    const coordinator = switchCoordinatorRef.current;
-    if (!coordinator) return;
-    const generation = coordinator.start(
-      null,
-      undefined,
-      { employeeId: employee.employee_id },
-    );
-    dispatch({ type: "session.selected", generation, sessionId: null });
-  };
-
   const switchScope = useMemo(() => {
     const connection = mockMode
       ? connectMockGuiChat()
@@ -331,6 +310,11 @@ export function GuiChatShell() {
             if (groupIdRef.current) {
               return connection.attachOwner().then(() => null);
             }
+            if (contactsOpenRef.current) {
+              const employeeId = selectedEmployeeIdRef.current;
+              if (!employeeId) return Promise.resolve(null);
+              return coordinator.start(null, undefined, { employeeId });
+            }
             return coordinator.start(
               coordinator.committedSessionId ??
                 stateRef.current.storedSessionId ??
@@ -345,6 +329,7 @@ export function GuiChatShell() {
   switchCoordinatorRef.current = switchCoordinator;
 
   const connectRoute = useCallback(() => {
+    if (contactsOpen) return;
     if (groupId) {
       historyAbortRef.current?.abort();
       setAttachmentsToQueue([]);
@@ -431,16 +416,30 @@ export function GuiChatShell() {
           }
         : undefined,
     );
-  }, [groupId, mockMode, resumeSessionId, switchCoordinator, updateSearchParams]);
+  }, [contactsOpen, groupId, mockMode, resumeSessionId, switchCoordinator, updateSearchParams]);
+
+  const startEmployeeTarget = useCallback((employeeId: string) => {
+    contactTargetRef.current = employeeId;
+    const generation = switchCoordinator.start(
+      null,
+      undefined,
+      { employeeId },
+    );
+    dispatch({ type: "session.selected", generation, sessionId: null });
+  }, [switchCoordinator]);
 
   const retryConnection = useCallback(() => {
     setResumeNotice(null);
+    if (contactsOpen && selectedEmployeeId) {
+      startEmployeeTarget(selectedEmployeeId);
+      return;
+    }
     if (mockMode) {
       connectRoute();
       return;
     }
     reconnectLifecycleRef.current?.retryNow();
-  }, [connectRoute, mockMode]);
+  }, [connectRoute, contactsOpen, mockMode, selectedEmployeeId, startEmployeeTarget]);
 
   useEffect(() => {
     if (!authIdentityReady) return;
@@ -453,7 +452,7 @@ export function GuiChatShell() {
       return;
     }
     connectRoute();
-  }, [authIdentityReady, connectRoute, groupId, resumeSessionId]);
+  }, [authIdentityReady, connectRoute, contactsOpen, groupId, resumeSessionId]);
 
   useEffect(
     () => () => {
@@ -473,6 +472,22 @@ export function GuiChatShell() {
   );
 
   const refreshGroups = useCallback(() => setGroupsRefreshNonce((nonce) => nonce + 1), []);
+  const refreshEmployees = useCallback(async () => {
+    setEmployeeLoadStatus("loading");
+    try {
+      const response = await api.getEmployees();
+      setEmployees(response.employees);
+      setEmployeeLoadStatus("ready");
+    } catch {
+      setEmployees([]);
+      setEmployeeLoadStatus("error");
+    }
+  }, []);
+
+  useEffect(() => {
+    if (!authIdentityReady) return;
+    void refreshEmployees();
+  }, [authIdentityReady, refreshEmployees]);
 
   useEffect(() => {
     if (!authIdentityReady) return;
@@ -485,16 +500,6 @@ export function GuiChatShell() {
     }).catch(() => undefined).finally(() => {
       if (!controller.signal.aborted) setGroupsLoading(false);
     });
-    setEmployeeLoadStatus("loading");
-    void api.getEmployees().then((response) => {
-      if (controller.signal.aborted) return;
-      setEmployees(response.employees);
-      setEmployeeLoadStatus("ready");
-    }).catch(() => {
-      if (controller.signal.aborted) return;
-      setEmployees([]);
-      setEmployeeLoadStatus("error");
-    });
     return () => controller.abort();
   }, [authIdentityReady, groupsRefreshNonce, switchScope]);
 
@@ -505,6 +510,63 @@ export function GuiChatShell() {
       if (event.type === "collaboration.group.changed") refreshGroups();
     });
   }, [refreshGroups, switchScope]);
+
+  const selectedEmployee = useMemo(
+    () => employees.find((employee) => employee.employee_id === selectedEmployeeId) ?? null,
+    [employees, selectedEmployeeId],
+  );
+  const selectedEmployeeAvailable = selectedEmployee?.lifecycle_status === "active"
+    && selectedEmployee.profile !== null;
+
+  useEffect(() => {
+    if (!contactsOpen) {
+      contactTargetRef.current = null;
+      return;
+    }
+    if (employeeLoadStatus !== "ready") return;
+    if (!selectedEmployeeId) {
+      if (contactTargetRef.current !== null) {
+        contactTargetRef.current = null;
+        historyAbortRef.current?.abort();
+        setAttachmentsToQueue([]);
+        reconnectLifecycleRef.current?.cancelRecovery();
+        switchCoordinator.cancel();
+        dispatch({
+          type: "session.selected",
+          generation: switchCoordinator.currentGeneration,
+          sessionId: null,
+        });
+      }
+      return;
+    }
+    if (!selectedEmployeeAvailable) {
+      contactTargetRef.current = null;
+      navigate(`/chat/contacts${contactsSearch}`, { replace: true });
+      dispatch({ type: "error", message: copy.shell.employeeUnavailable });
+      return;
+    }
+    if (contactTargetRef.current === selectedEmployeeId) return;
+    historyAbortRef.current?.abort();
+    setAttachmentsToQueue([]);
+    reconnectLifecycleRef.current?.cancelRecovery();
+    setResumeNotice(null);
+    startEmployeeTarget(selectedEmployeeId);
+  }, [
+    contactsOpen,
+    contactsSearch,
+    copy.shell.employeeUnavailable,
+    employeeLoadStatus,
+    navigate,
+    selectedEmployeeAvailable,
+    selectedEmployeeId,
+    startEmployeeTarget,
+    switchCoordinator,
+  ]);
+
+  const pickContact = useCallback((employeeId: string) => {
+    closeMobilePanel();
+    navigate(`/chat/contacts/${encodeURIComponent(employeeId)}${contactsSearch}`);
+  }, [closeMobilePanel, contactsSearch, navigate]);
 
   const pickGroup = useCallback((nextGroupId: string) => {
     closeMobilePanel();
@@ -848,17 +910,9 @@ export function GuiChatShell() {
   const conversationTitle = groupId
     ? activeGroup?.name ?? copy.shell.group
     : activeSessionTitle ?? (activeSessionId ? copy.shell.conversation : copy.shell.newChat);
+  const contactTitle = selectedEmployee?.profile?.name ?? copy.shell.contacts;
+  const conversationSurfaceOpen = !workspacePaneOpen || (contactsOpen && selectedEmployeeAvailable);
   const accountLabel = authMe?.display_name || authMe?.email || copy.shell.workspaceAccount;
-  const availableDirectEmployees = employees.filter(
-    (employee) => employee.lifecycle_status === "active" && employee.profile !== null,
-  );
-  const employeeChatNotice = employeeLoadStatus === "loading"
-    ? copy.shell.employeesLoading
-    : employeeLoadStatus === "error"
-      ? copy.shell.employeesLoadFailed
-      : availableDirectEmployees.length === 0
-        ? copy.shell.noEmployees
-        : null;
   const handleLogout = () => {
     dashboardAuthTransition.reset();
     void api.logout();
@@ -887,38 +941,18 @@ export function GuiChatShell() {
           <span>{copy.shell.newChat}</span>
         </button>
         <button
-          aria-describedby={employeeChatNotice ? "employee-chat-notice" : undefined}
-          aria-expanded={employeeChatOpen}
-          aria-label={copy.shell.startEmployeeChat}
-          className="gui-chat-nav-item disabled:cursor-not-allowed disabled:opacity-45"
-          disabled={employeeChatNotice !== null}
-          onClick={() => setEmployeeChatOpen((open) => !open)}
+          aria-current={contactsOpen ? "page" : undefined}
+          aria-label={copy.shell.contacts}
+          className="gui-chat-nav-item"
+          onClick={() => {
+            closeMobilePanel();
+            navigate(`/chat/contacts${contactsSearch}`);
+          }}
           type="button"
         >
-          <Bot />
-          <span>{copy.shell.chatWithEmployee}</span>
+          <ContactRound />
+          <span>{copy.shell.contacts}</span>
         </button>
-        {employeeChatNotice ? (
-          <p className="ml-6 px-3 pb-1 text-xs leading-5 text-red-600" id="employee-chat-notice" role="status">
-            {employeeChatNotice}
-          </p>
-        ) : null}
-        {employeeChatOpen ? (
-          <div className="ml-6 space-y-[3px] border-l border-[#e4e6ea] pl-2">
-            {availableDirectEmployees.map((employee) => (
-              <button
-                className="gui-chat-nav-item"
-                key={employee.employee_id}
-                onClick={() => startEmployeeChat(employee.employee_id)}
-                type="button"
-              >
-                <span className="min-w-0 truncate">
-                  {employee.profile?.name || copy.shell.unnamedEmployee}
-                </span>
-              </button>
-            ))}
-          </div>
-        ) : null}
         <button
           aria-current={statisticsOpen ? "page" : undefined}
           aria-label={copy.shell.messageCompositionStatistics}
@@ -967,19 +1001,6 @@ export function GuiChatShell() {
         >
           <CalendarClock />
           <span>{copy.shell.scheduledTasks}</span>
-        </button>
-        <button
-          aria-current={robotsOpen ? "page" : undefined}
-          aria-label={copy.shell.employees}
-          className="gui-chat-nav-item"
-          onClick={() => {
-            closeMobilePanel();
-            navigate("/chat/robots");
-          }}
-          type="button"
-        >
-          <Radio />
-          <span>{copy.shell.employees}</span>
         </button>
         <button
           aria-current={modelsOpen ? "page" : undefined}
@@ -1035,6 +1056,71 @@ export function GuiChatShell() {
           <CircleHelp />
           <span>{copy.shell.help}</span>
         </button>
+      </div>
+    </>
+  );
+
+  const conversationPane = (
+    <>
+      {resumeNotice ? (
+        <div className="gui-chat-notice">
+          <AlertCircle />
+          <span>{resumeNotice}</span>
+        </div>
+      ) : null}
+      {state.error ? (
+        <div className="gui-chat-notice gui-chat-notice-error">
+          <AlertCircle />
+          <span>{state.error}</span>
+        </div>
+      ) : null}
+
+      <div className="relative flex min-h-0 flex-1 flex-col overflow-hidden">
+        <MessageList
+          disabled={disabled}
+          forceBottomKey={forceBottomKey}
+          onApprovalRespond={respondToApproval}
+          onClarifyRespond={respondToClarify}
+          onLoadEarlier={loadEarlier}
+          onUseAttachmentAgain={useAttachmentAgain}
+          state={state}
+        />
+        <Composer
+          allowSendWhileGenerating={hasPendingClarification}
+          attachmentToQueue={attachmentsToQueue[0]}
+          disabled={disabled}
+          isGenerating={state.isGenerating}
+          modelPicker={
+            <ComposerModelPicker
+              busy={state.isGenerating}
+              canSwitch={Boolean(state.sessionId && state.connection === "open")}
+              currentModel={state.model}
+              currentProvider={state.provider}
+              onManageModels={() => navigate("/chat/models")}
+              onSwitchChat={(registration, confirmExpensiveModel) =>
+                switchChatModel(registration, confirmExpensiveModel)
+              }
+            />
+          }
+          onAttachmentQueued={(requestId) => {
+            setAttachmentsToQueue((current) =>
+              current.filter((request) => request.requestId !== requestId)
+            );
+          }}
+          reasoningPicker={
+            <ComposerReasoningPicker
+              busy={state.isGenerating}
+              currentLevel={state.reasoningEffort}
+              levels={state.supportedReasoningLevels}
+              onChange={async (level: ReasoningLevel) => {
+                if (!state.sessionId) return;
+                await connectionRef.current?.setReasoningLevel(state.sessionId, level);
+              }}
+            />
+          }
+          onSend={send}
+          onStop={stop}
+        />
       </div>
     </>
   );
@@ -1097,7 +1183,16 @@ export function GuiChatShell() {
 
       <main className="flex min-h-0 min-w-0 flex-1 flex-col bg-white">
         <header className="relative flex h-12 shrink-0 items-center border-b border-[#ebecef] px-3 sm:px-4">
-          {narrow ? (
+          {narrow && contactsOpen && selectedEmployeeId ? (
+            <button
+              aria-label={copy.shell.backToContacts}
+              className="gui-chat-icon-button"
+              onClick={() => navigate(`/chat/contacts${contactsSearch}`)}
+              type="button"
+            >
+              <ArrowLeft className="h-4 w-4" />
+            </button>
+          ) : narrow ? (
             <button
               aria-controls="gui-chat-session-panel"
               aria-expanded={mobilePanelOpen}
@@ -1119,16 +1214,22 @@ export function GuiChatShell() {
                   ? copy.shell.skills
                   : scheduledTasksOpen
                     ? copy.shell.scheduledTasks
-                    : robotsOpen
-                      ? copy.shell.employees
+                    : contactsOpen
+                      ? contactTitle
                       : modelsOpen
                         ? copy.shell.models
                         : conversationTitle}
             </h1>
             <p className="truncate text-[0.625rem] text-[#969aa1]">
-              {workspacePaneOpen
-                ? copy.shell.workspace
-                : groupId
+              {contactsOpen
+                ? selectedEmployee
+                  ? copy.shell.contactSummary
+                      .replace("{role}", selectedEmployee.profile?.role || copy.shell.unnamedEmployee)
+                      .replace("{connection}", state.connection)
+                  : copy.shell.selectContact
+                : workspacePaneOpen
+                  ? copy.shell.workspace
+                  : groupId
                   ? copy.shell.workspaceSummaryGroup
                       .replace("{status}", activeGroup?.status ?? copy.shell.group)
                       .replace("{count}", String(Object.values(groups).length))
@@ -1138,7 +1239,7 @@ export function GuiChatShell() {
                       .replace("{connection}", mockMode ? copy.shell.mock : state.connection)}
             </p>
           </div>
-          {!workspacePaneOpen ? (
+          {conversationSurfaceOpen ? (
             <div className="ml-auto flex items-center gap-1">
               {groupId ? <UsersRound className="mr-1 h-3.5 w-3.5 text-[#777c84]" /> : null}
               {canConnectWeChat ? (
@@ -1177,13 +1278,32 @@ export function GuiChatShell() {
           <GuiChatSkillsPane />
         ) : scheduledTasksOpen ? (
           <GuiChatScheduledTasksPane />
-        ) : robotsOpen ? (
-          <div
-            data-robots-pane
-            data-theme="chat-workspace"
-            className="min-h-0 flex-1 overflow-auto"
-          >
-            <EmployeeManagementPane onEmployeesChanged={setEmployees} />
+        ) : contactsOpen ? (
+          <div data-contacts-workspace className="flex min-h-0 flex-1 overflow-hidden">
+            {(!narrow || !selectedEmployeeId) ? (
+              <div className={cn("min-h-0 w-full shrink-0", !narrow && "w-[18rem] border-r border-[#ebecef]")}>
+                <EmployeeContactsPane
+                  employees={employees}
+                  loadStatus={employeeLoadStatus}
+                  onEmployeeSelect={pickContact}
+                  onRefresh={refreshEmployees}
+                  selectedEmployeeId={selectedEmployeeId}
+                />
+              </div>
+            ) : null}
+            {(!narrow || selectedEmployeeId) ? (
+              <div className="flex min-h-0 min-w-0 flex-1 flex-col bg-white">
+                {selectedEmployeeAvailable ? conversationPane : (
+                  <div className="flex min-h-0 flex-1 items-center justify-center px-6 text-center">
+                    <div>
+                      <ContactRound className="mx-auto h-8 w-8 text-[#b0b3b8]" />
+                      <p className="mt-3 text-sm font-medium text-[#4d5055]">{copy.shell.selectContact}</p>
+                      <p className="mt-1 text-xs text-[#969aa1]">{copy.shell.selectContactHint}</p>
+                    </div>
+                  </div>
+                )}
+              </div>
+            ) : null}
           </div>
         ) : modelsOpen ? (
           <GuiChatModelsPane
@@ -1203,70 +1323,7 @@ export function GuiChatShell() {
             onArchive={archiveGroup}
             onGroupChanged={refreshGroups}
           />
-        ) : (
-          <>
-            {resumeNotice ? (
-              <div className="gui-chat-notice">
-                <AlertCircle />
-                <span>{resumeNotice}</span>
-              </div>
-            ) : null}
-            {state.error ? (
-              <div className="gui-chat-notice gui-chat-notice-error">
-                <AlertCircle />
-                <span>{state.error}</span>
-              </div>
-            ) : null}
-
-            <div className="relative flex min-h-0 flex-1 flex-col overflow-hidden">
-              <MessageList
-                disabled={disabled}
-                forceBottomKey={forceBottomKey}
-                onApprovalRespond={respondToApproval}
-                onClarifyRespond={respondToClarify}
-                onLoadEarlier={loadEarlier}
-                onUseAttachmentAgain={useAttachmentAgain}
-                state={state}
-              />
-              <Composer
-                allowSendWhileGenerating={hasPendingClarification}
-                attachmentToQueue={attachmentsToQueue[0]}
-                disabled={disabled}
-                isGenerating={state.isGenerating}
-                modelPicker={
-                  <ComposerModelPicker
-                    busy={state.isGenerating}
-                    canSwitch={Boolean(state.sessionId && state.connection === "open")}
-                    currentModel={state.model}
-                    currentProvider={state.provider}
-                    onManageModels={() => navigate("/chat/models")}
-                    onSwitchChat={(registration, confirmExpensiveModel) =>
-                      switchChatModel(registration, confirmExpensiveModel)
-                    }
-                  />
-                }
-                onAttachmentQueued={(requestId) => {
-                  setAttachmentsToQueue((current) =>
-                    current.filter((request) => request.requestId !== requestId)
-                  );
-                }}
-                reasoningPicker={
-                  <ComposerReasoningPicker
-                    busy={state.isGenerating}
-                    currentLevel={state.reasoningEffort}
-                    levels={state.supportedReasoningLevels}
-                    onChange={async (level: ReasoningLevel) => {
-                      if (!state.sessionId) return;
-                      await connectionRef.current?.setReasoningLevel(state.sessionId, level);
-                    }}
-                  />
-                }
-                onSend={send}
-                onStop={stop}
-              />
-            </div>
-          </>
-        )}
+        ) : conversationPane}
       </main>
     </div>
   );

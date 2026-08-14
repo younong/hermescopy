@@ -231,7 +231,7 @@ export default function ChannelsPage() {
                 <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
                   <div className="flex min-w-0 items-start gap-3"><StateIcon className="mt-0.5 h-5 w-5 shrink-0 text-muted-foreground" /><div><div className="flex items-center gap-2"><span className="font-mondwest text-sm font-medium normal-case">{platform.name}</span><Badge tone={badge.tone}>{badge.label}</Badge></div><span className="text-xs text-muted-foreground">{platform.description}</span></div></div>
                   {isManagedFeishu ? (
-                    <Link className="inline-flex h-8 items-center rounded-md bg-midground px-3 text-xs font-medium text-background-base hover:bg-midground/90" to="/chat/robots">{employeeText.manageEmployees}</Link>
+                    <Link className="inline-flex h-8 items-center rounded-md bg-midground px-3 text-xs font-medium text-background-base hover:bg-midground/90" to="/chat/contacts">{employeeText.manageEmployees}</Link>
                   ) : (
                     <div className="flex items-center gap-2">
                       {togglingId === platform.id ? <Spinner /> : <Switch aria-label={`Enable ${platform.name}`} checked={platform.enabled} onCheckedChange={() => void handleToggle(platform)} />}
