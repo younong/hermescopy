@@ -5297,10 +5297,29 @@ def _make_agent(
         **(agent_callbacks if agent_callbacks is not None else _agent_cbs(sid)),
     )
     if employee_policy is not None:
+        _stamp_employee_compression_metadata(
+            agent,
+            employee_policy=employee_policy,
+            collaboration_context=collaboration_context,
+        )
         _restrict_employee_agent_tools(agent)
     if collaboration_context is not None and collaboration_context.role != "member":
         _inject_collaboration_agent_tools(agent, collaboration_context)
     return agent
+
+
+def _stamp_employee_compression_metadata(
+    agent,
+    *,
+    employee_policy: dict[str, Any],
+    collaboration_context: Any,
+) -> None:
+    """Pin employee identity into every compression continuation row."""
+    agent._session_init_model_config[_EMPLOYEE_POLICY_CONFIG_KEY] = employee_policy
+    if getattr(collaboration_context, "source_kind", None) == "web_direct":
+        agent._session_init_model_config[_WEB_DIRECT_EMPLOYEE_CONFIG_KEY] = str(
+            employee_policy["employee_id"]
+        )
 
 
 def _restrict_employee_agent_tools(agent) -> None:
@@ -6294,6 +6313,40 @@ def _web_direct_collaboration_context(
     )
 
 
+def _web_direct_binding_scope() -> dict[str, Any] | None:
+    scope = current_recovery_scope()
+    if scope is None:
+        return None
+    return {
+        "owner_key": str(scope["owner_key"]),
+        "workspace_root": str(scope["workspace_root"]),
+        "worker_generation": int(scope["worker_generation"]),
+    }
+
+
+def _stamp_web_direct_binding(session: dict, binding: dict[str, Any]) -> None:
+    session["web_direct_binding"] = {
+        "owner_key": str(binding["owner_key"]),
+        "workspace_root": str(binding["workspace_root"]),
+        "employee_id": str(binding["employee_id"]),
+        "root_session_id": str(binding["root_session_id"]),
+        "binding_epoch": int(binding["binding_epoch"]),
+    }
+
+
+def _web_direct_binding_is_current(session: dict) -> bool:
+    binding = session.get("web_direct_binding")
+    if not isinstance(binding, dict):
+        return True
+    db = _get_db()
+    if db is None:
+        return False
+    try:
+        return db.web_direct_employee_binding_matches(**binding)
+    except (TypeError, ValueError):
+        return False
+
+
 def _collaboration_call(rid, callback) -> dict:
     try:
         result = callback(_collaboration_service(subscribe=True))
@@ -6488,8 +6541,18 @@ def _session_create(rid, params: dict) -> dict:
     if employee_policy is not None and direct_employee_policy is not None:
         return _err(rid, 4002, "employee session identity is ambiguous")
     employee_policy = employee_policy or direct_employee_policy
-    if employee_policy is not None and any(
-        key in params for key in ("model", "provider", "reasoning_effort", "fast", "cwd")
+    runtime_override_keys = ("model", "provider", "reasoning_effort", "fast", "cwd")
+    if employee_policy is not None and any(key in params for key in runtime_override_keys):
+        return _err(rid, 4002, "employee policy cannot be combined with runtime overrides")
+    if direct_employee_policy is not None and any(
+        key in params
+        for key in (
+            "messages",
+            "title",
+            "parent_session_id",
+            "stored_session_id",
+            "kind",
+        )
     ):
         return _err(rid, 4002, "employee policy cannot be combined with runtime overrides")
     if _owner_worker_mode():
@@ -6511,11 +6574,61 @@ def _session_create(rid, params: dict) -> dict:
         begin_error = dashboard_transport.begin_dashboard_attach(
             dashboard_generation,
             browser_id=str(params.get("browser_id") or "").strip(),
-            pending=False,
+            # Opening an employee contact may cold-resume a durable conversation.
+            # Fence dashboard mutations until that potentially long lookup commits.
+            pending=direct_employee_policy is not None,
         )
         if begin_error is not None:
             code = 4091 if begin_error == "session attach superseded" else 4002
             return _err(rid, code, begin_error)
+
+    employee_binding = None
+    if direct_employee_policy is not None:
+        scope = _web_direct_binding_scope()
+        db = _get_db()
+        if scope is None or db is None:
+            if dashboard_transport is not None and dashboard_generation is not None:
+                dashboard_transport.abort_dashboard_attach(dashboard_generation)
+            return _err(rid, 5000, "employee conversation binding is unavailable")
+        try:
+            employee_binding = db.claim_web_direct_employee_conversation(
+                owner_key=scope["owner_key"],
+                workspace_root=scope["workspace_root"],
+                employee_id=str(direct_employee_policy["employee_id"]),
+                proposed_session_id=_new_session_key(),
+                worker_generation=scope["worker_generation"],
+            )
+        except Exception:
+            logger.exception("failed to claim web direct employee conversation")
+            if dashboard_transport is not None and dashboard_generation is not None:
+                dashboard_transport.abort_dashboard_attach(dashboard_generation)
+            return _err(rid, 5000, "employee conversation binding is unavailable")
+
+        key = str(employee_binding["root_session_id"])
+        if employee_binding["state"] in {"persisted", "adopted"}:
+            assert dashboard_transport is not None
+            assert dashboard_generation is not None
+            resume_params = {
+                **params,
+                "session_id": key,
+                "_dashboard_attach": True,
+            }
+            try:
+                response = _session_resume(rid, resume_params)
+                if "error" not in response:
+                    resumed_sid = str(response.get("result", {}).get("session_id") or "")
+                    resumed_session = _sessions.get(resumed_sid)
+                    if resumed_session is None:
+                        return _err(rid, 4007, "session not found")
+                    _stamp_web_direct_binding(resumed_session, employee_binding)
+                return _commit_session_attach(
+                    rid,
+                    transport=dashboard_transport,
+                    generation=dashboard_generation,
+                    response=response,
+                )
+            finally:
+                dashboard_transport.abort_dashboard_attach(dashboard_generation)
 
     sid = uuid.uuid4().hex[:8]
     requested_stored_id = str(params.get("stored_session_id") or "").strip()
@@ -6526,7 +6639,11 @@ def _session_create(rid, params: dict) -> dict:
             return _err(rid, 4002, "invalid stored_session_id")
         key = requested_stored_id
     else:
-        key = _new_session_key()
+        key = (
+            str(employee_binding["root_session_id"])
+            if employee_binding is not None
+            else _new_session_key()
+        )
     collaboration_context = (
         _web_direct_collaboration_context(
             service=collaboration_service,
@@ -6615,50 +6732,85 @@ def _session_create(rid, params: dict) -> dict:
     if limit_message is not None:
         return _err(rid, 4090, limit_message)
 
-    with _sessions_lock:
-        _sessions[sid] = {
-            "agent": None,
-            "agent_error": None,
-            "agent_ready": ready,
-            "attached_images": [],
-            "pending_attachments": [],
-            "close_on_disconnect": is_truthy_value(params.get("close_on_disconnect", False)),
-            "browser_id": str(params.get("browser_id") or "").strip() or None,
-            "active_session_lease": lease,
-            "cols": cols,
-            "created_at": now,
-            "edit_snapshots": {},
-            "explicit_cwd": explicit_cwd,
-            "history": history,
-            "history_lock": threading.Lock(),
-            "history_version": 0,
-            "image_counter": 0,
-            "cwd": resolved_cwd,
-            "inflight_turn": None,
-            "last_active": now,
-            "model_override": session_model_override,
-            "model_kind": requested_kind,
-            "runtime_profile": "coding" if requested_kind == "code" else None,
-            "runtime_toolset": "coding" if requested_kind == "code" else None,
-            "employee_policy": employee_policy,
-            "collaboration_context": collaboration_context,
-            "create_reasoning_override": create_reasoning_override,
-            "create_service_tier_override": create_service_tier_override,
-            "parent_session_id": parent_session_id,
-            "pending_title": title or None,
-            "running": False,
-            "session_key": key,
-            "show_reasoning": _load_show_reasoning(),
-            "source": source,
-            "tool_progress_mode": _load_tool_progress_mode(),
-            "tool_started_at": {},
-            "transport": (
-                _detached_ws_transport
-                if dashboard_transport is not None
-                else _required_gateway_transport()
-            ),
-        }
-        _register_session_cwd(_sessions[sid])
+    session_record = {
+        "agent": None,
+        "agent_error": None,
+        "agent_ready": ready,
+        "attached_images": [],
+        "pending_attachments": [],
+        "close_on_disconnect": is_truthy_value(params.get("close_on_disconnect", False)),
+        "browser_id": str(params.get("browser_id") or "").strip() or None,
+        "active_session_lease": lease,
+        "cols": cols,
+        "created_at": now,
+        "edit_snapshots": {},
+        "explicit_cwd": explicit_cwd,
+        "history": history,
+        "history_lock": threading.Lock(),
+        "history_version": 0,
+        "image_counter": 0,
+        "cwd": resolved_cwd,
+        "inflight_turn": None,
+        "last_active": now,
+        "model_override": session_model_override,
+        "model_kind": requested_kind,
+        "runtime_profile": "coding" if requested_kind == "code" else None,
+        "runtime_toolset": "coding" if requested_kind == "code" else None,
+        "employee_policy": employee_policy,
+        "collaboration_context": collaboration_context,
+        "create_reasoning_override": create_reasoning_override,
+        "create_service_tier_override": create_service_tier_override,
+        "parent_session_id": parent_session_id,
+        "pending_title": title or None,
+        "running": False,
+        "session_key": key,
+        "show_reasoning": _load_show_reasoning(),
+        "source": source,
+        "tool_progress_mode": _load_tool_progress_mode(),
+        "tool_started_at": {},
+        "transport": (
+            _detached_ws_transport
+            if dashboard_transport is not None
+            else _required_gateway_transport()
+        ),
+    }
+    if employee_binding is not None:
+        _stamp_web_direct_binding(session_record, employee_binding)
+    live = _claim_or_reuse_live(sid, key, session_record, lease)
+    if employee_binding is not None and live is not None:
+        live_sid, live_session = live
+        _stamp_web_direct_binding(live_session, employee_binding)
+        live_context = _web_direct_collaboration_context(
+            service=collaboration_service,
+            employee_policy=direct_employee_policy,
+            session_key=key,
+        )
+        live_session["collaboration_context"] = live_context
+        if live_session.get("agent") is not None:
+            live_session["agent"].collaboration_context = live_context
+        response = _ok(
+            rid,
+            {
+                **_live_session_payload(
+                    live_sid,
+                    live_session,
+                    include_display_history=True,
+                ),
+                "resumed": key,
+                "_attach_live": True,
+            },
+        )
+        assert dashboard_transport is not None
+        assert dashboard_generation is not None
+        try:
+            return _commit_session_attach(
+                rid,
+                transport=dashboard_transport,
+                generation=dashboard_generation,
+                response=response,
+            )
+        finally:
+            dashboard_transport.abort_dashboard_attach(dashboard_generation)
 
     # NOTE: we intentionally do NOT persist a DB row here. Every TUI/desktop
     # launch (and every "New agent" / draft) opens a session here just to paint
@@ -10313,6 +10465,8 @@ def _(rid, params: dict) -> dict:
     # events leave through the active socket after a disconnect and reattach.
     if (t := current_transport()) is not None:
         session["transport"] = t
+    if not _web_direct_binding_is_current(session):
+        return _err(rid, 4093, "employee conversation was reset — reopen the contact")
     with session["history_lock"]:
         if session.get("running"):
             # Don't reject a mid-turn prompt — queue it (and, by default,
@@ -10392,6 +10546,15 @@ def _(rid, params: dict) -> dict:
             return _err(rid, 4092, "external turn outcome is ambiguous")
         session["_external_turn_key"] = idempotency_key
         session["_external_turn_generation"] = generation
+
+    # Recheck after turn claiming: deletion/reset may race between the first
+    # history-lock check and lazy persistence. Never let an old tab recreate the
+    # tombstoned row or submit against a replacement binding.
+    if not _web_direct_binding_is_current(session):
+        with session["history_lock"]:
+            session["running"] = False
+            _clear_inflight_turn(session, generation)
+        return _err(rid, 4093, "employee conversation was reset — reopen the contact")
 
     # Persist the DB row lazily, now that the user has actually sent a message.
     _ensure_session_db_row(session)
@@ -10795,6 +10958,16 @@ def _run_prompt_submit(
     *,
     generation: int | None = None,
 ) -> None:
+    if not _web_direct_binding_is_current(session):
+        with session["history_lock"]:
+            session["running"] = False
+            _clear_inflight_turn(session, generation)
+        _emit(
+            "error",
+            sid,
+            {"message": "employee conversation was reset — reopen the contact"},
+        )
+        return
     with session["history_lock"]:
         if generation is None:
             generation = session.get("_active_turn_generation")
