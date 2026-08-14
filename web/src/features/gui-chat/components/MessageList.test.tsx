@@ -364,6 +364,49 @@ describe("MessageList", () => {
     await act(async () => root.unmount());
   });
 
+  it("removes a clarification card after it is resolved", async () => {
+    const container = document.createElement("div");
+    document.body.appendChild(container);
+    const root = createRoot(container);
+    const clarification = {
+      choices: ["A", "B"],
+      id: "clarify-1",
+      question: "Pick one",
+      status: "pending" as const,
+    };
+
+    await act(async () => root.render(
+      <MessageList
+        onApprovalRespond={() => undefined}
+        onClarifyRespond={() => undefined}
+        state={{
+          ...initialGuiChatState,
+          clarificationOrder: [clarification.id],
+          clarifications: { [clarification.id]: clarification },
+        }}
+      />,
+    ));
+    expect(container.textContent).toContain("Pick one");
+
+    await act(async () => root.render(
+      <MessageList
+        onApprovalRespond={() => undefined}
+        onClarifyRespond={() => undefined}
+        state={{
+          ...initialGuiChatState,
+          clarificationOrder: [clarification.id],
+          clarifications: {
+            [clarification.id]: { ...clarification, status: "answered" },
+          },
+        }}
+      />,
+    ));
+    expect(container.textContent).not.toContain("Hermes needs your answer");
+    expect(container.textContent).not.toContain("Pick one");
+
+    await act(async () => root.unmount());
+  });
+
   it("automatically loads near the top and keeps manual loading for errors only", async () => {
     const container = document.createElement("div");
     document.body.appendChild(container);
