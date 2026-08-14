@@ -765,6 +765,7 @@ def switch_model(
     explicit_provider: str = "",
     user_providers: dict = None,
     custom_providers: list | None = None,
+    trusted_selection: bool = False,
 ) -> ModelSwitchResult:
     """Core model-switching pipeline shared between CLI and gateway.
 
@@ -799,6 +800,8 @@ def switch_model(
         explicit_provider: From --provider flag (empty = no explicit provider).
         user_providers: The ``providers:`` dict from config.yaml (for user endpoints).
         custom_providers: The ``custom_providers:`` list from config.yaml.
+        trusted_selection: Skip remote catalog validation for a model-plane
+            registration that was already resolved locally.
 
     Returns:
         ModelSwitchResult with all information the caller needs.
@@ -821,15 +824,50 @@ def switch_model(
     # PATH A: Explicit --provider given
     # =================================================================
     if explicit_provider:
+        # Trusted (registered) selections resolve against the control-plane
+        # deployment routes FIRST: the descriptor already carries everything the
+        # switch needs (provider id, label, transport), and the models.dev
+        # catalog cannot know deployment-owned ``custom:*`` providers anyway.
+        # This keeps the send-time preflight path entirely local — a blocked or
+        # slow models.dev endpoint previously stalled it for ~75s and killed
+        # the chat WebSocket before the turn started.
+        pdef = None
+        if trusted_selection:
+            try:
+                from hermes_cli.deployment_inference import (
+                    route_descriptors_from_control_plane,
+                )
+
+                deployment_route = next(
+                    (
+                        route
+                        for route in route_descriptors_from_control_plane()
+                        if route.provider == explicit_provider.strip().lower()
+                        and route.model == new_model
+                    ),
+                    None,
+                )
+            except Exception:
+                deployment_route = None
+            if deployment_route is not None:
+                pdef = ProviderDef(
+                    id=deployment_route.provider,
+                    name=deployment_route.name or deployment_route.provider,
+                    transport=deployment_route.api_mode,
+                    api_key_env_vars=(),
+                    auth_type="deployment",
+                    source="deployment",
+                )
         # Resolve the provider
-        pdef = resolve_provider_full(
-            explicit_provider,
-            user_providers,
-            custom_providers,
-        )
+        if pdef is None:
+            pdef = resolve_provider_full(
+                explicit_provider,
+                user_providers,
+                custom_providers,
+            )
         if pdef is None and explicit_provider.strip().lower() == "custom":
             pdef = _bare_custom_provider_def(current_base_url)
-        if pdef is None:
+        if pdef is None and not trusted_selection:
             try:
                 from hermes_cli.deployment_inference import (
                     route_descriptors_from_control_plane,
@@ -1140,10 +1178,16 @@ def switch_model(
     # =================================================================
 
     provider_changed = target_provider != current_provider
-    provider_label = get_label(target_provider)
+    if deployment_route is not None:
+        # Deployment-owned route: the control plane is the source of truth for
+        # the label — no catalog lookup (``custom:*`` providers are not in
+        # models.dev, so that lookup can only stall or miss).
+        provider_label = deployment_route.name or deployment_route.provider
+    else:
+        provider_label = get_label(target_provider)
     if target_provider == "custom" and current_base_url:
         provider_label = "Custom endpoint"
-    if target_provider.startswith("custom:"):
+    if target_provider.startswith("custom:") and deployment_route is None:
         custom_pdef = resolve_provider_full(
             target_provider,
             user_providers,
@@ -1274,7 +1318,7 @@ def switch_model(
     # Deployment routes are an exact operator allowlist and the worker cannot
     # query their private upstream catalogs. Treat only that exact route as
     # validated; all ordinary providers retain normal catalog validation.
-    if deployment_managed:
+    if deployment_managed or trusted_selection:
         validation = {
             "accepted": True,
             "persist": True,
@@ -1381,11 +1425,18 @@ def switch_model(
     ):
         base_url = re.sub(r"/v1/?$", "", base_url)
 
-    # --- Get capabilities (legacy) ---
-    capabilities = get_model_capabilities(target_provider, new_model)
-
-    # --- Get full model info from models.dev ---
-    model_info = get_model_info(target_provider, new_model)
+    # Registered UI selections must not block on metadata refreshes. Cached
+    # metadata still powers the price guard and capability display when present.
+    capabilities = get_model_capabilities(
+        target_provider,
+        new_model,
+        allow_network=not trusted_selection,
+    )
+    model_info = get_model_info(
+        target_provider,
+        new_model,
+        allow_network=not trusted_selection,
+    )
 
     # --- Collect warnings ---
     warnings: list[str] = []

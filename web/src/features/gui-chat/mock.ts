@@ -148,7 +148,22 @@ export function connectMockGuiChat(): GuiChatConnection {
         payload: { kind: "clarify", text: `Mock answer: ${answer}` },
       });
     },
-    async send(_sessionId, text) {
+    async preflightModel() {
+      return { confirm_required: false };
+    },
+    async send(_sessionId, text, options) {
+      const registration = options?.modelRegistration;
+      if (registration) {
+        emitEvent({
+          type: "session.info",
+          session_id: MOCK_SESSION_ID,
+          payload: {
+            model: registration.model,
+            provider: registration.provider,
+            title: "Mock GUI Chat",
+          },
+        });
+      }
       replayUserTurn(schedule, text);
     },
     async setReasoningLevel(_sessionId, level) {
@@ -168,13 +183,17 @@ export function connectMockGuiChat(): GuiChatConnection {
         payload: { status: "interrupted", text: "Mock generation stopped." },
       });
     },
-    async switchModel(_sessionId, provider, model) {
+    async setDefaultModel(_sessionId, registration) {
       emitEvent({
         type: "session.info",
         session_id: MOCK_SESSION_ID,
-        payload: { model, provider, title: "Mock GUI Chat" },
+        payload: {
+          model: registration.model,
+          provider: registration.provider,
+          title: "Mock GUI Chat",
+        },
       });
-      return { confirm_required: false, value: model };
+      return { confirm_required: false, value: registration.model };
     },
   };
 }

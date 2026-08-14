@@ -25,10 +25,11 @@ class FakeConnection implements GuiChatConnection {
   readonly attachImage = vi.fn();
   readonly attachPdf = vi.fn();
   readonly attachFile = vi.fn();
+  readonly preflightModel = vi.fn();
   readonly send = vi.fn();
+  readonly setDefaultModel = vi.fn();
   readonly setReasoningLevel = vi.fn();
   readonly stop = vi.fn();
-  readonly switchModel = vi.fn();
   readonly respondToApproval = vi.fn();
   readonly respondToClarify = vi.fn();
   readonly ping = vi.fn();
