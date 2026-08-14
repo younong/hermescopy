@@ -1042,6 +1042,8 @@ export const en: Translations = {
       role: "Role",
       model: "Model",
       selectModel: "Select model",
+      reasoningEffort: "Reasoning level",
+      reasoningDefault: "Default",
       systemPrompt: "System prompt",
       skills: "Skills",
       noSkills: "No skills available.",

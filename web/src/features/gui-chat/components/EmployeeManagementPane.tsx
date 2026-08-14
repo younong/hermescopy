@@ -17,8 +17,10 @@ import {
   type EmployeeCollaborationPolicy,
   type EmployeeLifecycleStatus,
   type EmployeePolicy,
+  type ReasoningLevel,
   withHermesAssetAuth,
 } from "@/lib/api";
+import { REASONING_LEVEL_LABELS } from "@/lib/reasoning-level";
 import { cn } from "@/lib/utils";
 
 type EmployeeEditor = { mode: "create" } | { mode: "profile"; employee: Employee };
@@ -37,6 +39,8 @@ interface BindingDraft {
 }
 
 type EmployeeText = ReturnType<typeof guiChatTranslations>["employees"];
+
+const EMPLOYEE_SELECT_CLASS = "h-9 w-full min-w-0 rounded-lg border border-[#dfe2e7] bg-white px-3 text-[13px] text-[#2c2f35] outline-none transition focus:border-[#8ca7c5] focus:ring-2 focus:ring-[#dce5ef]";
 
 function lifecycleLabel(status: EmployeeLifecycleStatus, text: EmployeeText) {
   return text.lifecycle[status];
@@ -59,6 +63,7 @@ function emptyPolicy(catalog: EmployeeCatalog | null): EmployeePolicy {
     mcp_servers: [],
     model_registration_id: catalog?.model_registrations[0]?.id ?? "",
     name: "",
+    reasoning_effort: "",
     role: "",
     schema_version: 1,
     skills: [],
@@ -430,6 +435,10 @@ function PolicyEditor({
   policy: EmployeePolicy;
   text: EmployeeText;
 }) {
+  const selectedModel = catalog?.model_registrations.find(
+    (item) => item.id === policy.model_registration_id,
+  );
+  const availableReasoningLevels = selectedModel?.reasoning_levels ?? [];
   return (
     <div className="grid gap-4">
       <Field label={text.avatar}>
@@ -445,7 +454,47 @@ function PolicyEditor({
         <Field label={text.name}><Input value={policy.name ?? ""} onChange={(event) => onChange({ ...policy, name: event.target.value })} /></Field>
         <Field label={text.role}><Input value={policy.role ?? ""} onChange={(event) => onChange({ ...policy, role: event.target.value })} /></Field>
       </div>
-      <Field label={text.model}><select className="h-9 rounded-md border border-[#dfe2e7] bg-white px-3 text-sm" value={policy.model_registration_id} onChange={(event) => onChange({ ...policy, model_registration_id: event.target.value })}><option value="">{text.selectModel}</option>{catalog?.model_registrations.map((item) => <option key={item.id} value={item.id}>{item.model || item.name}</option>)}</select></Field>
+      <div
+        className={cn(
+          "grid gap-3",
+          availableReasoningLevels.length > 0 && "sm:grid-cols-[minmax(0,1fr)_minmax(9rem,0.42fr)]",
+        )}
+        data-employee-model-reasoning-row
+      >
+        <Field label={text.model}>
+          <select
+            className={EMPLOYEE_SELECT_CLASS}
+            onChange={(event) => onChange({
+              ...policy,
+              model_registration_id: event.target.value,
+              reasoning_effort: "",
+            })}
+            value={policy.model_registration_id}
+          >
+            <option value="">{text.selectModel}</option>
+            {catalog?.model_registrations.map((item) => (
+              <option key={item.id} value={item.id}>{item.model || item.name}</option>
+            ))}
+          </select>
+        </Field>
+        {availableReasoningLevels.length > 0 ? (
+          <Field label={text.reasoningEffort}>
+            <select
+              className={EMPLOYEE_SELECT_CLASS}
+              onChange={(event) => onChange({
+                ...policy,
+                reasoning_effort: event.target.value as ReasoningLevel | "",
+              })}
+              value={policy.reasoning_effort ?? ""}
+            >
+              <option value="">{text.reasoningDefault}</option>
+              {availableReasoningLevels.map((level) => (
+                <option key={level} value={level}>{REASONING_LEVEL_LABELS[level]}</option>
+              ))}
+            </select>
+          </Field>
+        ) : null}
+      </div>
       <Field label={text.systemPrompt}><textarea className="min-h-28 rounded-md border border-[#dfe2e7] bg-white p-3 text-sm" value={policy.system_prompt} onChange={(event) => onChange({ ...policy, system_prompt: event.target.value })} /></Field>
       <Field label={text.skills}><NameCheckboxPicker available={catalog?.skills ?? []} emptyLabel={text.noSkills} id="employee-skills" onChange={(skills) => onChange({ ...policy, skills })} selected={policy.skills} /></Field>
       <Field label={text.maxIterations}><Input min={1} onChange={(event) => onChange({ ...policy, max_iterations: Number(event.target.value) || 1 })} type="number" value={policy.max_iterations} /></Field>
