@@ -3891,6 +3891,30 @@ class TestListSessionsRich:
         ).fetchone()) == ("web_group", 1)
         reopened.close()
 
+    def test_v25_adds_durable_collaboration_discussion_tables(self, tmp_path):
+        db_path = tmp_path / "state.db"
+        db = SessionDB(db_path=db_path)
+        db._conn.execute("DROP TABLE collaboration_discussion_rounds")
+        db._conn.execute("DROP TABLE collaboration_discussions")
+        db._conn.execute("UPDATE schema_version SET version=24")
+        db._conn.commit()
+        db.close()
+
+        migrated = SessionDB(db_path=db_path)
+
+        tables = {
+            row[0]
+            for row in migrated._conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'collaboration_discussion%'"
+            ).fetchall()
+        }
+        assert tables == {
+            "collaboration_discussions",
+            "collaboration_discussion_rounds",
+        }
+        assert migrated._conn.execute("SELECT version FROM schema_version").fetchone()[0] == 25
+        migrated.close()
+
     def test_v24_migration_rebuilds_empty_legacy_collaboration_schema(self, tmp_path):
         db_path = tmp_path / "state.db"
         db = SessionDB(db_path=db_path)
@@ -3931,7 +3955,7 @@ class TestListSessionsRich:
         assert "account_id" not in columns
         assert migrated._conn.execute(
             "SELECT version FROM schema_version"
-        ).fetchone()[0] == 24
+        ).fetchone()[0] == 25
         assert migrated._conn.execute("PRAGMA foreign_key_check").fetchall() == []
         migrated.close()
 

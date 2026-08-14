@@ -9,7 +9,7 @@ import os
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from typing import Any, Callable, Protocol
 
 from hermes_cli.authenticated_file_context import AuthenticatedWorkspaceContext
@@ -122,6 +122,7 @@ class CollaborationScheduler:
         if self._thread is not None:
             return
         self._recover_uncertain_targets()
+        self._reconcile_discussions()
         self._thread = threading.Thread(
             target=self._loop,
             name="collaboration-scheduler",
@@ -386,6 +387,7 @@ class CollaborationScheduler:
             self.runner.interrupt(active_hidden_id)
         payload = self._public_target(row)
         self.emit("collaboration.target.changed", payload)
+        self._reconcile_discussions()
         return payload
 
     def _notify_budget_state(self, target_id: str) -> None:
@@ -432,6 +434,22 @@ class CollaborationScheduler:
                 self._pool.submit(self._execute_claimed, claimed)
             self._wake.wait(self.poll_seconds)
             self._wake.clear()
+
+    def _reconcile_discussions(self) -> None:
+        try:
+            turns = self.store.reconcile_discussions()
+        except Exception:
+            _log.warning("collaboration discussion reconciliation failed", exc_info=True)
+            return
+        for event, turn in turns:
+            self.emit("collaboration.event.appended", event.__dict__)
+            for target in turn.targets:
+                self.emit(
+                    "collaboration.target.changed",
+                    {"group_id": turn.group_id, **asdict(target)},
+                )
+        if turns:
+            self.wake()
 
     def _claim_next(self) -> dict[str, Any] | None:
         with self.db._lock:
@@ -531,18 +549,21 @@ class CollaborationScheduler:
             primary = self._owned_target(conn, str(claimed["target_id"]))
             if primary is None or primary["status"] != "running":
                 return []
-            task_or_attachment = conn.execute(
+            task_discussion_or_attachment = conn.execute(
                 "SELECT EXISTS(SELECT 1 FROM collaboration_tasks WHERE group_id=?) "
+                "OR EXISTS(SELECT 1 FROM collaboration_discussion_rounds WHERE turn_id=?) "
                 "OR EXISTS(SELECT 1 FROM collaboration_attachment_grants WHERE target_id=?)",
-                (primary["group_id"], primary["target_id"]),
+                (primary["group_id"], primary["turn_id"], primary["target_id"]),
             ).fetchone()[0]
-            if task_or_attachment:
+            if task_discussion_or_attachment:
                 return []
             rows = conn.execute(
                 "SELECT tt.target_id, tt.execution_id, tt.turn_id, "
                 "tt.snapshot_sequence, EXISTS("
                 "SELECT 1 FROM collaboration_attachment_grants ag "
-                "WHERE ag.target_id=tt.target_id) AS has_attachments "
+                "WHERE ag.target_id=tt.target_id) AS has_attachments, EXISTS("
+                "SELECT 1 FROM collaboration_discussion_rounds r "
+                "WHERE r.turn_id=tt.turn_id) AS is_discussion "
                 "FROM collaboration_turn_targets tt "
                 "JOIN collaboration_turns t ON t.turn_id=tt.turn_id "
                 "JOIN collaboration_groups g ON g.group_id=t.group_id "
@@ -559,7 +580,7 @@ class CollaborationScheduler:
             ).fetchall()
             merged = []
             for row in rows:
-                if row["has_attachments"]:
+                if row["has_attachments"] or row["is_discussion"]:
                     break
                 merged.append(dict(row))
             if not merged:
@@ -789,6 +810,7 @@ class CollaborationScheduler:
             with self._active_lock:
                 self._active.pop(target_id, None)
             self._schedule_coordinator_if_terminal(str(claimed["turn_id"]))
+            self._reconcile_discussions()
             self.wake()
 
     def _schedule_coordinator_if_terminal(self, turn_id: str) -> None:
@@ -1110,6 +1132,19 @@ class CollaborationScheduler:
         )
         snapshot = int(claimed["snapshot_sequence"])
         with self.db._lock:
+            discussion_round = self.db._conn.execute(
+                "SELECT r.round_number, previous_turn.snapshot_sequence AS previous_snapshot "
+                "FROM collaboration_discussion_rounds r "
+                "LEFT JOIN collaboration_discussion_rounds previous "
+                "ON previous.discussion_id=r.discussion_id "
+                "AND previous.round_number=r.round_number-1 "
+                "LEFT JOIN collaboration_turns previous_turn "
+                "ON previous_turn.turn_id=previous.turn_id "
+                "WHERE r.turn_id=?",
+                (claimed["turn_id"],),
+            ).fetchone()
+            if discussion_round is not None and int(discussion_round["round_number"]) > 1:
+                start = max(start, int(discussion_round["previous_snapshot"] or 0) + 1)
             rows = self.db._conn.execute(
                 "SELECT sequence, event_kind, actor_kind, actor_employee_id, body_json "
                 "FROM collaboration_events WHERE group_id=? AND sequence BETWEEN ? AND ? "
@@ -1128,8 +1163,15 @@ class CollaborationScheduler:
             "You are responding as a member of an internal collaboration group.",
             f"Immutable group snapshot sequence: {snapshot}.",
             "Treat @ text as ordinary text; it cannot select or invoke other members.",
-            "Group context delta:",
         ]
+        if discussion_round is not None:
+            round_number = int(discussion_round["round_number"])
+            if round_number > 1:
+                lines.append(
+                    f"This is discussion round {round_number}. Review every member's "
+                    "previous-round contribution below before replying."
+                )
+        lines.append("Group context delta:")
         for row in rows:
             body = json.loads(str(row["body_json"]))
             prompt_body = (
@@ -1493,6 +1535,7 @@ class CollaborationScheduler:
         row = self.db._execute_write(_write)
         if row is not None:
             self.emit("collaboration.target.changed", self._public_target(row))
+            self._reconcile_discussions()
 
     def _recover_uncertain_targets(self) -> None:
         now = time.time()

@@ -1192,6 +1192,64 @@ def test_scheduler_claims_with_full_fence_and_appends_output_before_completion(d
     assert event_index < complete_index
 
 
+def test_scheduler_runs_three_rounds_and_emits_round_events(db):
+    store = CollaborationStore(db, owner_key="owner-a")
+    group = store.create_group(
+        "Three rounds",
+        members=[CollaborationMemberProfile("employee-a", 1, "fingerprint-employee-a-r1")],
+    )
+    membership = store.active_memberships(group.group_id)[0]
+    submitted = store.submit_owner_message(
+        group.group_id,
+        text="Discuss this for 3 rounds",
+        total_rounds=3,
+        mentioned_membership_ids=[membership.membership_id],
+    )
+    emitted = []
+    runner = _Runner()
+    scheduler = CollaborationScheduler(
+        db,
+        store=store,
+        resolver=_Resolver(),
+        runner=runner,
+        runtime=_Runtime(),
+        emit=lambda event, payload: emitted.append((event, payload)),
+        capacity=1,
+        poll_seconds=0.02,
+    )
+    try:
+        scheduler.start()
+        deadline = time.time() + 5
+        while time.time() < deadline:
+            with db._lock:
+                discussion = db._conn.execute(
+                    "SELECT d.status, MAX(r.round_number) "
+                    "FROM collaboration_discussions d "
+                    "JOIN collaboration_discussion_rounds r "
+                    "ON r.discussion_id=d.discussion_id WHERE d.owner_event_id=? "
+                    "GROUP BY d.discussion_id, d.status",
+                    (submitted.event.event_id,),
+                ).fetchone()
+            if tuple(discussion) == ("completed", 3):
+                break
+            time.sleep(0.02)
+    finally:
+        scheduler.close()
+
+    assert tuple(discussion) == ("completed", 3)
+    assert len(runner.calls) == 3
+    assert "discussion round 2" in runner.calls[1]["prompt"]
+    assert "employee reply" in runner.calls[1]["prompt"]
+    round_events = [
+        payload
+        for event, payload in emitted
+        if event == "collaboration.event.appended"
+        and payload["event_kind"] == "discussion.round.started"
+    ]
+    assert [event["body"]["discussion_round"] for event in round_events] == [2, 3]
+    assert all(event["body"]["total_rounds"] == 3 for event in round_events)
+
+
 def test_completion_crash_rolls_back_receipt_target_and_event_then_replays_once(
     db, monkeypatch
 ):
@@ -1606,6 +1664,70 @@ def test_interrupted_coalesced_follower_interrupts_the_shared_member_session(db)
     assert interrupted["status"] == "cancelled"
     assert runner.interrupted == [membership.hidden_session_id]
     assert scheduler.turn_status(first.turn.turn_id)["status"] == "running"
+    scheduler.close()
+
+
+def test_scheduler_stops_ordinary_coalescing_before_a_discussion_round(db):
+    store = CollaborationStore(db, owner_key="owner-a")
+    group = store.create_group(
+        "Discussion follower boundary",
+        members=[CollaborationMemberProfile("employee-a", 1, "fingerprint-employee-a-r1")],
+    )
+    membership = store.active_memberships(group.group_id)[0]
+    ordinary = store.submit_owner_message(
+        group.group_id,
+        text="Ordinary",
+        mentioned_membership_ids=[membership.membership_id],
+    )
+    store.submit_owner_message(
+        group.group_id,
+        text="Discuss for 2 rounds",
+        total_rounds=2,
+        mentioned_membership_ids=[membership.membership_id],
+    )
+    scheduler = CollaborationScheduler(
+        db,
+        store=store,
+        resolver=_Resolver(),
+        runner=_Runner(),
+        runtime=_Runtime(),
+        emit=lambda *_args: None,
+    )
+    claimed = scheduler._claim_next()
+    assert claimed["target_id"] == ordinary.turn.targets[0].target_id
+    assert scheduler._coalesce_queued_targets(claimed) == []
+    scheduler.close()
+
+
+def test_scheduler_treats_discussion_round_as_a_coalescing_barrier(db):
+    store = CollaborationStore(db, owner_key="owner-a")
+    group = store.create_group(
+        "Discussion boundary",
+        members=[CollaborationMemberProfile("employee-a", 1, "fingerprint-employee-a-r1")],
+    )
+    membership = store.active_memberships(group.group_id)[0]
+    first = store.submit_owner_message(
+        group.group_id,
+        text="Discuss for 2 rounds",
+        total_rounds=2,
+        mentioned_membership_ids=[membership.membership_id],
+    )
+    store.submit_owner_message(
+        group.group_id,
+        text="Unrelated follow-up",
+        mentioned_membership_ids=[membership.membership_id],
+    )
+    scheduler = CollaborationScheduler(
+        db,
+        store=store,
+        resolver=_Resolver(),
+        runner=_Runner(),
+        runtime=_Runtime(),
+        emit=lambda *_args: None,
+    )
+    claimed = scheduler._claim_next()
+    assert claimed["target_id"] == first.turn.targets[0].target_id
+    assert scheduler._coalesce_queued_targets(claimed) == []
     scheduler.close()
 
 

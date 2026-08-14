@@ -54,6 +54,9 @@ export interface CollaborationEventBody {
   employee_id?: string;
   membership_id?: string;
   name?: string;
+  discussion_id?: string;
+  discussion_round?: number;
+  total_rounds?: number;
   [key: string]: unknown;
 }
 

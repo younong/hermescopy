@@ -292,6 +292,49 @@ def test_owner_message_without_available_employees_remains_background_context(db
     assert submitted.event.body["mentions"] == []
 
 
+@pytest.mark.parametrize("total_rounds", [1, 3, 10])
+def test_owner_message_persists_structured_round_count(db, total_rounds):
+    store = CollaborationStore(db, owner_key="owner-a")
+    group = store.create_group("Rounds", members=[_member("employee-a")])
+
+    submitted = store.submit_owner_message(
+        group.group_id,
+        text="Discuss this",
+        total_rounds=total_rounds,
+    )
+
+    assert submitted.turn is not None
+    with db._lock:
+        row = db._conn.execute(
+            "SELECT d.total_rounds, MAX(r.round_number) "
+            "FROM collaboration_discussions d "
+            "JOIN collaboration_discussion_rounds r "
+            "ON r.discussion_id=d.discussion_id WHERE d.owner_event_id=? "
+            "GROUP BY d.discussion_id, d.total_rounds",
+            (submitted.event.event_id,),
+        ).fetchone()
+    if total_rounds == 1:
+        assert row is None
+    else:
+        assert tuple(row) == (total_rounds, 1)
+
+
+@pytest.mark.parametrize("total_rounds", [False, 0, 11])
+def test_owner_message_rejects_invalid_structured_round_counts(db, total_rounds):
+    store = CollaborationStore(db, owner_key="owner-a")
+    group = store.create_group("Rounds", members=[_member("employee-a")])
+    before = store.get_group(group.group_id).last_sequence
+
+    with pytest.raises(ValueError, match="round"):
+        store.submit_owner_message(
+            group.group_id,
+            text="Discuss this",
+            total_rounds=total_rounds,
+        )
+
+    assert store.get_group(group.group_id).last_sequence == before
+
+
 def test_mentioned_turn_snapshots_members_and_attachment_grants_atomically(db):
     store = CollaborationStore(db, owner_key="owner-a")
     group = store.create_group(
@@ -365,6 +408,100 @@ def test_mentioned_turn_snapshots_members_and_attachment_grants_atomically(db):
     assert len(page["events"]) == 1
     assert page["has_more"] is False
     assert page["next_after_sequence"] == all_submitted.event.sequence
+
+
+def test_discussion_advancement_is_durable_idempotent_and_copies_first_round(db):
+    store = CollaborationStore(db, owner_key="owner-a")
+    group = store.create_group("Review", members=[_member("employee-a")])
+    membership = store.active_memberships(group.group_id)[0]
+    attachment = store.create_attachment(
+        group.group_id,
+        filename="brief.txt",
+        media_type="text/plain",
+        size_bytes=5,
+        storage_key="groups/review/brief",
+        content_sha256="a" * 64,
+    )
+    first = store.submit_owner_message(
+        group.group_id,
+        text="Review this for 3 rounds",
+        total_rounds=3,
+        mentioned_membership_ids=[membership.membership_id],
+        attachment_ids=[attachment["attachment_id"]],
+    )
+    assert first.turn is not None
+    assert first.event.body["discussion_round"] == 1
+    assert first.event.body["total_rounds"] == 3
+    assert first.event.body["discussion_id"].startswith("cd_")
+    with db._lock:
+        discussion_id = db._conn.execute(
+            "SELECT discussion_id FROM collaboration_discussions WHERE owner_event_id=?",
+            (first.event.event_id,),
+        ).fetchone()[0]
+        db._conn.execute(
+            "UPDATE collaboration_turn_targets SET status='completed' WHERE turn_id=?",
+            (first.turn.turn_id,),
+        )
+        db._conn.execute(
+            "UPDATE collaboration_turns SET status='completed' WHERE turn_id=?",
+            (first.turn.turn_id,),
+        )
+        db._conn.commit()
+
+    advanced = store.advance_discussion(discussion_id)
+    replay = store.advance_discussion(discussion_id)
+
+    assert advanced is not None
+    event, second = advanced
+    assert replay is None
+    assert event.event_kind == "discussion.round.started"
+    assert event.body["discussion_round"] == 2
+    assert second.targets[0].employee_id == "employee-a"
+    with db._lock:
+        rounds = db._conn.execute(
+            "SELECT round_number, turn_id FROM collaboration_discussion_rounds "
+            "WHERE discussion_id=? ORDER BY round_number",
+            (discussion_id,),
+        ).fetchall()
+        grants = db._conn.execute(
+            "SELECT attachment_id FROM collaboration_attachment_grants WHERE target_id=?",
+            (second.targets[0].target_id,),
+        ).fetchall()
+    assert [row[0] for row in rounds] == [1, 2]
+    assert grants[0][0] == attachment["attachment_id"]
+
+
+def test_discussion_stops_when_first_round_member_leaves(db):
+    store = CollaborationStore(db, owner_key="owner-a")
+    group = store.create_group("Review", members=[_member("employee-a")])
+    first = store.submit_owner_message(
+        group.group_id, text="Discuss for 2 rounds", total_rounds=2
+    )
+    assert first.turn is not None
+    store.remove_membership(group.group_id, "employee-a")
+    with db._lock:
+        status = db._conn.execute(
+            "SELECT status FROM collaboration_discussions WHERE owner_event_id=?",
+            (first.event.event_id,),
+        ).fetchone()[0]
+    assert status == "stopped"
+
+
+def test_multi_round_message_requires_an_active_target(db):
+    store = CollaborationStore(db, owner_key="owner-a")
+    group = store.create_group("Empty")
+
+    with pytest.raises(RuntimeError, match="requires an active member"):
+        store.submit_owner_message(
+            group.group_id, text="Discuss this for 2 rounds", total_rounds=2
+        )
+
+    assert store.get_group(group.group_id).last_sequence == 1
+    with db._lock:
+        assert db._conn.execute(
+            "SELECT COUNT(*) FROM collaboration_discussions WHERE group_id=?",
+            (group.group_id,),
+        ).fetchone()[0] == 0
 
 
 def test_message_submission_rolls_back_on_invalid_mention_or_attachment(db):

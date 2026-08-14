@@ -188,7 +188,7 @@ def get_default_db_path() -> Path:
 
 DEFAULT_DB_PATH = get_default_db_path()
 
-SCHEMA_VERSION = 24
+SCHEMA_VERSION = 25
 
 # Cap on user-controlled FTS5 query input before regex/sanitizer processing.
 # Search queries do not need to be arbitrarily large, and bounding them keeps
@@ -949,6 +949,17 @@ CREATE TABLE IF NOT EXISTS collaboration_tasks (
     CHECK(lease_version IS NULL OR lease_version >= 1),
     CHECK(recovery_generation IS NULL OR recovery_generation >= 0)
 );
+CREATE TABLE IF NOT EXISTS collaboration_discussions (
+    discussion_id TEXT PRIMARY KEY,
+    group_id TEXT NOT NULL REFERENCES collaboration_groups(group_id),
+    owner_event_id TEXT NOT NULL UNIQUE REFERENCES collaboration_events(event_id),
+    total_rounds INTEGER NOT NULL CHECK(total_rounds BETWEEN 1 AND 10),
+    status TEXT NOT NULL DEFAULT 'active'
+        CHECK(status IN ('active', 'completed', 'stopped')),
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL,
+    completed_at REAL
+);
 CREATE TABLE IF NOT EXISTS collaboration_turns (
     turn_id TEXT PRIMARY KEY,
     group_id TEXT NOT NULL REFERENCES collaboration_groups(group_id),
@@ -970,6 +981,13 @@ CREATE TABLE IF NOT EXISTS collaboration_turns (
     CHECK(worker_generation IS NULL OR worker_generation >= 1),
     CHECK(lease_version IS NULL OR lease_version >= 1),
     CHECK(recovery_generation IS NULL OR recovery_generation >= 0)
+);
+CREATE TABLE IF NOT EXISTS collaboration_discussion_rounds (
+    discussion_id TEXT NOT NULL REFERENCES collaboration_discussions(discussion_id),
+    round_number INTEGER NOT NULL CHECK(round_number BETWEEN 1 AND 10),
+    turn_id TEXT NOT NULL UNIQUE REFERENCES collaboration_turns(turn_id),
+    created_at REAL NOT NULL,
+    PRIMARY KEY(discussion_id, round_number)
 );
 CREATE TABLE IF NOT EXISTS collaboration_turn_targets (
     target_id TEXT PRIMARY KEY,
@@ -1161,6 +1179,8 @@ CREATE INDEX IF NOT EXISTS idx_collaboration_memberships_group
     ON collaboration_memberships(group_id, join_sequence, leave_sequence);
 CREATE INDEX IF NOT EXISTS idx_collaboration_tasks_group
     ON collaboration_tasks(group_id, status, updated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_collaboration_discussions_due
+    ON collaboration_discussions(status, updated_at);
 CREATE INDEX IF NOT EXISTS idx_collaboration_targets_account
     ON collaboration_turn_targets(employee_id, status, created_at);
 CREATE INDEX IF NOT EXISTS idx_collaboration_delivery_due

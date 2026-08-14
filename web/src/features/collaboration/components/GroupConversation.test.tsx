@@ -87,6 +87,53 @@ describe("GroupConversation owner mentions", () => {
     expect(container.textContent).toContain("@all");
   });
 
+  it("renders persisted discussion round metadata in the conversation stream", () => {
+    const container = renderConversation({
+      ...initialCollaborationState,
+      loading: false,
+      eventsBySequence: {
+        1: {
+          actor_employee_id: null,
+          actor_kind: "owner",
+          actor_membership_id: null,
+          body: {
+            discussion_id: "discussion-a",
+            discussion_round: 1,
+            mention_all: true,
+            mentions: [],
+            text: "Discuss this for 3 rounds",
+            total_rounds: 3,
+          },
+          created_at: 1,
+          event_id: "event-a",
+          event_kind: "message.owner",
+          group_id: "group-a",
+          sequence: 1,
+        },
+        2: {
+          actor_employee_id: null,
+          actor_kind: "system",
+          actor_membership_id: null,
+          body: {
+            discussion_id: "discussion-a",
+            discussion_round: 2,
+            text: "Discussion round 2 of 3",
+            total_rounds: 3,
+          },
+          created_at: 2,
+          event_id: "event-b",
+          event_kind: "discussion.round.started",
+          group_id: "group-a",
+          sequence: 2,
+        },
+      },
+    });
+
+    expect(container.textContent).toContain("Round 1 of 3");
+    expect(container.textContent).toContain("Round 2 of 3");
+    expect(container.textContent).not.toContain("Discussion round 2 of 3");
+  });
+
   it("renders employee avatars within the dashboard base path", () => {
     const container = renderConversation({
       ...initialCollaborationState,

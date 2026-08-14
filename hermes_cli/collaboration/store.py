@@ -287,6 +287,11 @@ class CollaborationStore:
                     (now, now, group_id),
                 )
                 conn.execute(
+                    "UPDATE collaboration_discussions SET status='stopped', updated_at=?, "
+                    "completed_at=? WHERE group_id=? AND status='active'",
+                    (now, now, group_id),
+                )
+                conn.execute(
                     "UPDATE collaboration_groups SET status='archived', archived_at=?, "
                     "updated_at=? WHERE group_id=? AND status='active'",
                     (now, now, group_id),
@@ -346,6 +351,14 @@ class CollaborationStore:
                 "UPDATE collaboration_memberships SET leave_sequence=?, left_at=? "
                 "WHERE membership_id=? AND leave_sequence IS NULL",
                 (event["sequence"], now, row["membership_id"]),
+            )
+            conn.execute(
+                "UPDATE collaboration_discussions SET status='stopped', updated_at=?, "
+                "completed_at=? WHERE group_id=? AND status='active' AND discussion_id IN ("
+                "SELECT r.discussion_id FROM collaboration_discussion_rounds r "
+                "JOIN collaboration_turn_targets tt ON tt.turn_id=r.turn_id "
+                "WHERE r.round_number=1 AND tt.membership_id=?)",
+                (now, now, group_id, row["membership_id"]),
             )
             return dict(
                 conn.execute(
@@ -407,6 +420,14 @@ class CollaborationStore:
                     "UPDATE collaboration_memberships SET leave_sequence=?, left_at=? "
                     "WHERE membership_id=? AND leave_sequence IS NULL",
                     (event["sequence"], now, row["membership_id"]),
+                )
+                conn.execute(
+                    "UPDATE collaboration_discussions SET status='stopped', updated_at=?, "
+                    "completed_at=? WHERE group_id=? AND status='active' AND discussion_id IN ("
+                    "SELECT r.discussion_id FROM collaboration_discussion_rounds r "
+                    "JOIN collaboration_turn_targets tt ON tt.turn_id=r.turn_id "
+                    "WHERE r.round_number=1 AND tt.membership_id=?)",
+                    (now, now, group_id, row["membership_id"]),
                 )
             for employee_id in requested:
                 member = trusted_additions.get(employee_id)
@@ -567,11 +588,14 @@ class CollaborationStore:
         mention_all: bool = False,
         attachment_ids: Iterable[str] = (),
         client_idempotency_key: str | None = None,
+        total_rounds: int = 1,
     ) -> SubmittedOwnerMessage:
         group_id = _identifier(group_id, "group ID")
         text = str(text or "").strip()
         if not text:
             raise ValueError("message text is required")
+        if type(total_rounds) is not int or not 1 <= total_rounds <= 10:
+            raise ValueError("collaboration round count must be between 1 and 10")
         requested = tuple(
             dict.fromkeys(
                 _identifier(value, "membership ID")
@@ -598,6 +622,7 @@ class CollaborationStore:
                     "mentioned_membership_ids": list(requested),
                     "mention_all": bool(mention_all),
                     "attachment_ids": list(requested_attachment_ids),
+                    "total_rounds": total_rounds,
                 },
                 ensure_ascii=False,
                 separators=(",", ":"),
@@ -693,6 +718,9 @@ class CollaborationStore:
             if missing:
                 raise RuntimeError("mentioned collaboration member is unavailable")
             targets = tuple(by_membership[membership_id] for membership_id in target_memberships)
+            if total_rounds > 1 and not targets:
+                raise RuntimeError("multi-round collaboration requires an active member")
+            discussion_id = f"cd_{uuid.uuid4().hex}" if total_rounds > 1 else None
             attachment_rows = []
             for attachment_id in requested_attachment_ids:
                 attachment = conn.execute(
@@ -712,6 +740,15 @@ class CollaborationStore:
                     "text": text,
                     "mentions": list(target_memberships),
                     "mention_all": bool(mention_all),
+                    **(
+                        {
+                            "discussion_id": discussion_id,
+                            "discussion_round": 1,
+                            "total_rounds": total_rounds,
+                        }
+                        if discussion_id is not None
+                        else {}
+                    ),
                 },
                 now=now,
             )
@@ -750,6 +787,20 @@ class CollaborationStore:
                 """,
                 (turn_id, group_id, event.event_id, event.sequence, now, now),
             )
+            if discussion_id is not None:
+                conn.execute(
+                    "INSERT INTO collaboration_discussions "
+                    "(discussion_id, group_id, owner_event_id, total_rounds, "
+                    "status, created_at, updated_at) "
+                    "VALUES (?, ?, ?, ?, 'active', ?, ?)",
+                    (discussion_id, group_id, event.event_id, total_rounds, now, now),
+                )
+                conn.execute(
+                    "INSERT INTO collaboration_discussion_rounds "
+                    "(discussion_id, round_number, turn_id, created_at) "
+                    "VALUES (?, 1, ?, ?)",
+                    (discussion_id, turn_id, now),
+                )
             result_targets = []
             for membership in targets:
                 employee_id = str(membership["employee_id"])
@@ -814,6 +865,182 @@ class CollaborationStore:
             )
 
         return self.db._execute_write(_write)
+
+    def advance_discussion(
+        self, discussion_id: str
+    ) -> tuple[CollaborationEvent, CollaborationTurn] | None:
+        """Idempotently create the next durable ordinary-group discussion round."""
+
+        discussion_id = _identifier(discussion_id, "discussion ID")
+        now = time.time()
+
+        def _write(conn):
+            discussion = conn.execute(
+                "SELECT d.*, g.status AS group_status FROM collaboration_discussions d "
+                "JOIN collaboration_groups g ON g.group_id=d.group_id "
+                "WHERE d.discussion_id=? AND g.owner_key=?",
+                (discussion_id, self.owner_key),
+            ).fetchone()
+            if discussion is None:
+                raise RuntimeError("collaboration discussion is unavailable")
+            current = conn.execute(
+                "SELECT r.round_number, t.* FROM collaboration_discussion_rounds r "
+                "JOIN collaboration_turns t ON t.turn_id=r.turn_id "
+                "WHERE r.discussion_id=? ORDER BY r.round_number DESC LIMIT 1",
+                (discussion_id,),
+            ).fetchone()
+            if current is None:
+                raise RuntimeError("collaboration discussion round is inconsistent")
+            current_round = int(current["round_number"])
+            terminal = {"completed", "partial", "failed", "ambiguous", "cancelled"}
+            if str(current["status"]) not in terminal:
+                return None
+            if str(discussion["status"]) != "active":
+                return None
+            if (
+                str(discussion["group_status"]) != "active"
+                or str(current["status"]) != "completed"
+                or current_round >= int(discussion["total_rounds"])
+            ):
+                status = (
+                    "completed"
+                    if str(current["status"]) == "completed"
+                    and current_round >= int(discussion["total_rounds"])
+                    else "stopped"
+                )
+                conn.execute(
+                    "UPDATE collaboration_discussions SET status=?, updated_at=?, "
+                    "completed_at=? WHERE discussion_id=? AND status='active'",
+                    (status, now, now, discussion_id),
+                )
+                return None
+            next_round = current_round + 1
+            existing = conn.execute(
+                "SELECT t.* FROM collaboration_discussion_rounds r "
+                "JOIN collaboration_turns t ON t.turn_id=r.turn_id "
+                "WHERE r.discussion_id=? AND r.round_number=?",
+                (discussion_id, next_round),
+            ).fetchone()
+            if existing is not None:
+                return None
+            first_targets = conn.execute(
+                "SELECT tt.target_id, tt.employee_id, tt.membership_id, "
+                "tt.join_sequence, m.leave_sequence "
+                "FROM collaboration_discussion_rounds r "
+                "JOIN collaboration_turn_targets tt ON tt.turn_id=r.turn_id "
+                "JOIN collaboration_memberships m ON m.membership_id=tt.membership_id "
+                "WHERE r.discussion_id=? AND r.round_number=1 "
+                "ORDER BY tt.created_at, tt.employee_id",
+                (discussion_id,),
+            ).fetchall()
+            if not first_targets or any(row["leave_sequence"] is not None for row in first_targets):
+                conn.execute(
+                    "UPDATE collaboration_discussions SET status='stopped', updated_at=?, "
+                    "completed_at=? WHERE discussion_id=? AND status='active'",
+                    (now, now, discussion_id),
+                )
+                return None
+            body = {
+                "text": f"Discussion round {next_round} of {discussion['total_rounds']}",
+                "mentions": [str(row["membership_id"]) for row in first_targets],
+                "mention_all": False,
+                "discussion_id": discussion_id,
+                "discussion_round": next_round,
+                "total_rounds": int(discussion["total_rounds"]),
+            }
+            event = self._event(
+                self._append_event(
+                    conn,
+                    group_id=str(discussion["group_id"]),
+                    event_kind="discussion.round.started",
+                    actor_kind="system",
+                    body=body,
+                    now=now,
+                )
+            )
+            turn_id = f"ct_{uuid.uuid4().hex}"
+            conn.execute(
+                "INSERT INTO collaboration_turns "
+                "(turn_id, group_id, event_id, snapshot_sequence, status, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, 'queued', ?, ?)",
+                (turn_id, discussion["group_id"], event.event_id, event.sequence, now, now),
+            )
+            conn.execute(
+                "INSERT INTO collaboration_discussion_rounds "
+                "(discussion_id, round_number, turn_id, created_at) VALUES (?, ?, ?, ?)",
+                (discussion_id, next_round, turn_id, now),
+            )
+            for first in first_targets:
+                target_id = f"ctt_{uuid.uuid4().hex}"
+                conn.execute(
+                    "INSERT INTO collaboration_turn_targets "
+                    "(target_id, execution_id, turn_id, employee_id, membership_id, "
+                    "join_sequence, snapshot_sequence, status, created_at, updated_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?)",
+                    (
+                        target_id,
+                        f"cex_{uuid.uuid4().hex}",
+                        turn_id,
+                        first["employee_id"],
+                        first["membership_id"],
+                        first["join_sequence"],
+                        event.sequence,
+                        now,
+                        now,
+                    ),
+                )
+                grants = conn.execute(
+                    "SELECT attachment_id FROM collaboration_attachment_grants "
+                    "WHERE target_id=? ORDER BY created_at, attachment_id",
+                    (first["target_id"],),
+                ).fetchall()
+                for grant in grants:
+                    conn.execute(
+                        "INSERT INTO collaboration_attachment_grants "
+                        "(grant_id, attachment_id, target_id, granted_sequence, created_at) "
+                        "VALUES (?, ?, ?, ?, ?)",
+                        (
+                            f"cag_{uuid.uuid4().hex}",
+                            grant["attachment_id"],
+                            target_id,
+                            event.sequence,
+                            now,
+                        ),
+                    )
+            conn.execute(
+                "UPDATE collaboration_discussions SET updated_at=? "
+                "WHERE discussion_id=? AND status='active'",
+                (now, discussion_id),
+            )
+            turn = self._turn(
+                conn,
+                dict(conn.execute("SELECT * FROM collaboration_turns WHERE turn_id=?", (turn_id,)).fetchone()),
+            )
+            return event, turn
+
+        return self.db._execute_write(_write)
+
+    def reconcile_discussions(
+        self,
+    ) -> tuple[tuple[CollaborationEvent, CollaborationTurn], ...]:
+        """Advance or terminally settle every due ordinary discussion."""
+
+        with self.db._lock:
+            ids = [
+                str(row["discussion_id"])
+                for row in self.db._conn.execute(
+                    "SELECT discussion_id FROM collaboration_discussions d "
+                    "JOIN collaboration_groups g ON g.group_id=d.group_id "
+                    "WHERE g.owner_key=? AND d.status='active' ORDER BY d.created_at",
+                    (self.owner_key,),
+                ).fetchall()
+            ]
+        created = []
+        for discussion_id in ids:
+            result = self.advance_discussion(discussion_id)
+            if result is not None:
+                created.append(result)
+        return tuple(created)
 
     def create_ai_task(
         self,

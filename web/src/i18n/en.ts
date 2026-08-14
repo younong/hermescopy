@@ -760,6 +760,7 @@ export const en: Translations = {
       formerEmployee: "Former employee",
       internalCollaboration: "Internal collaboration",
       openGroup: "Open group",
+      discussionRound: "Round {round} of {total}",
       you: "You",
       loadingGroup: "Loading group…",
       startConversation: "Start the group conversation",
