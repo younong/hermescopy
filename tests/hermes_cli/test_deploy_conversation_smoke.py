@@ -15,6 +15,7 @@ EXPECTED_CHECKS = {
     "ws_ticket",
     "session_create",
     "config_propagation",
+    "native_image",
     "file_attachment",
     "safe_tool",
     "prompt_stream",
@@ -103,7 +104,23 @@ def test_deterministic_smoke_sets_bounded_owner_worker_drain_timeout(tmp_path):
     assert env["HERMES_OWNER_WORKER_DRAIN_TIMEOUT"] == str(
         module.OWNER_WORKER_DRAIN_TIMEOUT
     )
+    assert env["HERMES_DEPLOYMENT_INFERENCE_SUPPORTS_VISION"] == "true"
     assert module.OWNER_WORKER_DRAIN_TIMEOUT < module.DEFAULT_TIMEOUT
+
+
+def test_deterministic_smoke_keeps_vision_capability_in_deployment_policy(tmp_path):
+    module = _load_smoke_module()
+    home = tmp_path / "home"
+
+    module._write_config(home, "http://127.0.0.1:9", username="user", password="pass")
+    module._write_owner_config(
+        home,
+        owner_key="owner",
+        base_url="http://127.0.0.1:9",
+    )
+
+    assert "supports_vision" not in (home / "config.yaml").read_text()
+    assert "supports_vision" not in (home / "users" / "owner" / "config.yaml").read_text()
 
 
 def test_deterministic_smoke_uses_exact_operator_root(monkeypatch, tmp_path):

@@ -710,6 +710,7 @@ def build_native_content_parts(
     user_text: str,
     image_paths: List[str],
     image_urls: Optional[List[str]] = None,
+    image_path_hints: Optional[List[str]] = None,
 ) -> Tuple[List[Dict[str, Any]], List[str]]:
     """Build an OpenAI-style ``content`` list for a user turn.
 
@@ -749,7 +750,7 @@ def build_native_content_parts(
     attached_paths: List[str] = []
     attached_urls: List[str] = []
 
-    for raw_path in image_paths:
+    for index, raw_path in enumerate(image_paths):
         p = Path(raw_path)
         if not p.exists() or not p.is_file():
             skipped.append(str(raw_path))
@@ -762,7 +763,12 @@ def build_native_content_parts(
             "type": "image_url",
             "image_url": {"url": data_url},
         })
-        attached_paths.append(str(raw_path))
+        hint = (
+            image_path_hints[index]
+            if image_path_hints is not None and index < len(image_path_hints)
+            else raw_path
+        )
+        attached_paths.append(str(hint))
 
     for url in image_urls or []:
         url = (url or "").strip()

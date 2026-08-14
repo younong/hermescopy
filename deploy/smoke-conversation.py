@@ -32,6 +32,7 @@ KIND = "hermes.conversation-smoke"
 MODEL = "hermes-smoke-model"
 PROVIDER = "custom:hermes-smoke"
 ATTACHMENT_MARKER = "attachment-smoke-marker-731"
+IMAGE_MARKER = "image-native-smoke-marker-283"
 SAFE_TOOL_MARKER = "safe-tool-ok-419"
 RESUME_MARKER = "resume-context-marker-587"
 DEFAULT_TIMEOUT = 90.0
@@ -168,11 +169,24 @@ class ModelStub:
         serialized = json.dumps(messages, ensure_ascii=False)
         tool_messages = [item for item in messages if isinstance(item, dict) and item.get("role") == "tool"]
         latest_tool = json.dumps(tool_messages[-1], ensure_ascii=False) if tool_messages else ""
-        latest_user = ""
+        latest_user_content: Any = ""
         for item in reversed(messages):
             if isinstance(item, dict) and item.get("role") == "user":
-                latest_user = json.dumps(item.get("content", ""), ensure_ascii=False)
+                latest_user_content = item.get("content", "")
                 break
+        latest_user = json.dumps(latest_user_content, ensure_ascii=False)
+
+        if "image-native-smoke" in latest_user:
+            has_inline_image = any(
+                isinstance(part, dict)
+                and part.get("type") == "image_url"
+                and isinstance(part.get("image_url"), dict)
+                and str(part["image_url"].get("url") or "").startswith("data:image/")
+                for part in latest_user_content
+            ) if isinstance(latest_user_content, list) else False
+            if not has_inline_image:
+                return self._text_chunks(["image pixels missing"])
+            return self._text_chunks([IMAGE_MARKER])
 
         if "approval-deny" in latest_user:
             if tool_messages and ("BLOCKED" in latest_tool or "denied" in latest_tool.lower()):
@@ -628,6 +642,15 @@ def _dashboard_env(
             "TERMINAL_CWD": str(workspace),
             "HERMES_TUI_TOOLSETS": "terminal",
             "HERMES_OWNER_WORKER_DRAIN_TIMEOUT": str(OWNER_WORKER_DRAIN_TIMEOUT),
+            "HERMES_DEPLOYMENT_INFERENCE_POLICY": (
+                "hermes_cli.deployment_inference:policy_from_control_plane_environment"
+            ),
+            "HERMES_DEPLOYMENT_INFERENCE_PROVIDER": PROVIDER,
+            "HERMES_DEPLOYMENT_INFERENCE_MODEL": MODEL,
+            "HERMES_DEPLOYMENT_INFERENCE_API_MODE": "chat_completions",
+            "HERMES_DEPLOYMENT_INFERENCE_POLICY_ID": "smoke-policy-v1",
+            "HERMES_DEPLOYMENT_INFERENCE_ALLOWED_MODELS": MODEL,
+            "HERMES_DEPLOYMENT_INFERENCE_SUPPORTS_VISION": "true",
             "NO_PROXY": "127.0.0.1,localhost",
             "no_proxy": "127.0.0.1,localhost",
             "TERMINAL_ENV": "local",
@@ -716,6 +739,37 @@ def run_smoke(
         if info.get("model") != MODEL or info.get("provider") != "custom":
             raise SmokeFailure("config_mismatch", "config_propagation", "Custom provider/model did not reach the live agent")
         _record(checks, "config_propagation", stage, model=MODEL, provider=PROVIDER)
+
+        stage = time.monotonic()
+        png = base64.b64decode(
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGNgYGBgAAAABQABpfZFQAAAAABJRU5ErkJggg=="
+        )
+        attached_image = gateway.request(
+            "image.attach_bytes",
+            {
+                "session_id": sid,
+                "filename": "smoke-image.png",
+                "content_base64": base64.b64encode(png).decode("ascii"),
+            },
+        )
+        if not attached_image.get("attached"):
+            raise SmokeFailure(
+                "image_attachment_failed",
+                "native_image",
+                "image.attach_bytes did not stage the image",
+            )
+        gateway.request(
+            "prompt.submit",
+            {"session_id": sid, "text": "image-native-smoke"},
+        )
+        _, image_complete = _wait_complete(gateway, sid)
+        if IMAGE_MARKER not in str(image_complete.get("text") or ""):
+            raise SmokeFailure(
+                "native_image_missing",
+                "native_image",
+                "Uploaded image pixels did not reach the deployment vision route",
+            )
+        _record(checks, "native_image", stage)
 
         stage = time.monotonic()
         data = base64.b64encode(ATTACHMENT_MARKER.encode("utf-8")).decode("ascii")
