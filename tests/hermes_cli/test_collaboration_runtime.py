@@ -198,6 +198,56 @@ def test_agent_tool_contract_rejects_forged_context_and_unknown_arguments():
     }
 
 
+def test_employee_management_tools_require_durable_manager_authority(db):
+    class _ManagementResolver(_Resolver):
+        def __init__(self):
+            super().__init__(may_create=True, invite_quota=None)
+            self.may_manage = True
+
+        def resolve_current(self, employee_id: str) -> ResolvedCollaborationEmployee:
+            resolved = super().resolve_current(employee_id)
+            return ResolvedCollaborationEmployee(
+                member=resolved.member,
+                employee_policy=resolved.employee_policy,
+                may_participate=resolved.may_participate,
+                may_create_groups=resolved.may_create_groups,
+                may_manage_employees=self.may_manage,
+                invite_quota=resolved.invite_quota,
+            )
+
+    resolver = _ManagementResolver()
+    service = CollaborationService(
+        db,
+        owner_key="owner-a",
+        resolver=resolver,
+        emit=lambda *_args: None,
+        ensure_member_session=lambda **_kwargs: None,
+    )
+    context = service.source_agent_context(
+        creator_employee_id="assistant",
+        source_kind="web_direct",
+        source_conversation_id="session-a",
+    )
+
+    assert context.may_manage_employees is True
+    assert [
+        tool["function"]["name"]
+        for tool in tool_definitions(
+            role="source",
+            may_create=True,
+            may_manage_employees=True,
+        )
+    ] == [
+        "create_internal_group",
+        "list_employee_catalog",
+        "create_managed_employee",
+    ]
+
+    resolver.may_manage = False
+    with pytest.raises(RuntimeError, match="not authorized"):
+        service.list_employee_catalog(context=context)
+
+
 def test_source_context_checks_live_creation_authority_and_quota(db):
     resolver = _Resolver(may_create=False)
     service = CollaborationService(
@@ -224,6 +274,104 @@ def test_source_context_checks_live_creation_authority_and_quota(db):
         source_group_id="source-group",
     )
     assert allowed.may_create_authorized is True
+
+
+def test_create_managed_employee_validates_catalog_and_controlled_workspace(
+    db, tmp_path, monkeypatch
+):
+    from hermes_cli.authenticated_file_context import AuthenticatedWorkspaceContext
+    from hermes_cli.channel_identity import ChannelCrypto, ChannelIdentityStore, Keyring
+    from hermes_cli.collaboration import service as service_module
+    from hermes_cli.controlled_roots import RootKind, controlled_roots_for
+    from hermes_cli.dashboard_auth.owner_context import owner_context_from_owner_key
+    from hermes_cli.owner_runtime import ensure_owner_runtime_dirs, owner_worker_runtime_paths
+
+    import hermes_cli.controlled_roots as controlled_roots
+
+    monkeypatch.setattr(controlled_roots.sys, "platform", "linux")
+    monkeypatch.setattr(controlled_roots, "_openat2", lambda *_args: None)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("HERMES_OWNER_SECRET", "owner-secret")
+    owner_home = ensure_owner_runtime_dirs(tmp_path / "users" / "ok1_owner-a")
+    paths = owner_worker_runtime_paths(owner_home=owner_home, worker_generation=1)
+    paths.default_workspace.mkdir(parents=True, exist_ok=True)
+    roots = controlled_roots_for(paths)
+    filesystem = AuthenticatedWorkspaceContext(roots)
+    identity_store = ChannelIdentityStore(
+        ChannelCrypto(
+            lookup=Keyring(keys={1: b"l" * 32}, active_version=1),
+            encryption=Keyring(keys={1: b"e" * 32}, active_version=1),
+        ),
+        tmp_path / "control",
+        global_home=tmp_path,
+    )
+
+    class _ManagementResolver(_Resolver):
+        owner = owner_context_from_owner_key("ok1_owner-a", global_home=tmp_path)
+
+        def _authority_store(self):
+            return identity_store
+
+        def resolve_current(self, employee_id: str) -> ResolvedCollaborationEmployee:
+            resolved = super().resolve_current(employee_id)
+            return ResolvedCollaborationEmployee(
+                member=resolved.member,
+                employee_policy=resolved.employee_policy,
+                may_participate=True,
+                may_create_groups=True,
+                may_manage_employees=True,
+                invite_quota=None,
+            )
+
+    catalog = {
+        "model_registrations": [{"id": "model-a"}],
+        "active_chat": {"registration_id": "model-a"},
+        "toolsets": [{"name": "terminal"}],
+        "skills": [{"name": "research"}],
+        "mcp_servers": ["browser"],
+        "workspace": {"root": "", "default": "default"},
+        "knowledge_roots": [],
+    }
+    monkeypatch.setattr(service_module, "employee_catalog_payload", lambda _home: catalog)
+    resolver = _ManagementResolver(may_create=True, invite_quota=None)
+    service = CollaborationService(
+        db,
+        owner_key="owner-a",
+        resolver=resolver,
+        emit=lambda *_args: None,
+        ensure_member_session=lambda **_kwargs: None,
+        filesystem_context=filesystem,
+    )
+    context = service.source_agent_context(
+        creator_employee_id="assistant",
+        source_kind="web_direct",
+        source_conversation_id="session-a",
+    )
+    policy = {
+        "schema_version": 1,
+        "name": "Researcher",
+        "role": "Analyst",
+        "model_registration_id": "model-a",
+        "system_prompt": "Research carefully.",
+        "toolsets": ["terminal"],
+        "skills": ["research"],
+        "mcp_servers": ["browser"],
+        "workspace_relative_path": "employees/researcher",
+        "knowledge_relative_paths": [],
+        "max_iterations": 20,
+        "max_tokens": None,
+    }
+
+    created = service.create_managed_employee(context=context, policy=policy)
+
+    assert created["employee"]["employee_kind"] == "managed"
+    assert created["employee"]["name"] == "Researcher"
+    assert roots.list_directory(RootKind.WORKSPACE, "default/employees")[0].name == "researcher"
+    with pytest.raises(ValueError, match="unknown or disabled skill"):
+        service.create_managed_employee(
+            context=context,
+            policy={**policy, "skills": ["missing"]},
+        )
 
 
 def test_create_and_later_actions_recheck_live_permission_and_quota(db):

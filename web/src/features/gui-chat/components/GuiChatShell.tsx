@@ -515,8 +515,7 @@ export function GuiChatShell() {
     () => employees.find((employee) => employee.employee_id === selectedEmployeeId) ?? null,
     [employees, selectedEmployeeId],
   );
-  const selectedEmployeeAvailable = selectedEmployee?.lifecycle_status === "active"
-    && selectedEmployee.profile !== null;
+  const selectedEmployeeAvailable = selectedEmployee?.chat_eligible === true;
 
   useEffect(() => {
     if (!contactsOpen) {
@@ -910,7 +909,9 @@ export function GuiChatShell() {
   const conversationTitle = groupId
     ? activeGroup?.name ?? copy.shell.group
     : activeSessionTitle ?? (activeSessionId ? copy.shell.conversation : copy.shell.newChat);
-  const contactTitle = selectedEmployee?.profile?.name ?? copy.shell.contacts;
+  const contactTitle = selectedEmployee?.employee_kind === "builtin_assistant"
+    ? copy.shell.aiAssistant
+    : selectedEmployee?.profile?.name ?? copy.shell.contacts;
   const conversationSurfaceOpen = !workspacePaneOpen || (contactsOpen && selectedEmployeeAvailable);
   const accountLabel = authMe?.display_name || authMe?.email || copy.shell.workspaceAccount;
   const handleLogout = () => {

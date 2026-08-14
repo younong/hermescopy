@@ -9,11 +9,13 @@ import pytest
 
 from hermes_cli.channel_identity import (
     ChannelCrypto,
+    BuiltinEmployeeProtected,
     ChannelIdentityStore,
     EmployeeProfileRevisionConflict,
     FeishuCredentialRevisionConflict,
     Keyring,
     create_employee,
+    ensure_owner_binding,
     list_employees,
     register_employee_feishu_binding,
     resolve_employee,
@@ -70,7 +72,7 @@ def test_fresh_schema_only_contains_generic_employee_tables(store):
         version = conn.execute(
             "SELECT value FROM channel_identity_meta WHERE key='schema_version'"
         ).fetchone()["value"]
-    assert version == "15"
+    assert version == "16"
     assert {
         "employees",
         "employee_profiles",
@@ -156,6 +158,107 @@ def test_v14_upgrade_refuses_nonempty_legacy_employee_tables(
     assert version == "14"
 
 
+def test_builtin_assistant_is_deterministic_self_healing_and_protected(store):
+    owner = _owner("owner-a")
+    canonical_user_id = ensure_owner_binding(store, owner)
+    first = list_employees(store, owner=owner)[0]
+
+    assert first.employee_id.startswith("emp_builtin_")
+    assert first.canonical_user_id == canonical_user_id
+    assert first.employee_kind == "builtin_assistant"
+    assert first.lifecycle_status == "active"
+    assert first.protected is True
+    assert first.chat_eligible is True
+    assert first.profile_revision is None
+    assert first.profile_fingerprint is None
+    assert first.collaboration_policy.may_participate is True
+    assert first.collaboration_policy.may_create_groups is True
+    assert first.collaboration_policy.invite_quota is None
+
+    with store.write() as conn:
+        conn.execute("DROP TRIGGER builtin_assistant_delete_protected")
+        conn.execute("DELETE FROM employees WHERE employee_id=?", (first.employee_id,))
+        ChannelIdentityStore._execute_schema(conn)
+    repaired = list_employees(store, owner=owner)[0]
+    assert repaired.employee_id == first.employee_id
+
+    mutations = (
+        lambda: set_employee_status(
+            store, owner=owner, employee_id=first.employee_id, status="suspended"
+        ),
+        lambda: update_employee_profile(
+            store,
+            owner=owner,
+            employee_id=first.employee_id,
+            profile={"name": "changed"},
+            expected_revision=0,
+        ),
+        lambda: update_employee_collaboration_policy(
+            store,
+            owner=owner,
+            employee_id=first.employee_id,
+            may_participate=False,
+            may_create_groups=False,
+            invite_quota=0,
+        ),
+        lambda: register_employee_feishu_binding(
+            store,
+            owner=owner,
+            employee_id=first.employee_id,
+            provider_account_id="builtin-app",
+            credentials={"app_id": "builtin-app", "app_secret": "secret"},
+        ),
+    )
+    for mutate in mutations:
+        with pytest.raises(BuiltinEmployeeProtected):
+            mutate()
+
+    from hermes_cli.channel_identity.employee_avatars import (
+        delete_employee_avatar,
+        save_employee_avatar,
+    )
+
+    with pytest.raises(BuiltinEmployeeProtected):
+        save_employee_avatar(store, first.employee_id, b"invalid")
+    with pytest.raises(BuiltinEmployeeProtected):
+        delete_employee_avatar(store, first.employee_id)
+
+    with pytest.raises(sqlite3.IntegrityError, match="builtin employee is protected"):
+        with store.write() as conn:
+            conn.execute(
+                "UPDATE employees SET lifecycle_status='suspended' WHERE employee_id=?",
+                (first.employee_id,),
+            )
+    with pytest.raises(sqlite3.IntegrityError, match="builtin employee is protected"):
+        with store.write() as conn:
+            conn.execute("DELETE FROM employees WHERE employee_id=?", (first.employee_id,))
+
+
+def test_v15_upgrade_backfills_builtin_for_existing_owner(
+    tmp_path, crypto, monkeypatch
+):
+    monkeypatch.setenv("HERMES_OWNER_SECRET", "owner-secret")
+    first = ChannelIdentityStore(crypto, tmp_path / "control", global_home=tmp_path)
+    owner = _owner("owner-a")
+    canonical_user_id = ensure_owner_binding(first, owner)
+    with first.write() as conn:
+        conn.execute("DROP TRIGGER builtin_assistant_delete_protected")
+        conn.execute("DROP TRIGGER builtin_assistant_identity_protected")
+        conn.execute("DROP INDEX idx_employees_builtin_assistant_owner")
+        conn.execute("DELETE FROM employees WHERE employee_kind='builtin_assistant'")
+        conn.execute(
+            "UPDATE channel_identity_meta SET value='15' WHERE key='schema_version'"
+        )
+
+    migrated = ChannelIdentityStore(
+        crypto, tmp_path / "control", global_home=tmp_path
+    )
+    employees = list_employees(migrated, owner=owner)
+    assert len(employees) == 1
+    assert employees[0].canonical_user_id == canonical_user_id
+    assert employees[0].employee_kind == "builtin_assistant"
+
+
 def test_employee_crud_profiles_policy_and_owner_security(store):
     owner = _owner("owner-a")
     other = _owner("owner-b")
@@ -166,10 +269,17 @@ def test_employee_crud_profiles_policy_and_owner_security(store):
     assert employee.employee_id.startswith("emp_")
     assert employee.feishu_binding is None
     assert employee.collaboration_policy.employee_id == employee.employee_id
-    assert [item.employee_id for item in list_employees(store, owner=owner)] == [
-        employee.employee_id
-    ]
-    assert list_employees(store, owner=other) == ()
+    employees = list_employees(store, owner=owner)
+    assert {item.employee_kind for item in employees} == {
+        "builtin_assistant",
+        "managed",
+    }
+    assert next(
+        item.employee_id for item in employees if item.employee_kind == "managed"
+    ) == employee.employee_id
+    other_employees = list_employees(store, owner=other)
+    assert len(other_employees) == 1
+    assert other_employees[0].employee_kind == "builtin_assistant"
     with pytest.raises(RuntimeError, match="unavailable"):
         resolve_employee(store, owner=other, employee_id=employee.employee_id)
 
@@ -214,7 +324,7 @@ def test_employee_crud_profiles_policy_and_owner_security(store):
             "SELECT canonical_user_id FROM owner_bindings WHERE owner_key=?",
             (other.owner_key,),
         ).fetchone()
-        assert other_canonical_user_id is None
+        assert other_canonical_user_id is not None
     with pytest.raises(sqlite3.IntegrityError, match="Owner is immutable"):
         with store.write() as conn:
             conn.execute(

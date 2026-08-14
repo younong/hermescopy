@@ -5517,6 +5517,9 @@ def _employee_payload(runtime, store, owner, employee) -> dict[str, Any]:
         }
     return {
         "employee_id": employee.employee_id,
+        "employee_kind": employee.employee_kind,
+        "protected": employee.protected,
+        "chat_eligible": employee.chat_eligible,
         "avatar_url": avatar_url,
         "lifecycle_status": employee.lifecycle_status,
         "profile_revision": profile.revision if profile is not None else None,
@@ -5538,6 +5541,20 @@ def _employee_or_404(store, owner, employee_id: str):
         return resolve_employee(store, owner=owner, employee_id=employee_id)
     except (RuntimeError, ValueError) as exc:
         raise HTTPException(status_code=404, detail="Employee not found") from exc
+
+
+def _reject_builtin_employee_http(employee) -> None:
+    from hermes_cli.channel_identity import (
+        BuiltinEmployeeProtected,
+        reject_builtin_employee_mutation,
+    )
+
+    try:
+        reject_builtin_employee_mutation(employee)
+    except BuiltinEmployeeProtected as exc:
+        raise HTTPException(
+            status_code=409, detail="builtin_employee_protected"
+        ) from exc
 
 
 def _feishu_binding_or_404(
@@ -5625,7 +5642,8 @@ async def get_employee_avatar(request: Request, employee_id: str):
 @app.put("/api/employees/{employee_id}/avatar")
 async def update_employee_avatar(request: Request, employee_id: str):
     _runtime, store, owner = _employee_authority_context(request)
-    _employee_or_404(store, owner, employee_id)
+    employee = _employee_or_404(store, owner, employee_id)
+    _reject_builtin_employee_http(employee)
     from hermes_cli.channel_identity.employee_avatars import (
         MAX_AVATAR_UPLOAD_BYTES,
         EmployeeAvatarInvalid,
@@ -5654,7 +5672,8 @@ async def update_employee_avatar(request: Request, employee_id: str):
 @app.delete("/api/employees/{employee_id}/avatar")
 async def delete_employee_avatar_route(request: Request, employee_id: str):
     _runtime, store, owner = _employee_authority_context(request)
-    _employee_or_404(store, owner, employee_id)
+    employee = _employee_or_404(store, owner, employee_id)
+    _reject_builtin_employee_http(employee)
     from hermes_cli.channel_identity.employee_avatars import delete_employee_avatar
 
     return {"ok": True, "deleted": delete_employee_avatar(store, employee_id)}
@@ -5667,7 +5686,8 @@ async def update_employee_profile_route(
     body: EmployeeProfileUpdate,
 ):
     runtime, store, owner = _employee_authority_context(request)
-    _employee_or_404(store, owner, employee_id)
+    employee = _employee_or_404(store, owner, employee_id)
+    _reject_builtin_employee_http(employee)
     from hermes_cli.channel_identity import EmployeeProfileRevisionConflict, update_employee_profile
     from hermes_cli.employee_policy import normalize_employee_source_policy
 
@@ -5695,7 +5715,8 @@ async def update_employee_collaboration_policy_route(
     body: EmployeeCollaborationPolicyUpdate,
 ):
     runtime, store, owner = _employee_authority_context(request)
-    _employee_or_404(store, owner, employee_id)
+    employee = _employee_or_404(store, owner, employee_id)
+    _reject_builtin_employee_http(employee)
     from hermes_cli.channel_identity import update_employee_collaboration_policy
 
     try:
@@ -5721,7 +5742,8 @@ async def update_employee_lifecycle(
     body: EmployeeLifecycleUpdate,
 ):
     runtime, store, owner = _employee_authority_context(request)
-    _employee_or_404(store, owner, employee_id)
+    employee = _employee_or_404(store, owner, employee_id)
+    _reject_builtin_employee_http(employee)
     from hermes_cli.channel_identity import set_employee_status
 
     status = str(body.status or "").strip().lower()
@@ -5741,7 +5763,8 @@ async def update_employee_lifecycle(
 @app.post("/api/employees/{employee_id}/rollover")
 async def rollover_employee_session_bindings(request: Request, employee_id: str):
     _runtime, store, owner = _employee_authority_context(request)
-    _employee_or_404(store, owner, employee_id)
+    employee = _employee_or_404(store, owner, employee_id)
+    _reject_builtin_employee_http(employee)
     from hermes_cli.channel_identity import rollover_employee_sessions
 
     try:
@@ -5762,7 +5785,8 @@ async def create_employee_feishu_binding(
     body: FeishuBindingCreate,
 ):
     runtime, store, owner = _employee_authority_context(request)
-    _employee_or_404(store, owner, employee_id)
+    employee = _employee_or_404(store, owner, employee_id)
+    _reject_builtin_employee_http(employee)
     from hermes_cli.channel_connectors.feishu import verify_feishu_credentials
     from hermes_cli.channel_identity import register_employee_feishu_binding
 
@@ -5819,6 +5843,8 @@ async def rotate_employee_feishu_binding_credentials(
     body: FeishuBindingCredentialRotate,
 ):
     runtime, store, owner = _employee_authority_context(request)
+    employee = _employee_or_404(store, owner, employee_id)
+    _reject_builtin_employee_http(employee)
     binding = _feishu_binding_or_404(store, owner, employee_id)
     from hermes_cli.channel_connectors.feishu import verify_feishu_credentials
     from hermes_cli.channel_identity import (
@@ -5902,6 +5928,8 @@ async def rotate_employee_feishu_binding_credentials(
 @app.post("/api/employees/{employee_id}/channels/feishu/test")
 async def test_employee_feishu_binding(request: Request, employee_id: str):
     _runtime, store, owner = _employee_authority_context(request)
+    employee = _employee_or_404(store, owner, employee_id)
+    _reject_builtin_employee_http(employee)
     _feishu_binding_or_404(store, owner, employee_id)
     from hermes_cli.channel_connectors.feishu import verify_feishu_credentials
     from hermes_cli.channel_identity import resolve_employee_feishu_credentials
@@ -5923,6 +5951,8 @@ async def update_employee_feishu_binding_lifecycle(
     body: FeishuBindingLifecycleUpdate,
 ):
     runtime, store, owner = _employee_authority_context(request)
+    employee = _employee_or_404(store, owner, employee_id)
+    _reject_builtin_employee_http(employee)
     status = str(body.status or "").strip().lower()
     binding = _feishu_binding_or_404(
         store, owner, employee_id, include_revoked=status == "active"

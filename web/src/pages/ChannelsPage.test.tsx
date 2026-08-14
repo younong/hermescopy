@@ -90,6 +90,9 @@ function employee(
 ): Employee {
   return {
     avatar_url: null,
+    employee_kind: "managed",
+    protected: false,
+    chat_eligible: true,
     channels: {
       feishu: {
         connector_account_id: `account-${employeeId}`,

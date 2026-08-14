@@ -160,7 +160,36 @@ describe("EmployeeContactsPane", () => {
       .not.toBeNull();
   });
 
-  it("renders loading, error retry, empty, and no-match states", async () => {
+  it("renders the built-in assistant without management actions", async () => {
+    const builtin = employee({
+      employee_id: "emp_builtin",
+      employee_kind: "builtin_assistant",
+      protected: true,
+      profile: null,
+    });
+    const profileUpdate = vi.spyOn(api, "updateEmployeeProfile");
+    const lifecycleUpdate = vi.spyOn(api, "updateEmployeeLifecycle");
+    const collaborationUpdate = vi.spyOn(api, "updateEmployeeCollaborationPolicy");
+
+    await renderPane({ employees: [builtin] });
+
+    expect(document.body.textContent).toContain("AI Assistant");
+    expect(document.body.textContent).toContain("Built-in");
+    expect(Array.from(document.querySelectorAll('[role="listitem"] span[aria-hidden]'))
+      .some((avatar) => avatar.textContent === "AI")).toBe(true);
+    await act(async () => buttonNamed("Manage employee: AI Assistant")?.click());
+
+    const dialog = document.querySelector('[role="dialog"]');
+    expect(dialog?.textContent).toContain("managed by Hermes");
+    for (const label of ["Edit profile", "Refresh sessions", "Suspend", "Revoke", "Save permissions", "Connect"]) {
+      expect(Array.from(dialog?.querySelectorAll("button") ?? []).some((button) => button.textContent === label)).toBe(false);
+    }
+    expect(profileUpdate).not.toHaveBeenCalled();
+    expect(lifecycleUpdate).not.toHaveBeenCalled();
+    expect(collaborationUpdate).not.toHaveBeenCalled();
+  });
+
+  it("renders loading, error retry, quiet empty, and no-match states", async () => {
     const onRefresh = vi.fn();
     await renderPane({ loadStatus: "error", onRefresh });
     expect(document.querySelector('[role="alert"]')?.textContent).toContain("Could not load employees");
@@ -177,7 +206,8 @@ describe("EmployeeContactsPane", () => {
     root = null;
     document.body.innerHTML = "";
     await renderPane();
-    expect(document.body.textContent).toContain("No employees yet");
+    expect(document.body.textContent).not.toContain("No employees yet");
+    expect(document.body.textContent).not.toContain("Add employees without connecting");
   });
 
   it("creates an employee and asks the parent to refresh without Feishu credentials", async () => {
@@ -350,13 +380,34 @@ function employee(overrides: {
   avatar_url?: string | null;
   channels?: Employee["channels"];
   employee_id?: string;
+  employee_kind?: Employee["employee_kind"];
   lifecycle_status?: Employee["lifecycle_status"];
   name?: string;
+  profile?: Employee["profile"];
+  protected?: boolean;
   role?: string;
 } = {}): Employee {
+  const profile = "profile" in overrides ? overrides.profile : {
+    knowledge_relative_paths: [],
+    max_iterations: 20,
+    max_tokens: null,
+    mcp_servers: [],
+    model_registration_id: "model-a",
+    name: overrides.name ?? "Researcher",
+    reasoning_effort: "high" as const,
+    role: overrides.role ?? "Analyst",
+    schema_version: 1 as const,
+    skills: [],
+    system_prompt: "Research carefully.",
+    toolsets: ["terminal"],
+    workspace_relative_path: "employees/researcher",
+  };
   return {
     avatar_url: overrides.avatar_url ?? null,
     channels: overrides.channels ?? {},
+    chat_eligible: (overrides.lifecycle_status ?? "active") === "active",
+    employee_kind: overrides.employee_kind ?? "managed",
+    protected: overrides.protected ?? false,
     collaboration_policy: {
       invite_quota: 5,
       may_create_groups: false,
@@ -364,22 +415,8 @@ function employee(overrides: {
     },
     employee_id: overrides.employee_id ?? "employee-a",
     lifecycle_status: overrides.lifecycle_status ?? "active",
-    profile: {
-      knowledge_relative_paths: [],
-      max_iterations: 20,
-      max_tokens: null,
-      mcp_servers: [],
-      model_registration_id: "model-a",
-      name: overrides.name ?? "Researcher",
-      reasoning_effort: "high",
-      role: overrides.role ?? "Analyst",
-      schema_version: 1,
-      skills: [],
-      system_prompt: "Research carefully.",
-      toolsets: ["terminal"],
-      workspace_relative_path: "employees/researcher",
-    },
-    profile_fingerprint: "sha256:test",
-    profile_revision: 1,
+    profile,
+    profile_fingerprint: profile ? "sha256:test" : null,
+    profile_revision: profile ? 1 : null,
   };
 }

@@ -7,6 +7,8 @@ import json
 from typing import Any
 
 _CREATE = "create_internal_group"
+_LIST_CATALOG = "list_employee_catalog"
+_CREATE_EMPLOYEE = "create_managed_employee"
 _DISPATCH = "dispatch_internal_group_round"
 _FINISH = "finish_internal_group_task"
 
@@ -51,6 +53,79 @@ _TOOL_DEFINITIONS = (
                     "origin_attachment_ids",
                     "first_round_target_employee_ids",
                     "idempotency_key",
+                ],
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": _LIST_CATALOG,
+            "description": (
+                "List the Owner's live employee catalog, including current employees, "
+                "active Chat model, and selectable models, skills, toolsets, and MCP servers."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {},
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": _CREATE_EMPLOYEE,
+            "description": (
+                "Create a managed employee from a complete policy validated against the live "
+                "Owner catalog. Call list_employee_catalog immediately before using this tool."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "schema_version": {"type": "integer", "const": 1},
+                    "name": {"type": "string", "minLength": 1},
+                    "role": {"type": "string", "minLength": 1},
+                    "model_registration_id": {"type": "string", "minLength": 1},
+                    "system_prompt": {"type": "string", "minLength": 1},
+                    "toolsets": {
+                        "type": "array",
+                        "items": {"type": "string", "minLength": 1},
+                        "uniqueItems": True,
+                    },
+                    "skills": {
+                        "type": "array",
+                        "items": {"type": "string", "minLength": 1},
+                        "uniqueItems": True,
+                    },
+                    "mcp_servers": {
+                        "type": "array",
+                        "items": {"type": "string", "minLength": 1},
+                        "uniqueItems": True,
+                    },
+                    "workspace_relative_path": {"type": "string", "minLength": 1},
+                    "knowledge_relative_paths": {
+                        "type": "array",
+                        "items": {"type": "string", "minLength": 1},
+                        "uniqueItems": True,
+                    },
+                    "max_iterations": {"type": "integer", "minimum": 1},
+                    "max_tokens": {"type": ["integer", "null"], "minimum": 1},
+                },
+                "required": [
+                    "schema_version",
+                    "name",
+                    "role",
+                    "model_registration_id",
+                    "system_prompt",
+                    "toolsets",
+                    "skills",
+                    "mcp_servers",
+                    "workspace_relative_path",
+                    "knowledge_relative_paths",
+                    "max_iterations",
+                    "max_tokens",
                 ],
                 "additionalProperties": False,
             },
@@ -124,6 +199,23 @@ _ALLOWED_ARGS = {
             "idempotency_key",
         }
     ),
+    _LIST_CATALOG: frozenset(),
+    _CREATE_EMPLOYEE: frozenset(
+        {
+            "schema_version",
+            "name",
+            "role",
+            "model_registration_id",
+            "system_prompt",
+            "toolsets",
+            "skills",
+            "mcp_servers",
+            "workspace_relative_path",
+            "knowledge_relative_paths",
+            "max_iterations",
+            "max_tokens",
+        }
+    ),
     _DISPATCH: frozenset(
         {"instruction", "target_employee_ids", "attachment_ids", "idempotency_key"}
     ),
@@ -152,6 +244,7 @@ class CollaborationAgentContext:
     task_id: str | None = None
     role: str = "source"
     may_create_authorized: bool = False
+    may_manage_employees: bool = False
 
     def same_agent_identity(self, other: object) -> bool:
         """Compare immutable identity and authority for one persistent Agent."""
@@ -165,10 +258,14 @@ class CollaborationAgentContext:
         )
 
 
-def tool_definitions(*, role: str, may_create: bool = False) -> list[dict[str, Any]]:
+def tool_definitions(
+    *, role: str, may_create: bool = False, may_manage_employees: bool = False
+) -> list[dict[str, Any]]:
     """Return detached schemas for one trusted collaboration execution role."""
     if role == "source":
         allowed = {_CREATE} if may_create else set()
+        if may_manage_employees:
+            allowed.update({_LIST_CATALOG, _CREATE_EMPLOYEE})
     elif role == "coordinator":
         allowed = {_DISPATCH, _FINISH}
     elif role == "member":
@@ -195,7 +292,14 @@ def invoke(
     if not isinstance(function_args, dict) or set(function_args) != _ALLOWED_ARGS[function_name]:
         return _error("collaboration tool arguments are invalid")
     try:
-        if function_name == _CREATE:
+        if function_name == _LIST_CATALOG:
+            result = context.service.list_employee_catalog(context=context)
+        elif function_name == _CREATE_EMPLOYEE:
+            result = context.service.create_managed_employee(
+                context=context,
+                policy=dict(function_args),
+            )
+        elif function_name == _CREATE:
             result = context.service.create_internal_group(
                 context=context,
                 title=_required_text(function_args["title"], "title"),

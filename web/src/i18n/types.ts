@@ -461,6 +461,10 @@ export interface GuiChatTranslations {
     listLabel: string;
     manageNamed: string;
     unnamed: string;
+    aiAssistant: string;
+    builtin: string;
+    builtinDescription: string;
+    builtinManaged: string;
     manageDescription: string;
     addTitle: string;
     editTitle: string;

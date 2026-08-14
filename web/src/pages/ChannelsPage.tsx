@@ -117,7 +117,10 @@ export default function ChannelsPage() {
     [displayedPlatforms],
   );
   const feishuBindings = useMemo(
-    () => employees.map((employee) => employee.channels.feishu).filter(Boolean),
+    () => employees
+      .filter((employee) => !employee.protected)
+      .map((employee) => employee.channels.feishu)
+      .filter(Boolean),
     [employees],
   );
 

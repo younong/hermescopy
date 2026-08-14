@@ -10,7 +10,14 @@ from typing import Any, Callable, Protocol
 
 from hermes_cli.attachment_uploads import validate_upload
 from hermes_cli.authenticated_file_context import AuthenticatedWorkspaceContext
+from hermes_cli.channel_identity import (
+    create_employee,
+    list_employees,
+    resolve_employee_profile,
+)
 from hermes_cli.controlled_roots import RootKind
+from hermes_cli.employee_catalog import employee_catalog_payload
+from hermes_cli.employee_policy import normalize_employee_source_policy
 from hermes_state import SessionDB
 
 from .agent_tools import CollaborationAgentContext
@@ -323,7 +330,65 @@ class CollaborationService:
             ),
             role="source",
             may_create_authorized=bool(creator.may_create_groups),
+            may_manage_employees=bool(creator.may_manage_employees),
         )
+
+    def list_employee_catalog(
+        self, *, context: CollaborationAgentContext
+    ) -> dict[str, Any]:
+        """Return the live Owner catalog after rechecking built-in authority."""
+        self._require_employee_manager(context)
+        catalog = employee_catalog_payload(self.resolver.owner.host_owner_home)
+        catalog["employees"] = [
+            {
+                "employee_id": item.employee_id,
+                "employee_kind": item.employee_kind,
+                "lifecycle_status": item.lifecycle_status,
+                "name": self._employee_display_name(item.employee_id),
+            }
+            for item in list_employees(
+                self.resolver._authority_store(), owner=self.resolver.owner
+            )
+        ]
+        return {"catalog": catalog}
+
+    def create_managed_employee(
+        self,
+        *,
+        context: CollaborationAgentContext,
+        policy: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Create one catalog-validated employee through controlled Owner APIs."""
+        self._require_employee_manager(context)
+        if not isinstance(policy, dict):
+            raise ValueError("employee policy must be an object")
+        normalized = normalize_employee_source_policy(policy)
+        catalog = employee_catalog_payload(self.resolver.owner.host_owner_home)
+        self._validate_employee_policy_catalog(normalized, catalog)
+        filesystem = self.filesystem_context
+        if not isinstance(filesystem, AuthenticatedWorkspaceContext):
+            raise RuntimeError("authenticated employee workspace is unavailable")
+        controlled_workspace = filesystem.controlled_workspace_path(
+            normalized["workspace_relative_path"]
+        )
+        filesystem.roots.mkdirs(RootKind.WORKSPACE, controlled_workspace)
+        employee = create_employee(
+            self.resolver._authority_store(),
+            owner=self.resolver.owner,
+            profile=normalized,
+        )
+        return {
+            "employee": {
+                "employee_id": employee.employee_id,
+                "employee_kind": employee.employee_kind,
+                "lifecycle_status": employee.lifecycle_status,
+                "name": str(normalized.get("name") or ""),
+                "role": str(normalized.get("role") or ""),
+                "profile_revision": employee.profile_revision,
+                "profile_fingerprint": employee.profile_fingerprint,
+                "workspace_relative_path": normalized["workspace_relative_path"],
+            }
+        }
 
     def create_internal_group(
         self,
@@ -524,6 +589,52 @@ class CollaborationService:
             raise RuntimeError("trusted collaboration context is required")
         if context.role != role:
             raise RuntimeError("collaboration tool is unavailable in this context")
+
+    def _require_employee_manager(self, context: CollaborationAgentContext):
+        self._require_bound_context(context, role="source")
+        if int(context.source_depth) != 0 or context.source_task_id is not None:
+            raise RuntimeError("employee management is unavailable in this context")
+        resolved = self.resolver.resolve_current(context.creator_employee_id)
+        if not resolved.may_manage_employees:
+            raise RuntimeError("employee management is not authorized")
+        return resolved
+
+    @staticmethod
+    def _validate_employee_policy_catalog(
+        policy: dict[str, Any], catalog: dict[str, Any]
+    ) -> None:
+        chat_ids = {
+            str(item.get("id") or item.get("registration_id") or "")
+            for item in catalog.get("model_registrations", [])
+        }
+        toolsets = {str(item.get("name") or "") for item in catalog.get("toolsets", [])}
+        skills = {str(item.get("name") or "") for item in catalog.get("skills", [])}
+        mcp_servers = {str(item) for item in catalog.get("mcp_servers", [])}
+        if policy["model_registration_id"] not in chat_ids:
+            raise ValueError("model registration is unavailable")
+        unknown_toolsets = sorted(set(policy["toolsets"]) - toolsets)
+        if unknown_toolsets:
+            raise ValueError(f"unknown or disabled toolset: {unknown_toolsets[0]}")
+        unknown_skills = sorted(set(policy["skills"]) - skills)
+        if unknown_skills:
+            raise ValueError(f"unknown or disabled skill: {unknown_skills[0]}")
+        unknown_mcp = sorted(set(policy["mcp_servers"]) - mcp_servers)
+        if unknown_mcp:
+            raise ValueError(f"unknown or disabled MCP server: {unknown_mcp[0]}")
+
+    def _employee_display_name(self, employee_id: str) -> str:
+        try:
+            resolved = self.resolver.resolve_current(employee_id)
+            if resolved.may_manage_employees:
+                return "AI Assistant"
+            current = resolve_employee_profile(
+                self.resolver._authority_store(),
+                owner=self.resolver.owner,
+                employee_id=employee_id,
+            )
+            return str(current.profile.get("name") or "")
+        except (RuntimeError, ValueError):
+            return ""
 
     @staticmethod
     def _require_task_creator(task: dict[str, Any], context: CollaborationAgentContext) -> None:
