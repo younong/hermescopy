@@ -9,7 +9,7 @@ import { getHermesBrowserId } from "@/lib/browserIdentity";
 import type { GuiFrameQueueDiagnostic } from "@/lib/chatDiagnostics";
 import { createCollaborationApi, type CollaborationApi } from "@/features/collaboration/api";
 import { base64FromDataUrl, compressImageForUpload, readFileAsDataUrl } from "./attachments";
-import type { ReasoningLevel } from "@/lib/api";
+import type { ModelRegistration, ReasoningLevel } from "@/lib/api";
 import type {
   SessionAttachResponse,
   SessionCreateResponse,
@@ -96,6 +96,11 @@ export interface GuiChatModelSwitchResponse {
   warning?: string;
 }
 
+export type GuiChatModelRegistration = Pick<
+  ModelRegistration,
+  "id" | "model" | "provider"
+>;
+
 export interface GuiChatConnection {
   client: GuiChatEventSource;
   collaboration: CollaborationApi;
@@ -112,14 +117,24 @@ export interface GuiChatConnection {
   attachImage(sessionId: string, file: File): Promise<ImageAttachResponse>;
   attachPdf(sessionId: string, file: File): Promise<PdfAttachResponse>;
   attachFile(sessionId: string, file: File): Promise<FileAttachResponse>;
-  send(sessionId: string, text: string): Promise<void>;
-  stop(sessionId: string): Promise<void>;
-  switchModel(
+  preflightModel(
     sessionId: string,
-    provider: string,
-    model: string,
-    confirmExpensiveModel?: boolean,
-    persistGlobally?: boolean,
+    registration: GuiChatModelRegistration,
+    options?: { confirmExpensiveModel?: boolean },
+  ): Promise<GuiChatModelSwitchResponse>;
+  send(
+    sessionId: string,
+    text: string,
+    options?: {
+      confirmExpensiveModel?: boolean;
+      modelRegistration?: GuiChatModelRegistration;
+    },
+  ): Promise<void>;
+  stop(sessionId: string): Promise<void>;
+  setDefaultModel(
+    sessionId: string,
+    registration: GuiChatModelRegistration,
+    options?: { confirmExpensiveModel?: boolean },
   ): Promise<GuiChatModelSwitchResponse>;
   setReasoningLevel(sessionId: string, level: ReasoningLevel): Promise<{ value?: string }>;
   respondToApproval(sessionId: string, request: unknown, approved: boolean): Promise<void>;
@@ -333,8 +348,28 @@ export function connectGuiChat(options: ConnectGuiChatOptions): GuiChatConnectio
         session_id: sessionId,
       });
     },
-    send: async (sessionId, text) => {
-      await client.request("prompt.submit", { session_id: sessionId, text });
+    preflightModel: (sessionId, registration, options) =>
+      client.request<GuiChatModelSwitchResponse>("prompt.model_preflight", {
+        confirm_expensive_model: options?.confirmExpensiveModel ?? false,
+        model: registration.model,
+        provider: registration.provider,
+        registration_id: registration.id,
+        session_id: sessionId,
+      }),
+    send: async (sessionId, text, options) => {
+      const registration = options?.modelRegistration;
+      await client.request("prompt.submit", {
+        ...(registration
+          ? {
+              confirm_expensive_model: options?.confirmExpensiveModel ?? false,
+              model: registration.model,
+              provider: registration.provider,
+              registration_id: registration.id,
+            }
+          : {}),
+        session_id: sessionId,
+        text,
+      });
     },
     stop: async (sessionId) => {
       await client.request("session.interrupt", { session_id: sessionId }, 30_000);
@@ -345,18 +380,13 @@ export function connectGuiChat(options: ConnectGuiChatOptions): GuiChatConnectio
         session_id: sessionId,
         value: level,
       }),
-    switchModel: (
-      sessionId,
-      provider,
-      model,
-      confirmExpensiveModel = false,
-      persistGlobally = false,
-    ) =>
+    setDefaultModel: (sessionId, registration, options) =>
       client.request<GuiChatModelSwitchResponse>("config.set", {
-        confirm_expensive_model: confirmExpensiveModel,
+        confirm_expensive_model: options?.confirmExpensiveModel ?? false,
         key: "model",
+        registration_id: registration.id,
         session_id: sessionId,
-        value: `${model} --provider ${provider} ${persistGlobally ? "--global" : "--session"}`,
+        value: `${registration.model} --provider ${registration.provider} --global`,
       }),
   };
 }

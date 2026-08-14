@@ -103,6 +103,7 @@ vi.mock("./Composer", () => ({
       <span data-composer-reused-file>
         {(props.attachmentToQueue as { file?: File } | undefined)?.file?.name}
       </span>
+      <div data-composer-model-picker>{props.modelPicker as ReactNode}</div>
       <button
         data-composer-ack-reused-file
         onClick={() => {
@@ -722,6 +723,98 @@ describe("GuiChatShell", () => {
     expect(document.querySelector("[data-composer-send]")).toBeNull();
     expect(Array.from(document.querySelectorAll<HTMLButtonElement>('button[aria-current="page"]'))
       .some((button) => button.textContent?.includes("Models"))).toBe(true);
+  });
+
+  it("submits only the final local model selection and keeps it selected", async () => {
+    const connection = createConnection();
+    mocks.getAuthMe.mockResolvedValue(authIdentity());
+    mocks.connectGuiChat.mockReturnValue(connection);
+
+    await renderShell(<GuiChatShell />);
+    await act(async () => {
+      connection.emitState("open");
+      await Promise.resolve();
+    });
+
+    const trigger = document.querySelector<HTMLButtonElement>(
+      'button[aria-label="Switch chat model"]',
+    );
+    await act(async () => {
+      trigger?.click();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    const nextOption = Array.from(
+      document.querySelectorAll<HTMLButtonElement>('[role="option"]'),
+    ).find((button) => button.textContent?.includes("next-model"));
+    await act(async () => nextOption?.click());
+    expect(connection.preflightModel).not.toHaveBeenCalled();
+    expect(connection.send).not.toHaveBeenCalled();
+
+    await act(async () => {
+      document.querySelector<HTMLButtonElement>("[data-composer-send]")?.click();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    const registration = {
+      id: "chat-b",
+      model: "next-model",
+      provider: "next-provider",
+    };
+    expect(connection.preflightModel).toHaveBeenCalledWith("runtime-a", registration);
+    expect(connection.send).toHaveBeenCalledWith(
+      "runtime-a",
+      "new message",
+      { confirmExpensiveModel: false, modelRegistration: registration },
+    );
+    expect(document.querySelector('[data-message-text]')?.textContent).toContain("new message");
+    expect(document.querySelector('[aria-label="Switch chat model"]')?.textContent)
+      .toContain("next-model");
+  });
+
+  it("cancels an expensive-model send without appending a user message", async () => {
+    const connection = createConnection();
+    vi.mocked(connection.preflightModel).mockResolvedValue({
+      confirm_message: "High price",
+      confirm_required: true,
+      value: "next-model",
+    });
+    mocks.getAuthMe.mockResolvedValue(authIdentity());
+    mocks.connectGuiChat.mockReturnValue(connection);
+
+    await renderShell(<GuiChatShell />);
+    await act(async () => {
+      connection.emitState("open");
+      await Promise.resolve();
+    });
+    await act(async () => {
+      document.querySelector<HTMLButtonElement>('button[aria-label="Switch chat model"]')?.click();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    await act(async () => {
+      Array.from(document.querySelectorAll<HTMLButtonElement>('[role="option"]'))
+        .find((button) => button.textContent?.includes("next-model"))
+        ?.click();
+      await Promise.resolve();
+    });
+    await act(async () => {
+      document.querySelector<HTMLButtonElement>("[data-composer-send]")?.click();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(document.body.textContent).toContain("High price");
+
+    await act(async () => {
+      Array.from(document.querySelectorAll<HTMLButtonElement>('button'))
+        .find((button) => button.textContent?.trim() === "Cancel")
+        ?.click();
+      await Promise.resolve();
+    });
+
+    expect(connection.send).not.toHaveBeenCalled();
+    expect(document.querySelector('[data-message-text]')?.textContent).not.toContain("new message");
   });
 
   it("updates the displayed provider from session info after switching", async () => {
@@ -1428,7 +1521,7 @@ type TestGuiChatConnection = GuiChatConnection & {
   createOrAttachMock: ReturnType<typeof vi.fn<GuiChatConnection["createOrAttach"]>>;
   emitEvent(event: Parameters<Parameters<GuiChatConnection["client"]["onEvent"]>[0]>[0]): void;
   emitState(state: ConnectionState): void;
-  switchModel: ReturnType<typeof vi.fn<GuiChatConnection["switchModel"]>>;
+  setDefaultModel: ReturnType<typeof vi.fn<GuiChatConnection["setDefaultModel"]>>;
 };
 
 function createConnection(): TestGuiChatConnection {
@@ -1485,10 +1578,11 @@ function createConnection(): TestGuiChatConnection {
     reportFrameQueueDiagnostic: vi.fn(),
     respondToApproval: vi.fn().mockResolvedValue(undefined),
     respondToClarify: vi.fn().mockResolvedValue(undefined),
+    preflightModel: vi.fn().mockResolvedValue({ confirm_required: false }),
     send: vi.fn().mockResolvedValue(undefined),
+    setDefaultModel: vi.fn().mockResolvedValue({ confirm_required: false, value: "next-model" }),
     setReasoningLevel: vi.fn().mockResolvedValue({ value: "max" }),
     stop: vi.fn(),
-    switchModel: vi.fn().mockResolvedValue({ confirm_required: false, value: "next-model" }),
   };
   return connection;
 }

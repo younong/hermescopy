@@ -18,6 +18,7 @@ beforeEach(() => {
     .IS_REACT_ACT_ENVIRONMENT = true;
   vi.spyOn(URL, "createObjectURL").mockReturnValue("blob:preview");
   vi.spyOn(URL, "revokeObjectURL").mockImplementation(() => undefined);
+  localStorage.setItem("hermes-locale", "en");
   document.body.innerHTML = "";
 });
 
@@ -143,6 +144,34 @@ describe("Composer attachment transfers", () => {
     expect(onSend).toHaveBeenCalledOnce();
     expect(onSend.mock.calls[0]?.[0]).toBe("Use the default");
     expect(container.querySelector('button[aria-label="Stop generating"]')).not.toBeNull();
+  });
+
+  it("preserves the draft and attachments when a send is not accepted", async () => {
+    const onSend = vi.fn().mockResolvedValue(false);
+    const container = renderComposer({ onSend });
+    const textarea = getTextarea(container);
+    const file = new File(["draft"], "draft.txt", { type: "text/plain" });
+
+    await act(async () => {
+      const valueSetter = Object.getOwnPropertyDescriptor(
+        HTMLTextAreaElement.prototype,
+        "value",
+      )?.set;
+      valueSetter?.call(textarea, "Keep this draft");
+      textarea.dispatchEvent(new Event("input", { bubbles: true }));
+    });
+    await dispatch(
+      getDropTarget(container),
+      transferEvent("drop", transfer([file])),
+    );
+    await dispatch(
+      container.querySelector<HTMLButtonElement>('button[aria-label="Send message"]'),
+      new MouseEvent("click", { bubbles: true, cancelable: true }),
+    );
+
+    expect(onSend).toHaveBeenCalledOnce();
+    expect(textarea.value).toBe("Keep this draft");
+    expect(container.querySelector('[title="draft.txt"]')).not.toBeNull();
   });
 
   it("does not accept new drops while a message is submitting", async () => {
@@ -301,9 +330,7 @@ function renderComposer({
 }
 
 function getTextarea(container: HTMLElement): HTMLTextAreaElement {
-  const textarea = container.querySelector<HTMLTextAreaElement>(
-    'textarea[aria-label="GUI chat message"]',
-  );
+  const textarea = container.querySelector<HTMLTextAreaElement>("textarea");
   if (!textarea) throw new Error("Composer textarea not found");
   return textarea;
 }

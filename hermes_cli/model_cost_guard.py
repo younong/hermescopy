@@ -61,6 +61,7 @@ def expensive_model_warning(
     base_url: Optional[str] = None,
     api_key: Optional[str] = None,
     model_info: Optional[ModelInfo] = None,
+    allow_network: bool = True,
 ) -> Optional[ExpensiveModelWarning]:
     """Return a warning payload when known pricing exceeds safety thresholds.
 
@@ -77,7 +78,7 @@ def expensive_model_warning(
             from agent.models_dev import get_model_info
 
             input_cost, output_cost, source = _pricing_from_model_info(
-                get_model_info(provider, model)
+                get_model_info(provider, model, allow_network=allow_network)
             )
         except Exception:
             pass
@@ -90,6 +91,7 @@ def expensive_model_warning(
                 provider=provider,
                 base_url=base_url,
                 api_key=api_key,
+                allow_network=allow_network,
             )
         except Exception:
             entry = None

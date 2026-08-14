@@ -37,10 +37,10 @@ interface GuiChatModelsPaneProps {
   currentModel?: string;
   currentProvider?: string;
   onActivateCode?: (registration: ModelRegistration) => Promise<void>;
-  onSwitchChat(
+  onSelectChat(registration: ModelRegistration): void;
+  onSetDefaultChat(
     registration: ModelRegistration,
     confirmExpensiveModel?: boolean,
-    persistGlobally?: boolean,
   ): Promise<GuiChatModelSwitchResponse>;
 }
 
@@ -59,7 +59,6 @@ interface RegistrationFormState {
 
 interface PendingChatSwitch {
   message: string;
-  persistGlobally: boolean;
   registration: ModelRegistration;
 }
 
@@ -124,7 +123,8 @@ export function GuiChatModelsPane({
   currentModel,
   currentProvider,
   onActivateCode,
-  onSwitchChat,
+  onSelectChat,
+  onSetDefaultChat,
 }: GuiChatModelsPaneProps) {
   const { t } = useI18n();
   const text = guiChatTranslations(t).models;
@@ -326,24 +326,24 @@ export function GuiChatModelsPane({
     }
   };
 
-  const applyChat = async (
+  const selectChat = (registration: ModelRegistration) => {
+    if (!canSwitchChat) return;
+    setError(null);
+    onSelectChat(registration);
+  };
+
+  const setDefaultChat = async (
     registration: ModelRegistration,
-    persistGlobally: boolean,
     confirmExpensiveModel = false,
   ) => {
     if (workingId || busy || !canSwitchChat) return;
     setWorkingId(registration.id);
     setError(null);
     try {
-      const result = await onSwitchChat(
-        registration,
-        confirmExpensiveModel,
-        persistGlobally,
-      );
+      const result = await onSetDefaultChat(registration, confirmExpensiveModel);
       if (result.confirm_required) {
         setPendingChatSwitch({
           message: result.confirm_message || result.warning || text.expensiveWarning,
-          persistGlobally,
           registration,
         });
         return;
@@ -480,8 +480,8 @@ export function GuiChatModelsPane({
                   <>
                     <button
                       className="gui-chat-model-action"
-                      disabled={!canSwitchChat || busy || working || current}
-                      onClick={() => void applyChat(registration, false)}
+                      disabled={!canSwitchChat || current}
+                      onClick={() => selectChat(registration)}
                       title={!canSwitchChat ? text.startConversationToSwitch : undefined}
                       type="button"
                     >
@@ -490,7 +490,7 @@ export function GuiChatModelsPane({
                     <button
                       className="gui-chat-model-action"
                       disabled={!canSwitchChat || busy || working || (current && configured)}
-                      onClick={() => void applyChat(registration, true)}
+                      onClick={() => void setDefaultChat(registration)}
                       title={!canSwitchChat ? text.startConversationForDefault : undefined}
                       type="button"
                     >
@@ -602,7 +602,7 @@ export function GuiChatModelsPane({
               onClick={() => {
                 const pending = pendingChatSwitch;
                 setPendingChatSwitch(null);
-                void applyChat(pending.registration, pending.persistGlobally, true);
+                void setDefaultChat(pending.registration, true);
               }}
               type="button"
             >{text.switchAnyway}            </button>
