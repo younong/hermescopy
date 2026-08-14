@@ -131,10 +131,65 @@ def normalize_employee_source_policy(profile: Mapping[str, Any]) -> dict[str, An
     }
 
 
+def _snapshot_fingerprint(snapshot: Mapping[str, Any]) -> str:
+    payload = json.dumps(dict(snapshot), ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return "sha256:" + hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
 def canonical_employee_snapshot(snapshot: Mapping[str, Any]) -> tuple[dict[str, Any], str]:
     """Return a JSON-stable snapshot and its non-secret policy fingerprint."""
-    payload = json.dumps(dict(snapshot), ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    fingerprint_input = dict(snapshot)
+    fingerprint_input.pop("snapshot_fingerprint", None)
+    payload = json.dumps(
+        fingerprint_input,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
     normalized = json.loads(payload)
     fingerprint = "sha256:" + hashlib.sha256(payload.encode("utf-8")).hexdigest()
     normalized["snapshot_fingerprint"] = fingerprint
     return normalized, fingerprint
+
+
+def _matches_legacy_membership_fingerprint(
+    snapshot: dict[str, Any],
+    persisted_fingerprint: Any,
+) -> bool:
+    knowledge = snapshot.get("knowledge_relative_paths")
+    if not isinstance(knowledge, list):
+        return False
+    if not knowledge:
+        return False
+    attachment_path = knowledge[-1]
+    if not isinstance(attachment_path, str) or not attachment_path.startswith(
+        "collaboration-attachments/"
+    ):
+        return False
+    attachment_suffix = attachment_path.removeprefix("collaboration-attachments/")
+    if not attachment_suffix or "/" in attachment_suffix:
+        return False
+
+    base_policy = dict(snapshot)
+    base_policy["knowledge_relative_paths"] = knowledge[:-1]
+    _, base_fingerprint = canonical_employee_snapshot(base_policy)
+    legacy_input = dict(snapshot)
+    legacy_input["snapshot_fingerprint"] = base_fingerprint
+    return persisted_fingerprint == _snapshot_fingerprint(legacy_input)
+
+
+def normalize_employee_snapshot_for_resume(snapshot: Mapping[str, Any]) -> dict[str, Any]:
+    """Canonicalize a retained snapshot with explicitly compatible defaults."""
+    normalized = dict(snapshot)
+    persisted_fingerprint = normalized.pop("snapshot_fingerprint", None)
+    canonical, fingerprint = canonical_employee_snapshot(normalized)
+    if persisted_fingerprint != fingerprint and not _matches_legacy_membership_fingerprint(
+        normalized,
+        persisted_fingerprint,
+    ):
+        raise EmployeePolicyInvalid("employee snapshot fingerprint is invalid")
+    if "reasoning_effort" in canonical:
+        return canonical
+    canonical.pop("snapshot_fingerprint")
+    canonical["reasoning_effort"] = ""
+    return canonical_employee_snapshot(canonical)[0]

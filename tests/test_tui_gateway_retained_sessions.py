@@ -5,6 +5,8 @@ from __future__ import annotations
 import asyncio
 import base64
 from dataclasses import replace
+import hashlib
+import json
 from pathlib import Path
 import threading
 
@@ -1111,6 +1113,7 @@ def test_collaboration_runner_rebuilds_from_matching_persisted_policy(
 ):
     db, runtime, _workspace_root = owner_gateway
     from hermes_cli.collaboration.models import CollaborationMembership
+    from hermes_cli.employee_policy import canonical_employee_snapshot
 
     membership = CollaborationMembership(
         membership_id="membership-a",
@@ -1126,12 +1129,16 @@ def test_collaboration_runner_rebuilds_from_matching_persisted_policy(
         created_at=1.0,
         left_at=None,
     )
-    policy = {
+    policy = canonical_employee_snapshot({
+        "employee_id": "employee-a",
+        "profile_revision": 1,
+        "source_profile_fingerprint": "fingerprint-a",
         "system_prompt": "Pinned policy",
         "model": {"provider": "openai", "model": "test-model"},
         "workspace_relative_path": "employees/analyst",
         "knowledge_relative_paths": ["collaboration-attachments/membership-a"],
-    }
+        "reasoning_effort": "max",
+    })[0]
     runner = server.CollaborationAgentRunner(db, runtime)
     runner.ensure_member_session(membership=membership, employee_policy=policy)
     built = []
@@ -1175,11 +1182,18 @@ def test_collaboration_runner_rebuilds_from_matching_persisted_policy(
 
     assert first["status"] == second["status"] == "complete"
     assert built == [policy, policy]
+    unsafe_snapshot = {
+        key: value
+        for key, value in policy.items()
+        if key != "snapshot_fingerprint"
+    }
+    unsafe_snapshot["system_prompt"] = "Browser override"
+    unsafe_policy = canonical_employee_snapshot(unsafe_snapshot)[0]
     with pytest.raises(RuntimeError, match="snapshot is inconsistent"):
         runner.run(
             stored_session_id="stored-a",
             hidden_session_id="other-hidden",
-            employee_policy={**policy, "system_prompt": "Browser override"},
+            employee_policy=unsafe_policy,
             prompt="unsafe",
             target_id="target-c",
             external_receipt_key="receipt-c",
@@ -1189,12 +1203,149 @@ def test_collaboration_runner_rebuilds_from_matching_persisted_policy(
     runner.close()
 
 
+def test_collaboration_runner_resumes_policy_from_before_reasoning_levels(
+    owner_gateway, monkeypatch
+):
+    db, runtime, _workspace_root = owner_gateway
+    from hermes_cli.collaboration.models import CollaborationMembership
+    from hermes_cli.collaboration.resolver import collaboration_member_policy
+    from hermes_cli.employee_policy import (
+        EmployeePolicyInvalid,
+        canonical_employee_snapshot,
+        normalize_employee_snapshot_for_resume,
+    )
+
+    membership = CollaborationMembership(
+        membership_id="membership-a",
+        group_id="group-a",
+        employee_id="employee-a",
+        profile_revision=4,
+        profile_fingerprint="profile-fingerprint-a",
+        hidden_session_id="hidden-a",
+        stored_session_id="stored-a",
+        role="member",
+        join_sequence=1,
+        leave_sequence=None,
+        created_at=1.0,
+        left_at=None,
+    )
+    legacy_employee_policy = canonical_employee_snapshot({
+        "employee_id": "employee-a",
+        "profile_revision": 4,
+        "source_profile_fingerprint": "profile-fingerprint-a",
+        "system_prompt": "Pinned policy",
+        "model": {"provider": "openai", "model": "test-model"},
+        "workspace_relative_path": "employees/analyst",
+        "knowledge_relative_paths": [],
+    })[0]
+    legacy_payload = {
+        **legacy_employee_policy,
+        "knowledge_relative_paths": [
+            f"collaboration-attachments/{membership.membership_id}"
+        ],
+    }
+    serialized_legacy_payload = json.dumps(
+        legacy_payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    legacy_policy = {
+        **legacy_payload,
+        "snapshot_fingerprint": "sha256:"
+        + hashlib.sha256(serialized_legacy_payload.encode("utf-8")).hexdigest(),
+    }
+    current_employee_policy = canonical_employee_snapshot({
+        **{
+            key: value
+            for key, value in legacy_employee_policy.items()
+            if key != "snapshot_fingerprint"
+        },
+        "reasoning_effort": "",
+    })[0]
+    current_policy = collaboration_member_policy(
+        current_employee_policy,
+        membership.membership_id,
+    )
+    runner = server.CollaborationAgentRunner(db, runtime)
+    runner.ensure_member_session(membership=membership, employee_policy=legacy_policy)
+    built = []
+
+    class _Agent:
+        def run_conversation(self, *_args, **_kwargs):
+            return {"final_response": "upgraded reply"}
+
+        def close(self):
+            return None
+
+        def interrupt(self):
+            return None
+
+    monkeypatch.setattr(
+        server,
+        "_make_agent",
+        lambda *_args, **kwargs: (built.append(kwargs["employee_policy"]) or _Agent()),
+    )
+
+    result = runner.run(
+        stored_session_id="stored-a",
+        hidden_session_id="hidden-a",
+        employee_policy=current_policy,
+        prompt="hello after upgrade",
+        target_id="target-a",
+        external_receipt_key="receipt-a",
+        on_delta=lambda _text: None,
+        on_approval=lambda _data: None,
+    )
+
+    assert result == {"status": "complete", "text": "upgraded reply"}
+    assert built == [current_policy]
+    assert legacy_policy["snapshot_fingerprint"] != canonical_employee_snapshot(
+        legacy_policy
+    )[1]
+    assert current_policy == canonical_employee_snapshot(current_policy)[0]
+
+    for changed_field, changed_value in (
+        ("employee_id", "employee-b"),
+        ("profile_revision", 5),
+        ("source_profile_fingerprint", "profile-fingerprint-b"),
+        ("knowledge_relative_paths", ["collaboration-attachments/membership-b"]),
+    ):
+        changed = dict(legacy_policy)
+        changed[changed_field] = changed_value
+        with pytest.raises(EmployeePolicyInvalid, match="fingerprint is invalid"):
+            normalize_employee_snapshot_for_resume(changed)
+
+        runner._agents.clear()
+        current_snapshot = {
+            key: value
+            for key, value in current_policy.items()
+            if key != "snapshot_fingerprint"
+        }
+        current_snapshot[changed_field] = changed_value
+        current_changed = canonical_employee_snapshot(current_snapshot)[0]
+        with pytest.raises(RuntimeError, match="snapshot is inconsistent"):
+            runner.run(
+                stored_session_id="stored-a",
+                hidden_session_id=f"hidden-{changed_field}",
+                employee_policy=current_changed,
+                prompt="unsafe",
+                target_id=f"target-{changed_field}",
+                external_receipt_key=f"receipt-{changed_field}",
+                on_delta=lambda _text: None,
+                on_approval=lambda _data: None,
+            )
+
+    runner.close()
+
+
 def test_collaboration_runner_refreshes_dynamic_context_but_pins_identity(
     owner_gateway, monkeypatch
 ):
     db, runtime, _workspace_root = owner_gateway
     from hermes_cli.collaboration.agent_tools import CollaborationAgentContext
     from hermes_cli.collaboration.models import CollaborationMembership
+    from hermes_cli.employee_policy import canonical_employee_snapshot
 
     membership = CollaborationMembership(
         membership_id="membership-a",
@@ -1210,12 +1361,16 @@ def test_collaboration_runner_refreshes_dynamic_context_but_pins_identity(
         created_at=1.0,
         left_at=None,
     )
-    policy = {
+    policy = canonical_employee_snapshot({
+        "employee_id": "employee-a",
+        "profile_revision": 1,
+        "source_profile_fingerprint": "fingerprint-a",
         "system_prompt": "Pinned policy",
         "model": {"provider": "openai", "model": "test-model"},
         "workspace_relative_path": "employees/analyst",
         "knowledge_relative_paths": ["collaboration-attachments/membership-a"],
-    }
+        "reasoning_effort": "max",
+    })[0]
     runner = server.CollaborationAgentRunner(db, runtime)
     runner.ensure_member_session(membership=membership, employee_policy=policy)
     service = object()
