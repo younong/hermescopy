@@ -138,3 +138,17 @@ def canonical_employee_snapshot(snapshot: Mapping[str, Any]) -> tuple[dict[str, 
     fingerprint = "sha256:" + hashlib.sha256(payload.encode("utf-8")).hexdigest()
     normalized["snapshot_fingerprint"] = fingerprint
     return normalized, fingerprint
+
+
+def normalize_employee_snapshot_for_resume(snapshot: Mapping[str, Any]) -> dict[str, Any]:
+    """Canonicalize a retained snapshot with explicitly compatible defaults."""
+    normalized = dict(snapshot)
+    persisted_fingerprint = normalized.pop("snapshot_fingerprint", None)
+    canonical, fingerprint = canonical_employee_snapshot(normalized)
+    if persisted_fingerprint != fingerprint:
+        raise EmployeePolicyInvalid("employee snapshot fingerprint is invalid")
+    if "reasoning_effort" in canonical:
+        return canonical
+    canonical.pop("snapshot_fingerprint")
+    canonical["reasoning_effort"] = ""
+    return canonical_employee_snapshot(canonical)[0]
