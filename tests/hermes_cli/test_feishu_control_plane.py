@@ -26,7 +26,6 @@ def _policy(name="Researcher"):
         "toolsets": [],
         "skills": [],
         "mcp_servers": [],
-        "workspace_relative_path": "employees/researcher",
         "knowledge_relative_paths": [],
         "max_iterations": 20,
     }
@@ -165,7 +164,11 @@ def test_create_binding_is_separate_from_employee_creation(authenticated_client,
     assert channel["lifecycle_status"] == "active"
     assert channel["runtime_state"] == "ready"
     assert runtime.started == [("feishu", channel["connector_account_id"])]
-    assert response.json()["profile"] == _policy()
+    assert response.json()["profile"] == {
+        **_policy(),
+        "max_tokens": None,
+        "workspace_relative_path": f"employees/{employee.employee_id}",
+    }
     assert "private" not in response.text
 
 

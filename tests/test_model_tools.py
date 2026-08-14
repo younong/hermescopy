@@ -141,6 +141,52 @@ class TestHandleFunctionCall:
             "knowledge_prefixes": (),
         }]
 
+    def test_legacy_employee_snapshot_uses_canonical_workspace(self):
+        from tui_gateway import server
+
+        calls = []
+
+        class _Context:
+            workspace_prefix = "default"
+
+            @staticmethod
+            def controlled_workspace_path(path):
+                return f"default/{path}"
+
+        class _Supervisor:
+            def dispatch(self, **kwargs):
+                calls.append(kwargs)
+                return '{"ok":true}'
+
+        runtime = server.OwnerWorkerGatewayRuntime(
+            "owner-a",
+            1,
+            "worker-a",
+            1,
+            0,
+            filesystem_context=_Context(),
+            tool_executor_supervisor=_Supervisor(),
+        )
+        employee_policy = {
+            "employee_id": "emp_legacy",
+            "workspace_relative_path": "employees/new-employee",
+            "knowledge_relative_paths": ["collaboration-attachments/member-a"],
+        }
+        with server.owner_worker_gateway_runtime(runtime):
+            result = handle_function_call(
+                "read_file",
+                {"path": "/knowledge/0/attachment.txt"},
+                task_id="task-1",
+                session_id="session-1",
+                employee_policy=employee_policy,
+            )
+
+        assert result == '{"ok":true}'
+        assert calls[0]["workspace_prefix"] == "default/employees/emp_legacy"
+        assert calls[0]["knowledge_prefixes"] == (
+            "default/collaboration-attachments/member-a",
+        )
+
     def test_authenticated_safe_terminal_is_approved_before_executor(self):
         from tui_gateway import server
 

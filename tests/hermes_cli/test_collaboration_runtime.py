@@ -356,7 +356,6 @@ def test_create_managed_employee_validates_catalog_and_controlled_workspace(
         "toolsets": ["terminal"],
         "skills": ["research"],
         "mcp_servers": ["browser"],
-        "workspace_relative_path": "employees/researcher",
         "knowledge_relative_paths": [],
         "max_iterations": 20,
         "max_tokens": None,
@@ -366,7 +365,9 @@ def test_create_managed_employee_validates_catalog_and_controlled_workspace(
 
     assert created["employee"]["employee_kind"] == "managed"
     assert created["employee"]["name"] == "Researcher"
-    assert roots.list_directory(RootKind.WORKSPACE, "default/employees")[0].name == "researcher"
+    employee_id = created["employee"]["employee_id"]
+    assert created["employee"]["workspace_relative_path"] == f"employees/{employee_id}"
+    assert roots.list_directory(RootKind.WORKSPACE, "default/employees")[0].name == employee_id
     with pytest.raises(ValueError, match="unknown or disabled skill"):
         service.create_managed_employee(
             context=context,

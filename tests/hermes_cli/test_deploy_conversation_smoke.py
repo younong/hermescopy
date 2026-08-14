@@ -22,6 +22,8 @@ EXPECTED_CHECKS = {
     "approval_deny",
     "cold_resume",
     "resume_continuation",
+    "employee_workspace",
+    "collaboration_attachment_readonly",
     "artifact_cleanup",
 }
 
@@ -64,6 +66,11 @@ def test_deterministic_conversation_smoke_exercises_authenticated_web_flow():
     assert checks["prompt_stream"]["deltaCount"] >= 1
     assert checks["prompt_stream"]["attachmentRequestCount"] == 2
     assert checks["config_propagation"]["provider"] == "custom:hermes-smoke"
+    employee = checks["employee_workspace"]
+    assert employee["employeeId"].startswith("emp_")
+    assert employee["workspaceRelativePath"] == f"employees/{employee['employeeId']}"
+    collaboration = checks["collaboration_attachment_readonly"]
+    assert collaboration["targetStatus"] == "completed"
     source = SMOKE.read_text()
     assert '"provider": PROVIDER' in source
     assert '"source": "dashboard-gui"' in source

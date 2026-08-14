@@ -17,7 +17,7 @@ from hermes_cli.channel_identity import (
 )
 from hermes_cli.controlled_roots import RootKind
 from hermes_cli.employee_catalog import employee_catalog_payload
-from hermes_cli.employee_policy import normalize_employee_source_policy
+from hermes_cli.employee_policy import employee_policy_with_workspace
 from hermes_state import SessionDB
 
 from .agent_tools import CollaborationAgentContext
@@ -362,20 +362,15 @@ class CollaborationService:
         self._require_employee_manager(context)
         if not isinstance(policy, dict):
             raise ValueError("employee policy must be an object")
-        normalized = normalize_employee_source_policy(policy)
+        employee_id = f"emp_{uuid.uuid4().hex}"
+        normalized = employee_policy_with_workspace(policy, employee_id=employee_id)
         catalog = employee_catalog_payload(self.resolver.owner.host_owner_home)
         self._validate_employee_policy_catalog(normalized, catalog)
-        filesystem = self.filesystem_context
-        if not isinstance(filesystem, AuthenticatedWorkspaceContext):
-            raise RuntimeError("authenticated employee workspace is unavailable")
-        controlled_workspace = filesystem.controlled_workspace_path(
-            normalized["workspace_relative_path"]
-        )
-        filesystem.roots.mkdirs(RootKind.WORKSPACE, controlled_workspace)
         employee = create_employee(
             self.resolver._authority_store(),
             owner=self.resolver.owner,
-            profile=normalized,
+            profile=policy,
+            employee_id=employee_id,
         )
         return {
             "employee": {

@@ -11,6 +11,8 @@ _MAX_SYSTEM_PROMPT_CHARS = 200_000
 _MAX_ITERATIONS = 500
 _MAX_TOKENS = 1_000_000
 _RELATIVE_COMPONENT = re.compile(r"^[^\x00/]+$")
+_EMPLOYEE_ID = re.compile(r"^emp_[A-Za-z0-9._-]+$")
+LEGACY_EMPLOYEE_WORKSPACE = "employees/new-employee"
 
 
 class EmployeePolicyInvalid(ValueError):
@@ -41,6 +43,42 @@ def _relative_path(value: Any, field: str, *, allow_empty: bool = False) -> str:
     if any(part in {"", ".", ".."} or not _RELATIVE_COMPONENT.fullmatch(part) for part in components):
         raise EmployeePolicyInvalid(f"{field} must be a controlled relative path")
     return "/".join(components)
+
+
+def employee_workspace_relative_path(employee_id: str) -> str:
+    """Return the immutable writable workspace for one managed employee."""
+    value = str(employee_id or "").strip()
+    if _EMPLOYEE_ID.fullmatch(value) is None:
+        raise EmployeePolicyInvalid("employee ID is invalid")
+    return f"employees/{value}"
+
+
+def effective_employee_workspace(
+    employee_id: str,
+    workspace_relative_path: Any,
+) -> str:
+    """Resolve the retired create-form placeholder in immutable old snapshots."""
+    path = _relative_path(workspace_relative_path, "workspace_relative_path")
+    if path == LEGACY_EMPLOYEE_WORKSPACE:
+        return employee_workspace_relative_path(employee_id)
+    return path
+
+
+def employee_policy_with_workspace(
+    profile: Mapping[str, Any],
+    *,
+    employee_id: str,
+    current_workspace: str | None = None,
+) -> dict[str, Any]:
+    """Build a source policy while keeping the workspace server-managed."""
+    if not isinstance(profile, Mapping):
+        raise EmployeePolicyInvalid("employee policy must be an object")
+    if "workspace_relative_path" in profile:
+        raise EmployeePolicyInvalid("workspace_relative_path is server-managed")
+    workspace = current_workspace or employee_workspace_relative_path(employee_id)
+    return normalize_employee_source_policy(
+        {**dict(profile), "workspace_relative_path": workspace}
+    )
 
 
 def normalize_employee_source_policy(profile: Mapping[str, Any]) -> dict[str, Any]:

@@ -35,6 +35,7 @@ def owner_gateway(monkeypatch, tmp_path):
     )
     paths.default_workspace.mkdir(parents=True, exist_ok=True)
     (paths.default_workspace / "employees" / "analyst").mkdir(parents=True)
+    (paths.default_workspace / "employees" / "emp_legacy").mkdir()
     roots = controlled_roots_for(paths)
     db = SessionDB(db_path=owner_home / "state.db")
     runtime = server.OwnerWorkerGatewayRuntime(
@@ -391,6 +392,53 @@ def test_employee_policy_rejects_interactive_source_spoof(owner_gateway):
         "message": "employee policy requires a retained channel connection",
     }
     assert runtime.mutable_state.sessions == {}
+
+
+def test_legacy_employee_policy_uses_canonical_workspace(owner_gateway, monkeypatch):
+    _db, runtime, _workspace_root = owner_gateway
+    source_policy = {
+        "schema_version": 1,
+        "model_registration_id": "registration-a",
+        "system_prompt": "You are an analyst.",
+        "toolsets": [],
+        "skills": [],
+        "mcp_servers": [],
+        "workspace_relative_path": "employees/new-employee",
+        "knowledge_relative_paths": [],
+        "max_iterations": 20,
+        "max_tokens": 2000,
+    }
+    monkeypatch.setattr(
+        "hermes_cli.model_registrations.resolve_chat_model_registration",
+        lambda _registration_id: {
+            "registration_id": "registration-a",
+            "provider": "openai",
+            "model": "gpt-test",
+            "source": "catalog",
+        },
+    )
+
+    response = _dispatch(
+        runtime,
+        "session.create",
+        {
+            "source": "feishu",
+            "employee_policy": {
+                "employee_id": "emp_legacy",
+                "profile_revision": 3,
+                "profile_fingerprint": "sha256:" + "a" * 64,
+                "source_policy": source_policy,
+            },
+        },
+        purpose="retained-channel",
+    )
+
+    assert "error" not in response
+    session = runtime.mutable_state.sessions[response["result"]["session_id"]]
+    assert (
+        session["employee_policy"]["workspace_relative_path"]
+        == "employees/emp_legacy"
+    )
 
 
 def test_employee_policy_accepts_only_retained_channel_and_rejects_runtime_overrides(

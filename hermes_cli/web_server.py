@@ -5608,13 +5608,12 @@ async def get_employee_record(request: Request, employee_id: str):
 async def create_employee_record(request: Request, body: EmployeeCreate):
     runtime, store, owner = _employee_authority_context(request)
     from hermes_cli.channel_identity import create_employee
-    from hermes_cli.employee_policy import normalize_employee_source_policy
 
     try:
         employee = create_employee(
             store,
             owner=owner,
-            profile=normalize_employee_source_policy(body.profile),
+            profile=body.profile,
             activate=body.activate,
         )
         return _employee_payload(runtime, store, owner, employee)
@@ -5689,14 +5688,13 @@ async def update_employee_profile_route(
     employee = _employee_or_404(store, owner, employee_id)
     _reject_builtin_employee_http(employee)
     from hermes_cli.channel_identity import EmployeeProfileRevisionConflict, update_employee_profile
-    from hermes_cli.employee_policy import normalize_employee_source_policy
 
     try:
         update_employee_profile(
             store,
             owner=owner,
             employee_id=employee_id,
-            profile=normalize_employee_source_policy(body.profile),
+            profile=body.profile,
             expected_revision=body.expected_revision,
         )
         return _employee_payload(

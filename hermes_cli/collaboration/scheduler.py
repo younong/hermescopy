@@ -16,7 +16,11 @@ from hermes_cli.authenticated_file_context import AuthenticatedWorkspaceContext
 from hermes_cli.controlled_roots import ExpectedType, RootKind
 from hermes_state import SessionDB
 
-from .resolver import CollaborationEmployeeResolver, collaboration_member_policy
+from .resolver import (
+    CollaborationEmployeeResolver,
+    collaboration_attachment_prefix,
+    collaboration_member_policy,
+)
 from .store import CollaborationStore, aggregate_collaboration_turn
 
 _log = logging.getLogger(__name__)
@@ -1209,6 +1213,18 @@ class CollaborationScheduler:
         if not isinstance(context, AuthenticatedWorkspaceContext):
             raise RuntimeError("authenticated collaboration storage is unavailable")
         references: list[str] = []
+        knowledge_paths = claimed["employee_policy"]["knowledge_relative_paths"]
+        expected_attachment_prefix = collaboration_attachment_prefix(
+            claimed["membership_id"]
+        )
+        try:
+            attachment_knowledge_index = knowledge_paths.index(
+                expected_attachment_prefix
+            )
+        except ValueError as exc:
+            raise RuntimeError(
+                "collaboration attachment capability is inconsistent"
+            ) from exc
         for index, grant in enumerate(grants):
             suffix = __import__("pathlib").Path(str(grant["filename"])).suffix
             attachment_prefix = (
@@ -1276,7 +1292,10 @@ class CollaborationScheduler:
                     )
 
             self.db._execute_write(_write)
-            references.append(f"/knowledge/{len(claimed['employee_policy']['knowledge_relative_paths']) - 1}/{claimed['target_id']}/{index}{suffix}")
+            references.append(
+                f"/knowledge/{attachment_knowledge_index}/"
+                f"{claimed['target_id']}/{index}{suffix}"
+            )
         return tuple(references)
 
     def _commit_completed(
