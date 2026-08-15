@@ -258,6 +258,9 @@ describe("EmployeeContactsPane", () => {
         toolsets: ["terminal"],
       }),
     });
+    expect(createEmployee.mock.calls[0]?.[0].profile).not.toHaveProperty(
+      "workspace_relative_path",
+    );
     expect(onRefresh).toHaveBeenCalledOnce();
   });
 
@@ -282,6 +285,7 @@ describe("EmployeeContactsPane", () => {
   it("preserves profile, collaboration, lifecycle, rollover, and optional binding management", async () => {
     const current = employee();
     const onRefresh = vi.fn();
+    const updateProfile = vi.spyOn(api, "updateEmployeeProfile").mockResolvedValue(current);
     const updatePolicy = vi.spyOn(api, "updateEmployeeCollaborationPolicy").mockResolvedValue(current);
     const rollover = vi.spyOn(api, "rolloverEmployeeSessions").mockResolvedValue({ ok: true, retired_sessions: 2 });
     const lifecycle = vi.spyOn(api, "updateEmployeeLifecycle").mockResolvedValue(current);
@@ -295,7 +299,23 @@ describe("EmployeeContactsPane", () => {
     await act(async () => buttonNamed("Manage employee: Researcher")?.click());
     expect(Array.from(document.querySelectorAll('[role="dialog"]')).find((dialog) => dialog.textContent?.includes("Manage the employee profile"))?.textContent)
       .toContain("Allow collaboration");
+    await act(async () => buttons().find((button) => button.textContent === "Edit profile")?.click());
+    await act(async () => {
+      Array.from(document.querySelectorAll<HTMLButtonElement>('[role="dialog"] button'))
+        .find((button) => button.textContent === "Save")
+        ?.click();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(updateProfile).toHaveBeenCalledWith(
+      "employee-a",
+      expect.objectContaining({ expected_revision: 1 }),
+    );
+    expect(updateProfile.mock.calls[0]?.[1].profile).not.toHaveProperty(
+      "workspace_relative_path",
+    );
 
+    await act(async () => buttonNamed("Manage employee: Researcher")?.click());
     await act(async () => buttons().find((button) => button.textContent === "Save permissions")?.click());
     expect(updatePolicy).toHaveBeenCalledWith("employee-a", current.collaboration_policy);
     await act(async () => buttons().find((button) => button.textContent === "Refresh sessions")?.click());
@@ -321,7 +341,7 @@ describe("EmployeeContactsPane", () => {
       app_secret: "secret",
       domain: "feishu",
     }));
-    expect(onRefresh).toHaveBeenCalledTimes(4);
+    expect(onRefresh).toHaveBeenCalledTimes(5);
   });
 
   it("renders authenticated avatars and manages an existing binding", async () => {

@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import hashlib
 import json
 import os
 import queue
@@ -35,6 +36,9 @@ ATTACHMENT_MARKER = "attachment-smoke-marker-731"
 IMAGE_MARKER = "image-native-smoke-marker-283"
 SAFE_TOOL_MARKER = "safe-tool-ok-419"
 RESUME_MARKER = "resume-context-marker-587"
+COLLABORATION_ATTACHMENT_MARKER = "collaboration-attachment-marker-263"
+EMPLOYEE_WORKSPACE_MARKER = "employee-workspace-marker-844"
+COLLABORATION_COMPLETE_MARKER = "collaboration-readonly-ok-195"
 DEFAULT_TIMEOUT = 90.0
 STEP_TIMEOUT = 60.0
 OWNER_WORKER_DRAIN_TIMEOUT = 12.0
@@ -201,6 +205,27 @@ class ModelStub:
             status = "prior context present" if RESUME_MARKER in serialized else "prior context missing"
             return self._text_chunks(["resume ", status])
 
+        if "collaboration-attachment-readonly" in latest_user:
+            if tool_messages:
+                if (
+                    COLLABORATION_ATTACHMENT_MARKER in latest_tool
+                    and "knowledge-write-denied" in latest_tool
+                ):
+                    return self._text_chunks([COLLABORATION_COMPLETE_MARKER])
+                return self._text_chunks(["collaboration smoke failed"])
+            command = (
+                f"printf '%s\\n' '{EMPLOYEE_WORKSPACE_MARKER}' > /workspace/collaboration-smoke.txt; "
+                "attachment=$(find /knowledge/0 -type f -print -quit); "
+                "test -n \"$attachment\"; cat \"$attachment\"; "
+                "if printf 'mutation' >> \"$attachment\" 2>/dev/null; then "
+                "printf 'knowledge-write-unexpected\\n'; else printf 'knowledge-write-denied\\n'; fi"
+            )
+            return self._tool_chunk(
+                "terminal",
+                {"command": command, "timeout": 5},
+                "call-collaboration",
+            )
+
         if "attachment-safe-tool" in latest_user:
             if tool_messages and SAFE_TOOL_MARKER in latest_tool:
                 return self._text_chunks(["stream-one ", f"stream-two {RESUME_MARKER}"])
@@ -315,7 +340,9 @@ class DashboardGateway:
                 "ws_ticket",
                 "Ticket mint did not register exactly one authenticated Owner",
             )
-        _write_owner_config(home, owner_key=owners[0].owner_key)
+        self.owner_key = owners[0].owner_key
+        self.owner_home = home / "users" / self.owner_key
+        _write_owner_config(home, owner_key=self.owner_key)
 
         cookie_header = "; ".join(
             f"{cookie.name}={cookie.value}" for cookie in self.client.cookies.jar
@@ -464,6 +491,30 @@ def _event_payload(event: dict[str, Any]) -> dict[str, Any]:
     return payload if isinstance(payload, dict) else {}
 
 
+def _wait_collaboration_target(
+    gateway: DashboardGateway,
+    target_id: str,
+    *,
+    timeout: float = STEP_TIMEOUT,
+) -> dict[str, Any]:
+    deadline = time.monotonic() + timeout
+    while True:
+        event = gateway.wait_event(
+            "collaboration.target.changed",
+            timeout=max(0.1, deadline - time.monotonic()),
+        )
+        payload = _event_payload(event)
+        if str(payload.get("target_id") or "") != target_id:
+            continue
+        if str(payload.get("status") or "") in {
+            "completed",
+            "failed",
+            "interrupted",
+            "cancelled",
+        }:
+            return payload
+
+
 def _record(checks: list[dict[str, Any]], name: str, started: float, **details: object) -> None:
     item: dict[str, Any] = {
         "name": name,
@@ -524,6 +575,9 @@ def _write_config(home: Path, base_url: str, *, username: str, password: str) ->
         "  tool_progress: full\n"
         "approvals:\n"
         "  mode: ask\n"
+        "channel_connectors:\n"
+        "  weixin_ilink:\n"
+        "    enabled: false\n"
         "dashboard:\n"
         "  basic_auth:\n"
         f"    username: {username}\n"
@@ -605,6 +659,11 @@ socket.socket.connect_ex = _guarded_connect_ex
 
 
 
+def _smoke_channel_keys(label: str) -> str:
+    key = hashlib.sha256(f"hermes-conversation-smoke:{label}".encode()).digest()
+    return json.dumps({"1": base64.b64encode(key).decode("ascii")})
+
+
 def _dashboard_env(
     home: Path,
     workspace: Path,
@@ -629,6 +688,8 @@ def _dashboard_env(
             "TERMINAL_CWD": str(workspace),
             "HERMES_TUI_TOOLSETS": "terminal",
             "HERMES_OWNER_WORKER_DRAIN_TIMEOUT": str(OWNER_WORKER_DRAIN_TIMEOUT),
+            "HERMES_ILINK_LOOKUP_KEYS_JSON": _smoke_channel_keys("lookup"),
+            "HERMES_ILINK_ENCRYPTION_KEYS_JSON": _smoke_channel_keys("encryption"),
             "HERMES_DEPLOYMENT_INFERENCE_POLICY": (
                 "hermes_cli.deployment_inference:policy_from_control_plane_environment"
             ),
@@ -869,6 +930,185 @@ def run_smoke(
         deleted = gateway.request("session.delete", {"session_id": stored_id})
         if deleted.get("deleted") != stored_id:
             raise SmokeFailure("session_cleanup_failed", "artifact_cleanup", "Smoke session was not deleted")
+
+        stage = time.monotonic()
+        catalog_response = gateway.client.get("/api/employees/catalog")
+        if catalog_response.status_code != 200:
+            raise SmokeFailure(
+                "employee_catalog_failed",
+                "employee_workspace",
+                f"Employee catalog returned HTTP {catalog_response.status_code}",
+            )
+        catalog = catalog_response.json()
+        registration_id = next(
+            (
+                str(item.get("id") or "")
+                for item in catalog.get("model_registrations") or []
+                if isinstance(item, dict)
+                and item.get("provider") == PROVIDER
+                and item.get("model") == MODEL
+            ),
+            "",
+        )
+        if not registration_id:
+            raise SmokeFailure(
+                "employee_model_missing",
+                "employee_workspace",
+                "Employee catalog omitted the deployment Chat model",
+            )
+        employee_response = gateway.client.post(
+            "/api/employees",
+            json={
+                "activate": True,
+                "profile": {
+                    "schema_version": 1,
+                    "name": "Smoke employee",
+                    "role": "Attachment verifier",
+                    "model_registration_id": registration_id,
+                    "system_prompt": "Use tools to verify collaboration attachments.",
+                    "toolsets": ["terminal"],
+                    "skills": [],
+                    "mcp_servers": [],
+                    "knowledge_relative_paths": [],
+                    "max_iterations": 8,
+                    "max_tokens": 2000,
+                },
+            },
+        )
+        if employee_response.status_code != 201:
+            raise SmokeFailure(
+                "employee_create_failed",
+                "employee_workspace",
+                f"Employee creation returned HTTP {employee_response.status_code}",
+            )
+        employee = employee_response.json()
+        employee_id = str(employee.get("employee_id") or "")
+        workspace_relative_path = str(
+            (employee.get("profile") or {}).get("workspace_relative_path") or ""
+        )
+        employee_workspace = gateway.owner_home / "workspaces" / "default" / workspace_relative_path
+        if (
+            not employee_id.startswith("emp_")
+            or workspace_relative_path != f"employees/{employee_id}"
+            or not employee_workspace.is_dir()
+        ):
+            raise SmokeFailure(
+                "employee_workspace_missing",
+                "employee_workspace",
+                "Backend-created employee workspace is inconsistent",
+            )
+        _record(
+            checks,
+            "employee_workspace",
+            stage,
+            employeeId=employee_id,
+            workspaceRelativePath=workspace_relative_path,
+        )
+
+        stage = time.monotonic()
+        gateway.request("session.owner_attach", {"browser_id": "conversation-smoke"})
+        group_snapshot = gateway.request(
+            "collaboration.group.create",
+            {
+                "name": "Attachment smoke",
+                "employee_ids": [employee_id],
+                "client_idempotency_key": "conversation-smoke-group",
+            },
+        )
+        group = group_snapshot.get("group") or {}
+        group_id = str(group.get("group_id") or "")
+        memberships = group_snapshot.get("memberships") or []
+        membership = next(
+            (
+                item
+                for item in memberships
+                if isinstance(item, dict) and item.get("employee_id") == employee_id
+            ),
+            None,
+        )
+        if not group_id or membership is None:
+            raise SmokeFailure(
+                "collaboration_group_failed",
+                "collaboration_attachment_readonly",
+                "Collaboration group omitted the employee membership",
+            )
+        membership_id = str(membership.get("membership_id") or "")
+        attachment_data = base64.b64encode(
+            COLLABORATION_ATTACHMENT_MARKER.encode("utf-8")
+        ).decode("ascii")
+        attached = gateway.request(
+            "collaboration.file.attach",
+            {
+                "group_id": group_id,
+                "filename": "collaboration-smoke.txt",
+                "content_base64": attachment_data,
+                "media_type": "text/plain",
+            },
+        )
+        attachment_id = str((attached.get("attachment") or {}).get("attachment_id") or "")
+        submitted = gateway.request(
+            "collaboration.message.submit",
+            {
+                "group_id": group_id,
+                "text": "collaboration-attachment-readonly",
+                "mentioned_membership_ids": [membership_id],
+                "mention_all": False,
+                "attachment_ids": [attachment_id],
+                "client_idempotency_key": "conversation-smoke-message",
+            },
+        )
+        targets = (submitted.get("turn") or {}).get("targets") or []
+        target_id = str((targets[0] if targets else {}).get("target_id") or "")
+        if not attachment_id or not target_id:
+            raise SmokeFailure(
+                "collaboration_target_missing",
+                "collaboration_attachment_readonly",
+                "Collaboration turn omitted its attachment or target",
+            )
+        target = _wait_collaboration_target(gateway, target_id)
+        result = target.get("result") or {}
+        result_text = str(result.get("text") or "") if isinstance(result, dict) else ""
+        workspace_file = employee_workspace / "collaboration-smoke.txt"
+        materialized_file = (
+            gateway.owner_home
+            / "workspaces"
+            / "default"
+            / "collaboration-attachments"
+            / membership_id
+            / target_id
+            / "0.txt"
+        )
+        if str(target.get("status") or "") != "completed":
+            raise SmokeFailure(
+                "collaboration_target_failed",
+                "collaboration_attachment_readonly",
+                f"Collaboration target ended as {target.get('status')}",
+            )
+        if COLLABORATION_COMPLETE_MARKER not in result_text:
+            raise SmokeFailure(
+                "collaboration_result_missing",
+                "collaboration_attachment_readonly",
+                "Collaboration target did not confirm the read-only attachment",
+            )
+        if workspace_file.read_text(encoding="utf-8").strip() != EMPLOYEE_WORKSPACE_MARKER:
+            raise SmokeFailure(
+                "employee_workspace_write_failed",
+                "collaboration_attachment_readonly",
+                "Employee did not write through its private workspace capability",
+            )
+        if materialized_file.read_text(encoding="utf-8").strip() != COLLABORATION_ATTACHMENT_MARKER:
+            raise SmokeFailure(
+                "collaboration_attachment_mutated",
+                "collaboration_attachment_readonly",
+                "The read-only collaboration attachment was changed",
+            )
+        gateway.request("collaboration.group.archive", {"group_id": group_id})
+        _record(
+            checks,
+            "collaboration_attachment_readonly",
+            stage,
+            targetStatus="completed",
+        )
     except SmokeFailure as exc:
         failure = exc
     except Exception as exc:  # keep output stable and sanitized

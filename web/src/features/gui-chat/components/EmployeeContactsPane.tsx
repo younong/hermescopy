@@ -15,7 +15,7 @@ import {
   type EmployeeCatalog,
   type EmployeeCollaborationPolicy,
   type EmployeeLifecycleStatus,
-  type EmployeePolicy,
+  type EmployeePolicyDraft,
   type ReasoningLevel,
   withHermesAssetAuth,
 } from "@/lib/api";
@@ -63,7 +63,7 @@ function allToolsets(catalog: EmployeeCatalog | null) {
   return catalog?.toolsets.map((item) => item.name) ?? [];
 }
 
-function emptyPolicy(catalog: EmployeeCatalog | null): EmployeePolicy {
+function emptyPolicy(catalog: EmployeeCatalog | null): EmployeePolicyDraft {
   return {
     knowledge_relative_paths: [],
     max_iterations: 20,
@@ -77,7 +77,6 @@ function emptyPolicy(catalog: EmployeeCatalog | null): EmployeePolicy {
     skills: [],
     system_prompt: "",
     toolsets: allToolsets(catalog),
-    workspace_relative_path: "employees/new-employee",
   };
 }
 
@@ -115,7 +114,7 @@ export const EmployeeContactsPane = memo(function EmployeeContactsPane({
   const [editor, setEditor] = useState<EmployeeEditor | null>(null);
   const [managedEmployeeId, setManagedEmployeeId] = useState<string | null>(null);
   const [bindingEditor, setBindingEditor] = useState<BindingEditor | null>(null);
-  const [employeeDraft, setEmployeeDraft] = useState<EmployeePolicy>(() => emptyPolicy(null));
+  const [employeeDraft, setEmployeeDraft] = useState<EmployeePolicyDraft>(() => emptyPolicy(null));
   const [bindingDraft, setBindingDraft] = useState<BindingDraft>(EMPTY_BINDING);
   const [avatarFile, setAvatarFile] = useState<File | null>(null);
   const [avatarPreview, setAvatarPreview] = useState<string | null>(null);
@@ -182,9 +181,12 @@ export const EmployeeContactsPane = memo(function EmployeeContactsPane({
     const nextCatalog = await ensureCatalog();
     if (!nextCatalog) return;
     resetAvatar(employee.avatar_url);
-    setEmployeeDraft(employee.profile
-      ? { ...employee.profile, toolsets: allToolsets(nextCatalog) }
-      : emptyPolicy(nextCatalog));
+    if (employee.profile) {
+      const { workspace_relative_path: _workspace, ...profileDraft } = employee.profile;
+      setEmployeeDraft({ ...profileDraft, toolsets: allToolsets(nextCatalog) });
+    } else {
+      setEmployeeDraft(emptyPolicy(nextCatalog));
+    }
     setEditor({ employee, mode: "profile" });
   };
 
@@ -497,8 +499,8 @@ function PolicyEditor({
   catalog: EmployeeCatalog | null;
   onAvatarChange(file: File): void;
   onAvatarRemove(): void;
-  onChange(policy: EmployeePolicy): void;
-  policy: EmployeePolicy;
+  onChange(policy: EmployeePolicyDraft): void;
+  policy: EmployeePolicyDraft;
   text: EmployeeText;
 }) {
   const selectedModel = catalog?.model_registrations.find(
@@ -697,7 +699,7 @@ function EmployeeManagementDetails({
   );
 }
 
-function EmployeeAvatar({ employee, large = false }: { employee: Pick<Employee, "avatar_url" | "profile"> & Partial<Pick<Employee, "employee_kind">>; large?: boolean }) {
+function EmployeeAvatar({ employee, large = false }: { employee: { avatar_url: string | null; employee_kind?: Employee["employee_kind"]; profile: EmployeePolicyDraft | null }; large?: boolean }) {
   const [failed, setFailed] = useState(false);
   useEffect(() => setFailed(false), [employee.avatar_url]);
   const label = employee.employee_kind === "builtin_assistant" ? "AI" : employee.profile?.name || "E";

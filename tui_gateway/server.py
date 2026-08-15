@@ -6118,7 +6118,10 @@ def _trusted_employee_policy(params: dict) -> tuple[dict | None, str | None]:
         return None, "employee policy is invalid"
     try:
         from hermes_cli.controlled_roots import ExpectedType, RootKind
-        from hermes_cli.employee_policy import normalize_employee_source_policy
+        from hermes_cli.employee_policy import (
+            effective_employee_workspace,
+            normalize_employee_source_policy,
+        )
         from hermes_cli.model_registrations import resolve_chat_model_registration
         from toolsets import validate_toolset
 
@@ -6138,8 +6141,12 @@ def _trusted_employee_policy(params: dict) -> tuple[dict | None, str | None]:
             raise ValueError("configured MCP server is unavailable")
         runtime = current_owner_worker_gateway_runtime()
         context = runtime.filesystem_context
-        controlled_paths = [
+        workspace_path = effective_employee_workspace(
+            employee_id,
             source_policy["workspace_relative_path"],
+        )
+        controlled_paths = [
+            workspace_path,
             *source_policy["knowledge_relative_paths"],
         ]
         for path in controlled_paths:
@@ -6162,7 +6169,7 @@ def _trusted_employee_policy(params: dict) -> tuple[dict | None, str | None]:
             "toolsets": source_policy["toolsets"],
             "skills": source_policy["skills"],
             "mcp_servers": source_policy["mcp_servers"],
-            "workspace_relative_path": source_policy["workspace_relative_path"],
+            "workspace_relative_path": workspace_path,
             "knowledge_relative_paths": source_policy["knowledge_relative_paths"],
             "max_iterations": source_policy["max_iterations"],
             "max_tokens": source_policy["max_tokens"],

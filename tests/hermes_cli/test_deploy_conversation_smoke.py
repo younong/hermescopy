@@ -22,6 +22,8 @@ EXPECTED_CHECKS = {
     "approval_deny",
     "cold_resume",
     "resume_continuation",
+    "employee_workspace",
+    "collaboration_attachment_readonly",
     "artifact_cleanup",
 }
 
@@ -64,6 +66,11 @@ def test_deterministic_conversation_smoke_exercises_authenticated_web_flow():
     assert checks["prompt_stream"]["deltaCount"] >= 1
     assert checks["prompt_stream"]["attachmentRequestCount"] == 2
     assert checks["config_propagation"]["provider"] == "custom:hermes-smoke"
+    employee = checks["employee_workspace"]
+    assert employee["employeeId"].startswith("emp_")
+    assert employee["workspaceRelativePath"] == f"employees/{employee['employeeId']}"
+    collaboration = checks["collaboration_attachment_readonly"]
+    assert collaboration["targetStatus"] == "completed"
     source = SMOKE.read_text()
     assert '"provider": PROVIDER' in source
     assert '"source": "dashboard-gui"' in source
@@ -107,6 +114,16 @@ def test_deterministic_smoke_sets_bounded_owner_worker_drain_timeout(tmp_path):
     )
     assert env["HERMES_DEPLOYMENT_INFERENCE_SUPPORTS_VISION"] == "true"
     assert module.OWNER_WORKER_DRAIN_TIMEOUT < module.DEFAULT_TIMEOUT
+    assert env["HERMES_ILINK_LOOKUP_KEYS_JSON"] != env[
+        "HERMES_ILINK_ENCRYPTION_KEYS_JSON"
+    ]
+    for key_name in (
+        "HERMES_ILINK_LOOKUP_KEYS_JSON",
+        "HERMES_ILINK_ENCRYPTION_KEYS_JSON",
+    ):
+        keyring = json.loads(env[key_name])
+        assert set(keyring) == {"1"}
+        assert len(__import__("base64").b64decode(keyring["1"])) == 32
 
 
 def test_deterministic_smoke_keeps_vision_capability_in_deployment_policy(tmp_path):
@@ -116,7 +133,9 @@ def test_deterministic_smoke_keeps_vision_capability_in_deployment_policy(tmp_pa
     module._write_config(home, "http://127.0.0.1:9", username="user", password="pass")
     module._write_owner_config(home, owner_key="owner")
 
-    assert "supports_vision" not in (home / "config.yaml").read_text()
+    global_config = (home / "config.yaml").read_text()
+    assert "supports_vision" not in global_config
+    assert "channel_connectors:\n  weixin_ilink:\n    enabled: false" in global_config
     assert "supports_vision" not in (home / "users" / "owner" / "config.yaml").read_text()
 
 
