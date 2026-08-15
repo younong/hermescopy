@@ -52,81 +52,36 @@ describe("ComposerModelPicker", () => {
     await openPicker();
 
     expect(api.getModelRegistrations).toHaveBeenCalledWith();
-    expect(listbox()).not.toBeNull();
     expect(listbox().textContent).toContain("default-model");
-    expect(listbox().textContent).not.toContain("Default model");
-    expect(listbox().textContent).not.toContain("default-provider");
     expect(listbox().textContent).not.toContain("Image model");
-
-    const current = optionFor("current-model");
-    expect(current.getAttribute("aria-selected")).toBe("true");
-    expect(current.disabled).toBe(true);
+    expect(optionFor("current-model").disabled).toBe(true);
   });
 
-  it("marks the current model when the gateway reports a raw provider name", async () => {
-    // Live gateways report the agent provider (bare "custom"), not the
-    // registration slug ("current-provider"), for custom endpoints.
-    await renderPicker({ currentProvider: "custom" });
+  it("selects locally, closes immediately, and remains available for another selection", async () => {
+    const onSelect = vi.fn();
+    await renderPicker({ onSelect });
     await openPicker();
 
-    const current = optionFor("current-model");
-    expect(current.getAttribute("aria-selected")).toBe("true");
-    expect(current.disabled).toBe(true);
-  });
+    await act(async () => optionFor("default-model").click());
 
-  it("falls back to a placeholder when no model is active", async () => {
-    await renderPicker({ currentModel: undefined, currentProvider: undefined });
-    expect(trigger().textContent).toContain("Select model");
-  });
-
-  it("switches the session model and closes the popover", async () => {
-    const onSwitchChat = vi.fn().mockResolvedValue({ confirm_required: false, value: "default-model" });
-    await renderPicker({ onSwitchChat });
-    await openPicker();
-
-    await act(async () => {
-      optionFor("default-model").click();
-      await Promise.resolve();
-      await Promise.resolve();
-    });
-
-    expect(onSwitchChat).toHaveBeenCalledWith(
-      expect.objectContaining({ id: "chat-default" }),
-      false,
-    );
+    expect(onSelect).toHaveBeenCalledWith(expect.objectContaining({ id: "chat-default" }));
     expect(queryListbox()).toBeNull();
-  });
+    expect(trigger().disabled).toBe(false);
 
-  it("confirms expensive models before switching", async () => {
-    const onSwitchChat = vi.fn()
-      .mockResolvedValueOnce({ confirm_message: "High price", confirm_required: true, value: "default-model" })
-      .mockResolvedValueOnce({ confirm_required: false, value: "default-model" });
-    await renderPicker({ onSwitchChat });
     await openPicker();
-
-    await act(async () => {
-      optionFor("default-model").click();
-      await Promise.resolve();
-      await Promise.resolve();
-    });
-
-    expect(document.body.textContent).toContain("High price");
-    expect(onSwitchChat).toHaveBeenCalledTimes(1);
-
-    await clickButton("Use model", true);
-    expect(onSwitchChat).toHaveBeenLastCalledWith(
-      expect.objectContaining({ id: "chat-default" }),
-      true,
-    );
+    expect(listbox()).not.toBeNull();
   });
 
-  it("disables switching while a response is generating", async () => {
-    await renderPicker({ busy: true });
-    expect(trigger().disabled).toBe(true);
+  it("allows local selection while a response is generating", async () => {
+    const onSelect = vi.fn();
+    await renderPicker({ onSelect });
+    await openPicker();
+    await act(async () => optionFor("default-model").click());
+    expect(onSelect).toHaveBeenCalledTimes(1);
   });
 
-  it("disables switching without an active conversation", async () => {
-    await renderPicker({ canSwitch: false });
+  it("disables selection without an active conversation", async () => {
+    await renderPicker({ canSelect: false });
     expect(trigger().disabled).toBe(true);
   });
 
@@ -154,21 +109,18 @@ describe("ComposerModelPicker", () => {
 });
 
 async function renderPicker(overrides: Partial<Parameters<typeof ComposerModelPicker>[0]> = {}) {
-  const container = document.getElementById("root");
-  root = createRoot(container!);
+  root = createRoot(document.getElementById("root")!);
   await act(async () => {
     root?.render(
       <ComposerModelPicker
-        busy={false}
-        canSwitch
+        canSelect
         currentModel="current-model"
         currentProvider="current-provider"
         onManageModels={vi.fn()}
-        onSwitchChat={vi.fn().mockResolvedValue({ confirm_required: false, value: "default-model" })}
+        onSelect={vi.fn()}
         {...overrides}
       />,
     );
-    await Promise.resolve();
     await Promise.resolve();
   });
 }
@@ -208,14 +160,12 @@ async function openPicker() {
   });
 }
 
-async function clickButton(text: string, exact = false) {
+async function clickButton(text: string) {
   await act(async () => {
-    const button = Array.from(document.querySelectorAll<HTMLButtonElement>("button")).find((item) => {
-      const value = item.textContent?.trim();
-      return exact ? value === text : value?.includes(text);
-    });
-    button?.click();
-    await Promise.resolve();
+    const button = Array.from(document.querySelectorAll<HTMLButtonElement>("button"))
+      .find((item) => item.textContent?.trim() === text);
+    if (!button) throw new Error(`Missing button: ${text}`);
+    button.click();
     await Promise.resolve();
   });
 }

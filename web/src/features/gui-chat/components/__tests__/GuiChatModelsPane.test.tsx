@@ -90,18 +90,18 @@ describe("GuiChatModelsPane", () => {
   });
 
   it("does not route Code models through the Chat switch callback", async () => {
-    const onSwitchChat = vi.fn();
+    const onSelectChat = vi.fn();
     const onActivateCode = vi.fn().mockResolvedValue(undefined);
-    await renderPane({ onSwitchChat, onActivateCode });
+    await renderPane({ onSelectChat, onActivateCode });
     await clickButton("Code", true);
     await clickWithin(rowFor("Codex model"), "Default", true);
     expect(onActivateCode).toHaveBeenCalledWith(expect.objectContaining({ id: "code-codex", kind: "code" }));
-    expect(onSwitchChat).not.toHaveBeenCalled();
+    expect(onSelectChat).not.toHaveBeenCalled();
   });
 
   it("shows Admin and Mine models while keeping administrator models immutable", async () => {
-    const onSwitchChat = vi.fn().mockResolvedValue({ confirm_required: false, value: "admin-model" });
-    await renderPane({ onSwitchChat });
+    const onSelectChat = vi.fn().mockResolvedValue({ confirm_required: false, value: "admin-model" });
+    await renderPane({ onSelectChat });
 
     const adminRow = rowFor("Admin model");
     expect(adminRow.textContent).toContain("Admin");
@@ -109,28 +109,32 @@ describe("GuiChatModelsPane", () => {
     expect(buttonWithin(adminRow, "Edit Admin model", true, "aria-label")).toBeUndefined();
     expect(buttonWithin(adminRow, "Delete Admin model", true, "aria-label")).toBeUndefined();
     await clickWithin(adminRow, "Use", true);
-    expect(onSwitchChat).toHaveBeenCalledWith(expect.objectContaining({ id: "admin-chat" }), false, false);
+    expect(onSelectChat).toHaveBeenCalledWith(expect.objectContaining({ id: "admin-chat" }));
 
     const mineRow = rowFor("Current model");
     expect(mineRow.textContent).toContain("Mine");
     expect(buttonWithin(mineRow, "Edit Current model", true, "aria-label")).toBeDefined();
   });
 
-  it("switches chat models for the session or global default and confirms expensive models", async () => {
-    const onSwitchChat = vi.fn()
-      .mockResolvedValueOnce({ confirm_required: false, value: "default-model" })
+  it("selects chat models locally and confirms an explicit global default", async () => {
+    const onSelectChat = vi.fn();
+    const onSetDefaultChat = vi.fn()
       .mockResolvedValueOnce({ confirm_message: "High price", confirm_required: true, value: "default-model" })
       .mockResolvedValueOnce({ confirm_required: false, value: "default-model" });
-    await renderPane({ onSwitchChat });
+    await renderPane({ onSelectChat, onSetDefaultChat });
 
     const defaultRow = rowFor("Default model");
     await clickWithin(defaultRow, "Use", true);
-    expect(onSwitchChat).toHaveBeenCalledWith(expect.objectContaining({ id: "chat-default" }), false, false);
+    expect(onSelectChat).toHaveBeenCalledWith(expect.objectContaining({ id: "chat-default" }));
+    expect(onSetDefaultChat).not.toHaveBeenCalled();
 
     await clickWithin(rowFor("Current model"), "Use as default", true);
     expect(document.body.textContent).toContain("High price");
     await clickButton("Switch anyway", true);
-    expect(onSwitchChat).toHaveBeenLastCalledWith(expect.objectContaining({ id: "chat-current" }), true, true);
+    expect(onSetDefaultChat).toHaveBeenLastCalledWith(
+      expect.objectContaining({ id: "chat-current" }),
+      true,
+    );
   });
 
   it("keeps CRUD available without a live conversation and activates media models", async () => {
@@ -219,13 +223,14 @@ describe("GuiChatModelsPane", () => {
     }));
   });
 
-  it("disables switching while generation is busy", async () => {
-    const onSwitchChat = vi.fn();
-    await renderPane({ busy: true, onSwitchChat });
+  it("keeps local selection available while disabling global changes during generation", async () => {
+    const onSelectChat = vi.fn();
+    await renderPane({ busy: true, onSelectChat });
 
-    expect(buttonWithin(rowFor("Default model"), "Use", true)?.disabled).toBe(true);
-    expect(document.querySelector('[role="alert"]')?.textContent).toContain("Stop the current response");
-    expect(onSwitchChat).not.toHaveBeenCalled();
+    expect(buttonWithin(rowFor("Default model"), "Use", true)?.disabled).toBe(false);
+    expect(buttonWithin(rowFor("Current model"), "Use as default", true)?.disabled).toBe(true);
+    await clickWithin(rowFor("Default model"), "Use", true);
+    expect(onSelectChat).toHaveBeenCalledOnce();
   });
   it("renders Chinese model chrome while preserving registration names", async () => {
     await renderPane({}, "zh");
@@ -252,7 +257,8 @@ async function renderPane(
         canSwitchChat
         currentModel="current-model"
         currentProvider="current-provider"
-        onSwitchChat={vi.fn().mockResolvedValue({ confirm_required: false, value: "default-model" })}
+        onSelectChat={vi.fn()}
+        onSetDefaultChat={vi.fn().mockResolvedValue({ confirm_required: false, value: "default-model" })}
         {...overrides}
       /></I18nProvider>,
     );

@@ -19,6 +19,7 @@ Hermetic: the model-resolution chain is fully mocked (no network), mirroring
 ``tests/hermes_cli/test_user_providers_model_switch.py``.
 """
 
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from hermes_cli.model_switch import switch_model
@@ -80,6 +81,91 @@ def _run_switch(
             user_providers=user_providers or {},
             custom_providers=custom_providers or [],
         )
+
+
+def test_trusted_selection_skips_remote_validation_and_metadata_refresh():
+    with patch("hermes_cli.models.validate_requested_model") as validate, \
+         patch("hermes_cli.model_switch.get_model_info", return_value=None) as get_info, \
+         patch("hermes_cli.model_switch.get_model_capabilities", return_value=None) as get_caps, \
+         patch("agent.models_dev.fetch_models_dev", return_value={}), \
+         patch("hermes_cli.runtime_provider.resolve_runtime_provider", return_value={
+             "api_key": "new-key",
+             "base_url": "https://api.example/v1",
+             "api_mode": "chat_completions",
+         }):
+        result = switch_model(
+            raw_input="registered-model",
+            current_provider="old-provider",
+            current_model="old-model",
+            explicit_provider="openrouter",
+            trusted_selection=True,
+        )
+
+    assert result.success is True
+    validate.assert_not_called()
+    get_info.assert_called_once_with(
+        result.target_provider,
+        result.new_model,
+        allow_network=False,
+    )
+    get_caps.assert_called_once_with(
+        result.target_provider,
+        result.new_model,
+        allow_network=False,
+    )
+
+
+def test_trusted_deployment_route_never_consults_catalog_or_provider_chain():
+    """A trusted (registered) selection backed by a control-plane deployment
+    route resolves entirely from the route descriptor: neither the models.dev
+    catalog nor the generic provider-resolution chain is consulted, so a
+    blocked catalog endpoint cannot stall send-time preflight.  Regression: on
+    networks where models.dev is unreachable, the provider-resolution fallback
+    hung ~75s on a TCP connect and killed the chat WebSocket before the
+    submitted route was ever applied."""
+    route = SimpleNamespace(
+        provider="custom:volcengine-ark",
+        model="kimi-k3",
+        name="Kimi K3",
+        api_mode="chat_completions",
+    )
+    with patch(
+         "hermes_cli.deployment_inference.route_descriptors_from_control_plane",
+         return_value=[route],
+         ), \
+         patch("hermes_cli.model_switch.resolve_provider_full") as resolve_full, \
+         patch("agent.models_dev.fetch_models_dev") as fetch_registry, \
+         patch("hermes_cli.model_switch.get_model_info", return_value=None), \
+         patch("hermes_cli.model_switch.get_model_capabilities", return_value=None), \
+         patch(
+             "hermes_cli.model_switch.normalize_model_for_provider",
+             side_effect=lambda model, provider: model,
+         ), \
+         patch(
+             "hermes_cli.runtime_provider.resolve_deployment_inference_runtime",
+             return_value={
+                 "api_key": "relay-key",
+                 "base_url": "https://relay.internal/v1",
+                 "api_mode": "chat_completions",
+                 "relay_provider": "custom:volcengine-ark",
+                 "model": "kimi-k3",
+             },
+         ):
+        result = switch_model(
+            raw_input="kimi-k3",
+            current_provider="custom:codex",
+            current_model="gpt-5.6-sol",
+            explicit_provider="custom:volcengine-ark",
+            trusted_selection=True,
+        )
+
+    assert result.success is True, result.error_message
+    assert result.target_provider == "custom:volcengine-ark"
+    assert result.new_model == "kimi-k3"
+    # Label comes from the control-plane descriptor, not from a catalog lookup.
+    assert result.provider_label == "Kimi K3"
+    fetch_registry.assert_not_called()
+    resolve_full.assert_not_called()
 
 
 def test_typed_configured_model_routes_away_from_openai_codex():
