@@ -550,6 +550,9 @@ def test_web_direct_employee_selection_is_server_resolved_and_context_bound(
         def commit_dashboard_attach(self, _generation, _sid, *, on_commit):
             return on_commit()
 
+        def abort_dashboard_attach(self, _generation):
+            return None
+
         def write(self, _payload):
             return None
 
@@ -720,6 +723,237 @@ def test_builtin_web_direct_policy_pins_tool_snapshot_and_rechecks_authority(
             server._stored_session_runtime_overrides(row)
 
 
+def _web_direct_test_service(policy):
+    from hermes_cli.collaboration.agent_tools import CollaborationAgentContext
+    from hermes_cli.collaboration.models import CollaborationMemberProfile
+    from hermes_cli.collaboration.resolver import ResolvedCollaborationEmployee
+
+    class _Resolver:
+        def resolve_current(self, employee_id):
+            if employee_id != policy["employee_id"]:
+                raise RuntimeError("employee not found")
+            return ResolvedCollaborationEmployee(
+                member=CollaborationMemberProfile(
+                    employee_id,
+                    int(policy.get("profile_revision") or 1),
+                    str(policy.get("source_profile_fingerprint") or "sha256:" + "a" * 64),
+                ),
+                employee_policy=policy,
+                may_participate=True,
+                may_create_groups=False,
+            )
+
+    class _Service:
+        resolver = _Resolver()
+
+        def source_agent_context(self, **kwargs):
+            return CollaborationAgentContext(
+                service=self,
+                creator_employee_id=kwargs["creator_employee_id"],
+                source_kind=kwargs["source_kind"],
+                source_conversation_id=kwargs["source_conversation_id"],
+                may_create_authorized=False,
+            )
+
+    return _Service()
+
+
+class _EmployeeDashboardTransport:
+    def __init__(self):
+        self.active_session_id = None
+
+    def begin_dashboard_attach(self, _generation, **_kwargs):
+        return None
+
+    def commit_dashboard_attach(self, _generation, sid, *, on_commit):
+        if not on_commit():
+            return False
+        self.active_session_id = sid
+        return True
+
+    def dashboard_attach_is_current(self, _generation):
+        return True
+
+    def abort_dashboard_attach(self, _generation):
+        return None
+
+    def write(self, _payload):
+        return None
+
+
+def _open_employee(runtime, transport, employee_id, generation):
+    return _call(
+        runtime,
+        "session.create",
+        {
+            "source": "dashboard-gui",
+            "employee_id": employee_id,
+            "browser_id": "browser-a",
+            "switch_generation": generation,
+        },
+        transport=transport,
+    )
+
+
+def test_web_direct_open_reuses_live_and_cold_persisted_conversation(
+    owner_gateway, monkeypatch
+):
+    db, runtime, _workspace_root = owner_gateway
+    policy = {
+        "employee_id": "employee-a",
+        "profile_revision": 1,
+        "source_profile_fingerprint": "sha256:" + "a" * 64,
+        "system_prompt": "Pinned employee prompt",
+        "model": {"provider": "openai", "model": "test-model"},
+        "toolsets": [],
+        "skills": [],
+        "mcp_servers": [],
+        "workspace_relative_path": "employees/analyst",
+        "knowledge_relative_paths": [],
+        "max_iterations": 20,
+        "max_tokens": 2000,
+    }
+    server.bind_collaboration_service(runtime, _web_direct_test_service(policy))
+    transport = _EmployeeDashboardTransport()
+    monkeypatch.setattr(server, "_reopen_resume_session", lambda *_args, **_kwargs: None)
+
+    first = _open_employee(runtime, transport, "employee-a", 1)
+    first_session = runtime.mutable_state.sessions[first["result"]["session_id"]]
+    original_binding = dict(first_session["web_direct_binding"])
+    second = _open_employee(runtime, transport, "employee-a", 2)
+
+    assert "error" not in first
+    assert second["result"]["session_key"] == first["result"]["stored_session_id"]
+    assert second["result"]["session_id"] == first["result"]["session_id"]
+    assert second["result"]["resume_kind"] == "live"
+    assert first_session["web_direct_binding"] == original_binding
+
+    server._ensure_session_db_row(first_session)
+    db.append_message(first["result"]["stored_session_id"], "user", "remember this")
+
+    live = _open_employee(runtime, transport, "employee-a", 3)
+
+    assert [message["text"] for message in live["result"]["messages"]] == [
+        "remember this"
+    ]
+    assert live["result"]["history_page"] == {
+        "cursor": None,
+        "has_more": False,
+        "returned_count": 1,
+        "truncated_count": 0,
+    }
+
+    runtime.mutable_state.sessions.clear()
+    cold = _open_employee(runtime, transport, "employee-a", 4)
+
+    assert cold["result"]["resumed"] == first["result"]["stored_session_id"]
+    assert cold["result"]["resume_kind"] == "cold"
+    assert [message["text"] for message in cold["result"]["messages"]] == [
+        "remember this"
+    ]
+    assert cold["result"]["history_page"] == {
+        "cursor": None,
+        "has_more": False,
+        "returned_count": 1,
+        "truncated_count": 0,
+    }
+    resumed = runtime.mutable_state.sessions[cold["result"]["session_id"]]
+    assert [message["content"] for message in resumed["history"]] == ["remember this"]
+    assert resumed["employee_policy"] == policy
+
+
+def test_web_direct_open_follows_compression_and_delete_fences_stale_runtime(
+    owner_gateway, monkeypatch
+):
+    db, runtime, workspace_root = owner_gateway
+    policy = {
+        "employee_id": "employee-a",
+        "profile_revision": 1,
+        "source_profile_fingerprint": "sha256:" + "a" * 64,
+        "system_prompt": "Pinned employee prompt",
+        "model": {"provider": "openai", "model": "test-model"},
+        "toolsets": [],
+        "skills": [],
+        "mcp_servers": [],
+        "workspace_relative_path": "employees/analyst",
+        "knowledge_relative_paths": [],
+        "max_iterations": 20,
+        "max_tokens": 2000,
+    }
+    server.bind_collaboration_service(runtime, _web_direct_test_service(policy))
+    transport = _EmployeeDashboardTransport()
+    monkeypatch.setattr(server, "_reopen_resume_session", lambda *_args, **_kwargs: None)
+
+    opened = _open_employee(runtime, transport, "employee-a", 1)
+    root = opened["result"]["stored_session_id"]
+    stale = runtime.mutable_state.sessions[opened["result"]["session_id"]]
+    server._ensure_session_db_row(stale)
+    db.append_message(root, "user", "before compression")
+    db.end_session(root, "compression")
+    db.create_session(
+        "compression-tip",
+        source="dashboard-gui",
+        owner_key="owner-a",
+        workspace_root=workspace_root,
+        worker_generation=2,
+        parent_session_id=root,
+        model_config={
+            server._EMPLOYEE_POLICY_CONFIG_KEY: policy,
+            server._WEB_DIRECT_EMPLOYEE_CONFIG_KEY: "employee-a",
+        },
+    )
+    db.append_message("compression-tip", "assistant", "after compression")
+    runtime.mutable_state.sessions.clear()
+
+    compressed = _open_employee(runtime, transport, "employee-a", 2)
+    assert compressed["result"]["resumed"] == "compression-tip"
+    assert [message["content"] for message in runtime.mutable_state.sessions[
+        compressed["result"]["session_id"]
+    ]["history"]] == ["after compression"]
+
+    assert db.delete_session(
+        "compression-tip",
+        recovery_scope={
+            "owner_key": "owner-a",
+            "workspace_root": workspace_root,
+            "worker_generation": 2,
+            "historical_resume": True,
+        },
+    )
+    assert server._web_direct_binding_is_current(stale) is False
+    stale["running"] = True
+    stale["queued_prompt"] = None
+    stale_sid = opened["result"]["session_id"]
+    runtime.mutable_state.sessions[stale_sid] = stale
+    rejected = _call(
+        runtime,
+        "prompt.submit",
+        {"session_id": stale_sid, "text": "stale prompt"},
+        transport=transport,
+    )
+    assert rejected["error"] == {
+        "code": 4093,
+        "message": "employee conversation was reset — reopen the contact",
+    }
+    assert stale["queued_prompt"] is None
+
+    runtime.mutable_state.sessions.clear()
+    replacement = _open_employee(runtime, transport, "employee-a", 3)
+    assert replacement["result"]["stored_session_id"] != root
+
+
+def test_ordinary_session_create_remains_non_idempotent(owner_gateway):
+    _db, runtime, _workspace_root = owner_gateway
+
+    first = _call(runtime, "session.create", {"source": "dashboard-gui"})
+    second = _call(runtime, "session.create", {"source": "dashboard-gui"})
+
+    assert first["result"]["stored_session_id"] != second["result"]["stored_session_id"]
+    assert first["result"]["session_id"] != second["result"]["session_id"]
+
+
+
+
 def test_feishu_direct_context_requires_exact_managed_origin_and_group_gets_no_tool(
     owner_gateway,
 ):
@@ -804,6 +1038,26 @@ def test_feishu_direct_context_requires_exact_managed_origin_and_group_gets_no_t
             assert "inconsistent" in error
         finally:
             server.reset_transport(token)
+
+
+def test_web_direct_employee_metadata_propagates_to_compression_children():
+    from types import SimpleNamespace
+
+    agent = SimpleNamespace(_session_init_model_config={"max_iterations": 20})
+    policy = {"employee_id": "employee-a", "system_prompt": "Pinned"}
+    context = SimpleNamespace(source_kind="web_direct")
+
+    server._stamp_employee_compression_metadata(
+        agent,
+        employee_policy=policy,
+        collaboration_context=context,
+    )
+
+    assert agent._session_init_model_config[server._EMPLOYEE_POLICY_CONFIG_KEY] == policy
+    assert (
+        agent._session_init_model_config[server._WEB_DIRECT_EMPLOYEE_CONFIG_KEY]
+        == "employee-a"
+    )
 
 
 def test_collaboration_tool_injection_requires_trusted_role_and_creation_authority():
@@ -1239,6 +1493,7 @@ def test_verified_artifact_emits_before_complete_and_failed_turn_emits_none(
 
     _db, runtime, _workspace_root = owner_gateway
     transport = _CollaborationTransport()
+    turn_started = threading.Event()
     outcomes = [
         {
             "artifacts": [
@@ -1280,6 +1535,7 @@ def test_verified_artifact_emits_before_complete_and_failed_turn_emits_none(
             return None
 
         def run_conversation(self, *_args, **_kwargs):
+            turn_started.set()
             return outcomes.pop(0)
 
     agent = _Agent()
@@ -1326,8 +1582,11 @@ def test_verified_artifact_emits_before_complete_and_failed_turn_emits_none(
                 transport=transport,
             )
             assert response["result"] == {"status": "streaming"}
-            session["_run_thread"].join(timeout=2)
-            assert not session["_run_thread"].is_alive()
+            assert turn_started.wait(timeout=2)
+            run_thread = session["_run_thread"]
+            run_thread.join(timeout=2)
+            assert not run_thread.is_alive()
+            turn_started.clear()
     finally:
         runtime.mutable_state.sessions.pop("live-artifact", None)
 

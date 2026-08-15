@@ -89,8 +89,11 @@ vi.mock("@/i18n", async (importOriginal) => {
 });
 
 vi.mock("@/components/ChatSessionList", () => ({
-  ChatSessionList: (props: { refreshNonce?: number }) => (
-    <span data-session-refresh-nonce={props.refreshNonce ?? 0} />
+  ChatSessionList: (props: { activeSessionId?: string | null; refreshNonce?: number }) => (
+    <span
+      data-active-session-id={props.activeSessionId ?? ""}
+      data-session-refresh-nonce={props.refreshNonce ?? 0}
+    />
   ),
 }));
 
@@ -430,7 +433,7 @@ describe("GuiChatShell", () => {
       await Promise.resolve();
     });
 
-    expect(document.querySelector("[data-location]")?.textContent).toBe("/chat/contacts/employee-a");
+    expect(document.querySelector("[data-location]")?.textContent).toBe("/chat?employee=employee-a");
     expect(connection.createOrAttach).toHaveBeenCalledOnce();
     expect(connection.createOrAttach).toHaveBeenLastCalledWith(
       null,
@@ -440,6 +443,180 @@ describe("GuiChatShell", () => {
       { employeeId: "employee-a" },
     );
     expect(document.querySelector("[data-composer-send]")).not.toBeNull();
+  });
+
+  it("reopens employee routes across A to B to A navigation and reload", async () => {
+    window.__HERMES_AUTH_REQUIRED__ = false;
+    const employees = [employee(), employee({ employee_id: "employee-b", name: "Writer" })];
+    mocks.getEmployees.mockResolvedValue({ employees });
+    const connection = createConnection();
+    connection.createOrAttachMock.mockImplementation(async (_target, _generation, _signal, _timing, options) => ({
+      info: { cwd: "/tmp", model: "test-model", provider: "test-provider" },
+      messages: options?.employeeId === "employee-a"
+        ? [{ id: "employee-a-message", role: "user", text: "employee A transcript" }]
+        : [],
+      session_id: `runtime-${options?.employeeId ?? "new"}`,
+      stored_session_id: `stored-${options?.employeeId ?? "new"}`,
+    }));
+    mocks.connectGuiChat.mockReturnValue(connection);
+    let navigate: ReturnType<typeof useNavigate> | null = null;
+
+    await renderShellAt(
+      "/chat?employee=employee-a",
+      <>
+        <NavigationProbe onReady={(nextNavigate) => { navigate = nextNavigate; }} />
+        <GuiChatShell />
+      </>,
+    );
+
+    for (const nextEmployeeId of ["employee-b", "employee-a"]) {
+      await act(async () => {
+        navigate?.(`/chat?employee=${nextEmployeeId}`);
+        await Promise.resolve();
+        await Promise.resolve();
+      });
+    }
+
+    expect(connection.createOrAttachMock.mock.calls.map((call) => call[4])).toEqual([
+      { employeeId: "employee-a" },
+      { employeeId: "employee-b" },
+      { employeeId: "employee-a" },
+    ]);
+    expect(connection.createOrAttachMock.mock.calls.map((call) => call[1])).toEqual([1, 2, 3]);
+    expect(mocks.connectGuiChat).toHaveBeenCalledOnce();
+    expect(document.querySelector("[data-message-text]")?.textContent)
+      .toContain("employee A transcript");
+
+    await act(async () => root?.unmount());
+    root = null;
+    const reloadConnection = createConnection();
+    reloadConnection.createOrAttachMock.mockResolvedValue({
+      info: { cwd: "/tmp", model: "test-model", provider: "test-provider" },
+      messages: [{ id: "employee-a-message", role: "user", text: "employee A transcript" }],
+      session_id: "runtime-employee-a",
+      stored_session_id: "stored-employee-a",
+    });
+    mocks.connectGuiChat.mockReturnValue(reloadConnection);
+    await renderShellAt("/chat?employee=employee-a");
+
+    expect(reloadConnection.createOrAttach).toHaveBeenCalledOnce();
+    expect(reloadConnection.createOrAttach).toHaveBeenCalledWith(
+      null,
+      expect.any(Number),
+      expect.any(AbortSignal),
+      undefined,
+      { employeeId: "employee-a" },
+    );
+    expect(document.querySelector("[data-message-text]")?.textContent)
+      .toContain("employee A transcript");
+  });
+
+  it("uses the committed stored session for recent-chat highlighting on employee routes", async () => {
+    const connection = createConnection();
+    mocks.getAuthMe.mockResolvedValue(authIdentity());
+    mocks.connectGuiChat.mockReturnValue(connection);
+    mocks.getEmployees.mockResolvedValue({ employees: [employee()] });
+
+    await renderShellAt("/chat?employee=employee-a");
+
+    expect(document.querySelector("[data-active-session-id]")?.getAttribute("data-active-session-id"))
+      .toBe("stored-a");
+  });
+
+  it("clears recent-chat highlighting when an employee route switches to a group", async () => {
+    const connection = createConnection();
+    mocks.getAuthMe.mockResolvedValue(authIdentity());
+    mocks.connectGuiChat.mockReturnValue(connection);
+    mocks.getEmployees.mockResolvedValue({ employees: [employee()] });
+    vi.mocked(connection.collaboration.getGroup).mockResolvedValue({
+      approvals: [],
+      attachments: [],
+      events: [],
+      group: {
+        archived_at: null,
+        created_at: 1,
+        creator_employee_id: null,
+        creator_kind: "owner",
+        group_id: "group-a",
+        last_sequence: 0,
+        name: "Research",
+        status: "active",
+        updated_at: 1,
+      },
+      memberships: [],
+      reconciliation: {
+        after_sequence: 0,
+        last_sequence: 0,
+        next_after_sequence: 0,
+        snapshot_authoritative: true,
+      },
+      targets: [],
+      turns: [],
+    });
+    let navigate: ReturnType<typeof useNavigate> | null = null;
+
+    await renderShellAt(
+      "/chat?employee=employee-a",
+      <>
+        <NavigationProbe onReady={(nextNavigate) => { navigate = nextNavigate; }} />
+        <GuiChatShell />
+      </>,
+    );
+    expect(document.querySelector("[data-active-session-id]")?.getAttribute("data-active-session-id"))
+      .toBe("stored-a");
+
+    await act(async () => {
+      navigate?.("/chat?group=group-a");
+      await Promise.resolve();
+    });
+
+    expect(document.querySelector("[data-active-session-id]")?.getAttribute("data-active-session-id"))
+      .toBe("");
+  });
+
+  it("redirects unavailable employee routes without starting a session", async () => {
+    const connection = createConnection();
+    mocks.getAuthMe.mockResolvedValue(authIdentity());
+    mocks.connectGuiChat.mockReturnValue(connection);
+    mocks.getEmployees.mockResolvedValue({
+      employees: [employee({ lifecycle_status: "suspended" })],
+    });
+
+    await renderShellAt(
+      "/chat?employee=employee-a",
+      <>
+        <LocationProbe />
+        <GuiChatShell />
+      </>,
+    );
+
+    expect(document.querySelector("[data-location]")?.textContent).toBe("/chat/contacts");
+    expect(connection.createOrAttach).not.toHaveBeenCalled();
+  });
+
+  it("redirects legacy contact URLs to the stable employee route", async () => {
+    const connection = createConnection();
+    mocks.getAuthMe.mockResolvedValue(authIdentity());
+    mocks.connectGuiChat.mockReturnValue(connection);
+    mocks.getEmployees.mockResolvedValue({ employees: [employee()] });
+
+    await renderShellAt(
+      "/chat/contacts/employee-a",
+      <>
+        <LocationProbe />
+        <GuiChatShell />
+      </>,
+    );
+
+    expect(document.querySelector("[data-location]")?.textContent).toBe("/chat?employee=employee-a");
+    expect(connection.createOrAttach).toHaveBeenCalledOnce();
+    expect(connection.createOrAttach).toHaveBeenCalledWith(
+      null,
+      expect.any(Number),
+      expect.any(AbortSignal),
+      undefined,
+      { employeeId: "employee-a" },
+    );
   });
 
   it("does not start unavailable contacts or select a contact from its settings button", async () => {
@@ -489,7 +666,7 @@ describe("GuiChatShell", () => {
     }));
 
     await renderShellAt(
-      "/chat/contacts/employee-a",
+      "/chat?employee=employee-a",
       <>
         <LocationProbe />
         <GuiChatShell />
