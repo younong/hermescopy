@@ -738,13 +738,15 @@ async def test_channel_sessions_are_scoped_and_pin_profile_revision(queued):
         dispatch_scope="thread:a",
         profile_revision=3,
     ) == ("live-a2", "stored-a")
+    # Unmanaged (non-Feishu) sources have no rotation path: a revision mismatch
+    # still fails closed instead of silently mixing profiles in one session.
     with pytest.raises(RuntimeError, match="profile revision"):
         await open_binding_session(
             client,
             store,
             binding_id=registered.binding_id,
-            source="feishu",
-            title="feishu channel",
+            source="weixin-ilink",
+            title="channel",
             dispatch_scope="thread:a",
             profile_revision=4,
         )

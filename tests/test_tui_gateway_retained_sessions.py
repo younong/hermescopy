@@ -728,23 +728,29 @@ def _web_direct_test_service(policy):
     from hermes_cli.collaboration.models import CollaborationMemberProfile
     from hermes_cli.collaboration.resolver import ResolvedCollaborationEmployee
 
+    # Indirection box: tests simulating a profile update swap box["policy"]
+    # mid-scenario so the NEXT resolve_current observes the new revision.
+    box = {"policy": policy}
+
     class _Resolver:
         def resolve_current(self, employee_id):
-            if employee_id != policy["employee_id"]:
+            current = box["policy"]
+            if employee_id != current["employee_id"]:
                 raise RuntimeError("employee not found")
             return ResolvedCollaborationEmployee(
                 member=CollaborationMemberProfile(
                     employee_id,
-                    int(policy.get("profile_revision") or 1),
-                    str(policy.get("source_profile_fingerprint") or "sha256:" + "a" * 64),
+                    int(current.get("profile_revision") or 1),
+                    str(current.get("source_profile_fingerprint") or "sha256:" + "a" * 64),
                 ),
-                employee_policy=policy,
+                employee_policy=current,
                 may_participate=True,
                 may_create_groups=False,
             )
 
     class _Service:
         resolver = _Resolver()
+        policy_box = box
 
         def source_agent_context(self, **kwargs):
             return CollaborationAgentContext(
@@ -756,6 +762,23 @@ def _web_direct_test_service(policy):
             )
 
     return _Service()
+
+
+def _employee_repin_policy(revision: int, *, model: str, system_prompt: str) -> dict:
+    """Canonical employee snapshot at one profile revision for re-pin tests."""
+    from hermes_cli.employee_policy import canonical_employee_snapshot
+
+    return canonical_employee_snapshot(
+        {
+            "employee_id": "employee-a",
+            "profile_revision": revision,
+            "source_profile_fingerprint": f"fingerprint-employee-a-r{revision}",
+            "system_prompt": system_prompt,
+            "model": {"provider": "openai", "model": model},
+            "workspace_relative_path": "employees/analyst",
+            "knowledge_relative_paths": [],
+        }
+    )[0]
 
 
 class _EmployeeDashboardTransport:
@@ -940,6 +963,464 @@ def test_web_direct_open_follows_compression_and_delete_fences_stale_runtime(
     runtime.mutable_state.sessions.clear()
     replacement = _open_employee(runtime, transport, "employee-a", 3)
     assert replacement["result"]["stored_session_id"] != root
+
+
+def _stub_prompt_turn_machinery(monkeypatch):
+    """Stub the turn/billing/render seams a fake-agent prompt.submit exercises."""
+    monkeypatch.setattr(server, "_sync_agent_model_with_config", lambda *_args: None)
+    monkeypatch.setattr(server, "_register_session_cwd", lambda *_args: None)
+    monkeypatch.setattr(
+        server, "_complete_prompt_turn_receipt", lambda *_args, **_kwargs: None
+    )
+    monkeypatch.setattr(server, "_session_info", lambda *_args: {})
+    monkeypatch.setattr(server, "_get_usage", lambda *_args: {})
+    monkeypatch.setattr(server, "render_message", lambda *_args: "")
+    monkeypatch.setattr(server, "_load_cfg", lambda: {})
+    monkeypatch.setattr(server, "_voice_tts_enabled", lambda: False)
+    monkeypatch.setattr(
+        server, "_start_notification_poller", lambda *_args: threading.Event()
+    )
+    monkeypatch.setattr(
+        "tools.process_registry.process_registry.drain_notifications",
+        lambda: [],
+    )
+
+
+class _RepinAgent:
+    """Minimal agent good enough for gateway turn processing."""
+
+    model = "test-model"
+    provider = "openai"
+
+    def __init__(self, on_run=None):
+        self._on_run = on_run
+        self.closed = False
+        self.ran = []
+
+    def clear_interrupt(self):
+        return None
+
+    def interrupt(self):
+        return None
+
+    def close(self):
+        self.closed = True
+
+    def run_conversation(self, message, **_kwargs):
+        self.ran.append(message)
+        if self._on_run is not None:
+            self._on_run(self)
+        return {
+            "final_response": "ok",
+            "messages": [{"role": "assistant", "content": "ok"}],
+        }
+
+
+def test_web_direct_reopen_repins_live_and_cold_conversation(
+    owner_gateway, monkeypatch
+):
+    db, runtime, _workspace_root = owner_gateway
+    service = _web_direct_test_service(
+        _employee_repin_policy(3, model="test-model", system_prompt="Rev 3 prompt")
+    )
+    server.bind_collaboration_service(runtime, service)
+    transport = _EmployeeDashboardTransport()
+    monkeypatch.setattr(server, "_reopen_resume_session", lambda *_args, **_kwargs: None)
+
+    first = _open_employee(runtime, transport, "employee-a", 1)
+    sid = first["result"]["session_id"]
+    root = first["result"]["stored_session_id"]
+    session = runtime.mutable_state.sessions[sid]
+    server._ensure_session_db_row(session)
+    db.append_message(root, "user", "remember this")
+
+    built = []
+
+    def _capture_build(*_args, **kwargs):
+        built.append(kwargs)
+        raise RuntimeError("stop after trusted build arguments are captured")
+
+    monkeypatch.setattr(server, "_make_agent", _capture_build)
+    service.policy_box["policy"] = _employee_repin_policy(
+        4, model="updated-model", system_prompt="Rev 4 prompt"
+    )
+
+    reopened = _open_employee(runtime, transport, "employee-a", 2)
+
+    assert reopened["result"]["session_id"] == sid
+    assert reopened["result"]["resume_kind"] == "live"
+    assert [m["text"] for m in reopened["result"]["messages"]] == ["remember this"]
+    assert session["employee_policy"]["profile_revision"] == 4
+    assert session["model_override"]["model"] == "updated-model"
+    assert session["model_override"]["provider"] == "openai"
+    assert session["agent_ready"].wait(timeout=2)
+    assert [kwargs["employee_policy"]["profile_revision"] for kwargs in built] == [4]
+    assert built[0]["model_override"]["model"] == "updated-model"
+    row = db.get_session(root)
+    model_config = json.loads(row["model_config"])
+    assert row["model"] == "updated-model"
+    assert (
+        model_config[server._EMPLOYEE_POLICY_CONFIG_KEY]["profile_revision"] == 4
+    )
+    assert model_config[server._WEB_DIRECT_EMPLOYEE_CONFIG_KEY] == "employee-a"
+
+    # Cold path: resume from the stored row must adopt a newer profile too.
+    service.policy_box["policy"] = _employee_repin_policy(
+        5, model="cold-model", system_prompt="Rev 5 prompt"
+    )
+    runtime.mutable_state.sessions.clear()
+    cold = _open_employee(runtime, transport, "employee-a", 3)
+
+    assert cold["result"]["resumed"] == root
+    assert cold["result"]["resume_kind"] == "cold"
+    assert [m["text"] for m in cold["result"]["messages"]] == ["remember this"]
+    cold_session = runtime.mutable_state.sessions[cold["result"]["session_id"]]
+    assert cold_session["employee_policy"]["profile_revision"] == 5
+    assert [m["content"] for m in cold_session["history"]] == ["remember this"]
+    row = db.get_session(root)
+    model_config = json.loads(row["model_config"])
+    assert row["model"] == "cold-model"
+    assert (
+        model_config[server._EMPLOYEE_POLICY_CONFIG_KEY]["profile_revision"] == 5
+    )
+    assert model_config[server._WEB_DIRECT_EMPLOYEE_CONFIG_KEY] == "employee-a"
+    # A cold resume defers the build; the fresh snapshot rides in the deferred
+    # overrides so the eventual build derives everything from revision 5.
+    assert (
+        cold_session["resume_runtime_overrides"]["employee_policy"]["profile_revision"]
+        == 5
+    )
+    assert cold_session["resume_runtime_overrides"]["model_override"]["model"] == (
+        "cold-model"
+    )
+    assert len(built) == 1
+
+
+def test_web_direct_prompt_submit_repins_idle_session(owner_gateway, monkeypatch):
+    db, runtime, _workspace_root = owner_gateway
+    service = _web_direct_test_service(
+        _employee_repin_policy(3, model="test-model", system_prompt="Rev 3 prompt")
+    )
+    server.bind_collaboration_service(runtime, service)
+    transport = _EmployeeDashboardTransport()
+    monkeypatch.setattr(server, "_reopen_resume_session", lambda *_args, **_kwargs: None)
+    _stub_prompt_turn_machinery(monkeypatch)
+
+    built = []
+    agents = []
+
+    def _fake_make_agent(*_args, **kwargs):
+        agent = _RepinAgent()
+        agents.append(agent)
+        built.append(kwargs)
+        return agent
+
+    monkeypatch.setattr(server, "_make_agent", _fake_make_agent)
+    opened = _open_employee(runtime, transport, "employee-a", 1)
+    sid = opened["result"]["session_id"]
+    root = opened["result"]["stored_session_id"]
+    session = runtime.mutable_state.sessions[sid]
+    server._ensure_session_db_row(session)
+    with server.owner_worker_gateway_runtime(runtime):
+        server._start_agent_build(sid, session)
+    assert session["agent_ready"].wait(timeout=2)
+    assert [kwargs["employee_policy"]["profile_revision"] for kwargs in built] == [3]
+
+    service.policy_box["policy"] = _employee_repin_policy(
+        4, model="updated-model", system_prompt="Rev 4 prompt"
+    )
+    response = _call(
+        runtime,
+        "prompt.submit",
+        {"session_id": sid, "text": "after update"},
+        transport=transport,
+    )
+
+    assert response["result"] == {"status": "streaming"}
+    session["_run_thread"].join(timeout=5)
+    assert not session["_run_thread"].is_alive()
+    assert agents[0].closed is True
+    assert [kwargs["employee_policy"]["profile_revision"] for kwargs in built] == [3, 4]
+    assert built[1]["model_override"]["model"] == "updated-model"
+    assert agents[1].ran == ["after update"]
+    assert session["employee_policy"]["profile_revision"] == 4
+    row = db.get_session(root)
+    model_config = json.loads(row["model_config"])
+    assert row["model"] == "updated-model"
+    assert (
+        model_config[server._EMPLOYEE_POLICY_CONFIG_KEY]["profile_revision"] == 4
+    )
+    assert model_config[server._WEB_DIRECT_EMPLOYEE_CONFIG_KEY] == "employee-a"
+
+
+def test_web_direct_busy_queue_drains_onto_repinned_policy(
+    owner_gateway, monkeypatch
+):
+    db, runtime, _workspace_root = owner_gateway
+    service = _web_direct_test_service(
+        _employee_repin_policy(3, model="test-model", system_prompt="Rev 3 prompt")
+    )
+    server.bind_collaboration_service(runtime, service)
+    transport = _EmployeeDashboardTransport()
+    monkeypatch.setattr(server, "_reopen_resume_session", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(server, "_load_busy_input_mode", lambda: "queue")
+    _stub_prompt_turn_machinery(monkeypatch)
+
+    first_started = threading.Event()
+    release_first = threading.Event()
+    second_done = threading.Event()
+    built = []
+    agents = []
+
+    def _on_run(agent):
+        if agent is agents[0]:
+            first_started.set()
+            assert release_first.wait(timeout=5)
+        else:
+            second_done.set()
+
+    def _fake_make_agent(*_args, **kwargs):
+        agent = _RepinAgent(on_run=_on_run)
+        agents.append(agent)
+        built.append(kwargs)
+        return agent
+
+    monkeypatch.setattr(server, "_make_agent", _fake_make_agent)
+    opened = _open_employee(runtime, transport, "employee-a", 1)
+    sid = opened["result"]["session_id"]
+    root = opened["result"]["stored_session_id"]
+    session = runtime.mutable_state.sessions[sid]
+
+    first = _call(
+        runtime,
+        "prompt.submit",
+        {"session_id": sid, "text": "first"},
+        transport=transport,
+    )
+    assert first["result"] == {"status": "streaming"}
+    assert first_started.wait(timeout=5)
+
+    # Profile update lands mid-turn: the next submit defers the re-pin instead
+    # of mutating the running turn, then queues behind it.
+    service.policy_box["policy"] = _employee_repin_policy(
+        4, model="updated-model", system_prompt="Rev 4 prompt"
+    )
+    second = _call(
+        runtime,
+        "prompt.submit",
+        {"session_id": sid, "text": "second"},
+        transport=transport,
+    )
+    assert second["result"] == {"status": "queued"}
+    assert session["_pending_employee_repin"]["profile_revision"] == 4
+    assert session["employee_policy"]["profile_revision"] == 3
+
+    release_first.set()
+    assert second_done.wait(timeout=5)
+    session["_run_thread"].join(timeout=5)
+
+    assert agents[0].closed is True
+    assert [kwargs["employee_policy"]["profile_revision"] for kwargs in built] == [3, 4]
+    assert built[1]["model_override"]["model"] == "updated-model"
+    assert agents[0].ran == ["first"]
+    assert agents[1].ran == ["second"]
+    assert "_pending_employee_repin" not in session
+    assert session["employee_policy"]["profile_revision"] == 4
+    row = db.get_session(root)
+    model_config = json.loads(row["model_config"])
+    assert row["model"] == "updated-model"
+    assert (
+        model_config[server._EMPLOYEE_POLICY_CONFIG_KEY]["profile_revision"] == 4
+    )
+
+
+def test_web_direct_reopen_without_policy_drift_is_a_no_op(
+    owner_gateway, monkeypatch
+):
+    db, runtime, _workspace_root = owner_gateway
+    service = _web_direct_test_service(
+        _employee_repin_policy(3, model="test-model", system_prompt="Rev 3 prompt")
+    )
+    server.bind_collaboration_service(runtime, service)
+    transport = _EmployeeDashboardTransport()
+    monkeypatch.setattr(server, "_reopen_resume_session", lambda *_args, **_kwargs: None)
+
+    first = _open_employee(runtime, transport, "employee-a", 1)
+    sid = first["result"]["session_id"]
+    session = runtime.mutable_state.sessions[sid]
+    server._ensure_session_db_row(session)
+
+    meta_writes = []
+    monkeypatch.setattr(
+        db,
+        "update_session_meta",
+        lambda *args, **kwargs: meta_writes.append((args, kwargs)),
+    )
+
+    def _no_build(*_args, **_kwargs):
+        pytest.fail("_make_agent must not run without policy drift")
+
+    monkeypatch.setattr(server, "_make_agent", _no_build)
+
+    reopened = _open_employee(runtime, transport, "employee-a", 2)
+
+    assert reopened["result"]["session_id"] == sid
+    assert reopened["result"]["resume_kind"] == "live"
+    assert meta_writes == []
+    with server.owner_worker_gateway_runtime(runtime):
+        fresh = server._resolve_current_web_direct_policy(
+            server._collaboration_service(), "employee-a"
+        )
+    assert server._repin_web_direct_employee_policy(sid, session, fresh) is False
+
+
+def test_builtin_web_direct_reopen_does_not_perpetually_repin(
+    owner_gateway, monkeypatch
+):
+    """Raw resolve lacks runtime_toolsets; the shared resolver helper must
+    re-augment the built-in snapshot or every reopen would look like drift."""
+    _db, runtime, _workspace_root = owner_gateway
+    from hermes_cli.collaboration.agent_tools import CollaborationAgentContext
+    from hermes_cli.collaboration.models import CollaborationMemberProfile
+    from hermes_cli.collaboration.resolver import ResolvedCollaborationEmployee
+
+    base_policy = {
+        "schema_version": 1,
+        "employee_id": "builtin-a",
+        "profile_revision": 1,
+        "source_profile_fingerprint": "builtin-assistant-v1",
+        "system_prompt": "Built-in prompt",
+        "model": {"provider": "openai", "model": "test-model"},
+        "toolsets": [],
+        "skills": [],
+        "mcp_servers": [],
+        "workspace_relative_path": "",
+        "knowledge_relative_paths": [],
+        "max_iterations": 90,
+        "max_tokens": None,
+        "builtin_assistant": True,
+    }
+
+    class _Resolver:
+        def resolve_current(self, employee_id):
+            assert employee_id == "builtin-a"
+            return ResolvedCollaborationEmployee(
+                member=CollaborationMemberProfile(
+                    "builtin-a", 1, "builtin-assistant-v1"
+                ),
+                employee_policy=base_policy,
+                may_participate=True,
+                may_create_groups=True,
+                may_manage_employees=True,
+                invite_quota=None,
+            )
+
+    class _Service:
+        resolver = _Resolver()
+
+        def source_agent_context(self, **kwargs):
+            return CollaborationAgentContext(
+                service=self,
+                creator_employee_id=kwargs["creator_employee_id"],
+                source_kind=kwargs["source_kind"],
+                source_conversation_id=kwargs["source_conversation_id"],
+                may_create_authorized=True,
+                may_manage_employees=True,
+            )
+
+    service = _Service()
+    server.bind_collaboration_service(runtime, service)
+    transport = _EmployeeDashboardTransport()
+    monkeypatch.setattr(server, "_reopen_resume_session", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        server, "_load_enabled_toolsets", lambda: ["terminal", "project"]
+    )
+
+    first = _open_employee(runtime, transport, "builtin-a", 1)
+    sid = first["result"]["session_id"]
+    session = runtime.mutable_state.sessions[sid]
+    pinned = session["employee_policy"]
+    assert pinned["runtime_toolsets"] == ["terminal", "project"]
+
+    meta_writes = []
+    monkeypatch.setattr(
+        "hermes_state.SessionDB.update_session_meta",
+        lambda *args, **kwargs: meta_writes.append((args, kwargs)),
+    )
+
+    def _no_build(*_args, **_kwargs):
+        pytest.fail("built-in assistant must not re-pin on an unchanged profile")
+
+    monkeypatch.setattr(server, "_make_agent", _no_build)
+
+    reopened = _open_employee(runtime, transport, "builtin-a", 2)
+
+    assert reopened["result"]["session_id"] == sid
+    assert session["employee_policy"] == pinned
+    assert meta_writes == []
+    with server.owner_worker_gateway_runtime(runtime):
+        fresh = server._resolve_current_web_direct_policy(service, "builtin-a")
+    assert server._repin_web_direct_employee_policy(sid, session, fresh) is False
+
+
+def test_web_direct_employee_route_pin_survives_policy_repin(
+    owner_gateway, monkeypatch
+):
+    _db, runtime, _workspace_root = owner_gateway
+    service = _web_direct_test_service(
+        _employee_repin_policy(3, model="test-model", system_prompt="Rev 3 prompt")
+    )
+    server.bind_collaboration_service(runtime, service)
+    transport = _EmployeeDashboardTransport()
+    monkeypatch.setattr(server, "_reopen_resume_session", lambda *_args, **_kwargs: None)
+
+    opened = _open_employee(runtime, transport, "employee-a", 1)
+    sid = opened["result"]["session_id"]
+    session = runtime.mutable_state.sessions[sid]
+
+    built = []
+
+    def _capture_build(*_args, **kwargs):
+        built.append(kwargs)
+        raise RuntimeError("stop after trusted build arguments are captured")
+
+    monkeypatch.setattr(server, "_make_agent", _capture_build)
+    service.policy_box["policy"] = _employee_repin_policy(
+        4, model="updated-model", system_prompt="Rev 4 prompt"
+    )
+    reopened = _open_employee(runtime, transport, "employee-a", 2)
+    assert reopened["result"]["session_id"] == sid
+    assert session["employee_policy"]["profile_revision"] == 4
+    assert session["agent_ready"].wait(timeout=2)
+    assert [kwargs["employee_policy"]["profile_revision"] for kwargs in built] == [4]
+
+    monkeypatch.setattr(
+        "hermes_cli.model_registrations.resolve_chat_model_registration",
+        lambda _registration_id: {
+            "registration_id": "registration-b",
+            "provider": "openai",
+            "model": "updated-model",
+            "source": "catalog",
+        },
+    )
+    rejected = _call(
+        runtime,
+        "prompt.submit",
+        {
+            "session_id": sid,
+            "text": "switch please",
+            "registration_id": "registration-b",
+            "model": "updated-model",
+            "provider": "openai",
+        },
+        transport=transport,
+    )
+
+    assert rejected["error"] == {
+        "code": 4032,
+        "message": "configuration is pinned for this employee session",
+    }
+    assert not session.get("running")
 
 
 def test_ordinary_session_create_remains_non_idempotent(owner_gateway):

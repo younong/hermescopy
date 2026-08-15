@@ -32,6 +32,7 @@ from hermes_cli.channel_identity import (
     ensure_employee_feishu_conversation_binding,
     register_employee_feishu_binding,
     resolve_connector_account,
+    update_employee_profile,
 )
 from hermes_cli.dashboard_auth.base import Session
 from hermes_cli.dashboard_auth.owner_context import owner_context_from_session
@@ -1092,6 +1093,251 @@ async def test_connector_dispatches_inbound_through_exact_owner_worker(store):
     assert client.call.await_args_list[3].args[0] == "prompt.submit"
     assert client.call.await_args_list[3].args[1]["text"] == "again"
     await connector.close()
+
+
+def _bump_employee_profile(store, registered, *, system_prompt: str) -> None:
+    """Revise the registered employee's profile (revision 1 -> 2)."""
+    with store.read() as conn:
+        employee_id = conn.execute(
+            "SELECT employee_id FROM employee_channel_bindings "
+            "WHERE connector_account_id=?",
+            (registered.account_id,),
+        ).fetchone()["employee_id"]
+    update_employee_profile(
+        store,
+        owner=_owner("owner-a"),
+        employee_id=employee_id,
+        profile={
+            "schema_version": 1,
+            "name": "employee-owner-a",
+            "model_registration_id": "registration-b",
+            "system_prompt": system_prompt,
+            "toolsets": [],
+            "skills": [],
+            "mcp_servers": [],
+            "knowledge_relative_paths": [],
+            "max_iterations": 20,
+        },
+        expected_revision=1,
+    )
+
+
+@pytest.mark.asyncio
+async def test_open_binding_session_rotates_on_profile_revision_drift(store):
+    from hermes_cli.channel_dispatch.session_router import open_binding_session
+
+    registered = _register(store)
+    client = AsyncMock()
+    client.owner = _owner("owner-a")
+    client.handle = SimpleNamespace(worker_generation=1)
+    client.call.side_effect = [
+        {"session_id": "live-1", "stored_session_id": "stored-1"},
+        {"session_id": "live-2", "stored_session_id": "stored-2"},
+    ]
+
+    assert await open_binding_session(
+        client,
+        store,
+        binding_id=registered.binding_id,
+        source="feishu",
+        title="feishu channel",
+        profile_revision=1,
+        conversation_kind="direct",
+        conversation_id="oc_chat",
+    ) == ("live-1", "stored-1")
+
+    _bump_employee_profile(
+        store, registered, system_prompt="You are the revised employee."
+    )
+
+    assert await open_binding_session(
+        client,
+        store,
+        binding_id=registered.binding_id,
+        source="feishu",
+        title="feishu channel",
+        profile_revision=2,
+        conversation_kind="direct",
+        conversation_id="oc_chat",
+    ) == ("live-2", "stored-2")
+
+    calls = client.call.await_args_list
+    assert [entry.args[0] for entry in calls] == ["session.create", "session.create"]
+    rotated_params = calls[1].args[1]
+    assert rotated_params["employee_policy"]["profile_revision"] == 2
+    assert rotated_params["employee_policy"]["source_policy"]["system_prompt"] == (
+        "You are the revised employee."
+    )
+    with store.read() as conn:
+        row = conn.execute(
+            "SELECT stored_session_id, profile_revision FROM channel_sessions"
+        ).fetchone()
+    assert tuple(row) == ("stored-2", 2)
+
+
+@pytest.mark.asyncio
+async def test_open_binding_session_rotation_lost_race_resumes_winner(store):
+    from hermes_cli.channel_dispatch.session_router import open_binding_session
+
+    registered = _register(store)
+    seed = AsyncMock()
+    seed.owner = _owner("owner-a")
+    seed.handle = SimpleNamespace(worker_generation=1)
+    seed.call.return_value = {"session_id": "live-1", "stored_session_id": "stored-1"}
+    await open_binding_session(
+        seed,
+        store,
+        binding_id=registered.binding_id,
+        source="feishu",
+        title="feishu channel",
+        profile_revision=1,
+        conversation_kind="direct",
+        conversation_id="oc_chat",
+    )
+    _bump_employee_profile(
+        store, registered, system_prompt="You are the revised employee."
+    )
+
+    def _racing_call(method, params):
+        if method == "session.create":
+            # Another worker rotated the mapping between our read and fence.
+            with store.write() as conn:
+                conn.execute(
+                    "UPDATE channel_sessions "
+                    "SET stored_session_id='stored-winner', profile_revision=2 "
+                    "WHERE binding_id=?",
+                    (registered.binding_id,),
+                )
+            return {"session_id": "live-dup", "stored_session_id": "stored-dup"}
+        if method == "session.close":
+            return {"closed": True}
+        if method == "session.resume":
+            return {"session_id": "live-winner"}
+        raise AssertionError(f"unexpected gateway call: {method}")
+
+    client = AsyncMock()
+    client.owner = _owner("owner-a")
+    client.handle = SimpleNamespace(worker_generation=1)
+    client.call.side_effect = _racing_call
+
+    assert await open_binding_session(
+        client,
+        store,
+        binding_id=registered.binding_id,
+        source="feishu",
+        title="feishu channel",
+        profile_revision=2,
+        conversation_kind="direct",
+        conversation_id="oc_chat",
+    ) == ("live-winner", "stored-winner")
+
+    calls = client.call.await_args_list
+    assert [entry.args[0] for entry in calls] == [
+        "session.create",
+        "session.close",
+        "session.resume",
+    ]
+    # The duplicate successor session is closed, and the winner's stored
+    # session is resumed.
+    assert calls[1].args[1] == {"session_id": "live-dup"}
+    assert calls[2].args[1] == {"session_id": "stored-winner", "source": "feishu"}
+    with store.read() as conn:
+        row = conn.execute(
+            "SELECT stored_session_id, profile_revision FROM channel_sessions"
+        ).fetchone()
+    assert tuple(row) == ("stored-winner", 2)
+
+
+@pytest.mark.asyncio
+async def test_connector_rotates_session_on_profile_revision_drift(store):
+    """A profile update takes effect on the next inbound Feishu message."""
+    registered = _register(store)
+    enqueue_verified_event(
+        store,
+        account_id=registered.account_id,
+        data=_event(),
+    )
+    supervisor = SimpleNamespace(global_home=store.global_home)
+    connector = FeishuConnector(
+        store,
+        supervisor,
+        account_id=registered.account_id,
+        config={"dispatch_retry_seconds": 0.001},
+        transport=AsyncMock(),
+    )
+
+    from hermes_cli.channel_identity.owner_resolution import resolve_binding
+
+    owner, _channel = resolve_binding(store, binding_id=registered.binding_id)
+    client = AsyncMock()
+    client.owner = owner
+    client.handle = SimpleNamespace(worker_generation=1)
+    client.call.side_effect = [
+        {"session_id": "live-1", "stored_session_id": "stored-1"},
+        {"status": "streaming"},
+        {"session_id": "live-2", "stored_session_id": "stored-2"},
+        {"status": "streaming"},
+    ]
+    client.wait_for_event.return_value = {
+        "method": "message.complete",
+        "params": {"session_id": "live-1", "status": "complete", "text": "answer"},
+    }
+
+    class _Context:
+        async def __aenter__(self):
+            return client
+
+        async def __aexit__(self, *_args):
+            return None
+
+    with patch(
+        "hermes_cli.channel_dispatch.dispatcher.OwnerWorkerGatewayClient",
+        return_value=_Context(),
+    ):
+        claim = connector.dispatcher.claim_next(holder="dispatcher")
+        await connector.dispatcher.dispatch_claim(claim, holder="dispatcher")
+
+    with store.write() as conn:
+        conn.execute("UPDATE outbound_messages SET status='delivered'")
+        conn.execute("UPDATE inbound_messages SET status='completed'")
+
+    _bump_employee_profile(
+        store, registered, system_prompt="You are the revised employee."
+    )
+    enqueue_verified_event(
+        store,
+        account_id=registered.account_id,
+        data=_event(message_id="om_second", content='{"text":"after update"}'),
+    )
+    claim = connector.dispatcher.claim_next(holder="dispatcher")
+    assert claim is not None
+    assert claim["profile_revision"] == 2
+    with patch(
+        "hermes_cli.channel_dispatch.dispatcher.OwnerWorkerGatewayClient",
+        return_value=_Context(),
+    ):
+        await connector.dispatcher.dispatch_claim(claim, holder="dispatcher")
+
+    calls = client.call.await_args_list
+    # The second dispatch ROTATES (new session.create with the revision-2
+    # policy) instead of resuming the revision-1 session.
+    assert calls[2].args[0] == "session.create"
+    rotated_params = calls[2].args[1]
+    assert rotated_params["employee_policy"]["profile_revision"] == 2
+    assert rotated_params["employee_policy"]["source_policy"]["system_prompt"] == (
+        "You are the revised employee."
+    )
+    assert calls[3].args[0] == "prompt.submit"
+    assert calls[3].args[1]["text"] == "after update"
+    with store.read() as conn:
+        row = conn.execute(
+            "SELECT stored_session_id, profile_revision FROM channel_sessions"
+        ).fetchone()
+        inbound = conn.execute(
+            "SELECT status FROM inbound_messages WHERE provider_message_id='om_second'"
+        ).fetchone()
+    assert tuple(row) == ("stored-2", 2)
+    assert inbound["status"] == "outbound_pending"
 
 
 @pytest.mark.asyncio
