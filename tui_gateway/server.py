@@ -5529,36 +5529,33 @@ class CollaborationAgentRunner:
             session_kind="internal_collaboration_member",
         )
 
-    def provision_member_session(self, membership, employee_policy: dict) -> None:
-        """Insert the durable hidden session on the caller's open transaction."""
-        model = employee_policy["model"]
-        self.session_db._insert_session_row(
-            membership.stored_session_id,
-            source="internal_collaboration",
-            model=str(model["model"]),
-            model_config={
-                "model": model["model"],
-                "provider": model["provider"],
-                **({"base_url": model["base_url"]} if model.get("base_url") else {}),
-                **({"api_mode": model["api_mode"]} if model.get("api_mode") else {}),
-                _EMPLOYEE_POLICY_CONFIG_KEY: employee_policy,
-            },
-            system_prompt=str(employee_policy["system_prompt"]),
-            owner_key=self.runtime.owner_key,
-            worker_generation=self.runtime.worker_generation,
+    def provision_session_generation(self, generation, employee_policy: dict) -> None:
+        """Insert one immutable collaboration session on the open transaction."""
+        self._ensure_session(
+            stored_session_id=generation.stored_session_id,
+            employee_policy=employee_policy,
             session_kind="internal_collaboration_member",
-            visibility="internal",
             conn=self.session_db._conn,
         )
 
     def ensure_coordinator_session(
-        self, *, task_id: str, employee_policy: dict[str, Any]
+        self,
+        *,
+        task_id: str,
+        membership_id: str,
+        session_generation: int,
+        employee_policy: dict[str, Any],
     ) -> tuple[str, str]:
         task_id = str(task_id or "").strip()
+        membership_id = str(membership_id or "").strip()
         if not task_id:
             raise ValueError("collaboration task ID is required")
+        if not membership_id or session_generation < 1:
+            raise ValueError("collaboration membership generation is required")
         digest = hashlib.sha256(
-            f"{self.runtime.owner_key}\x00{task_id}".encode("utf-8")
+            f"{self.runtime.owner_key}\x00{task_id}\x00{membership_id}\x00{session_generation}".encode(
+                "utf-8"
+            )
         ).hexdigest()
         stored_session_id = f"collab_coordinator_{digest}"
         hidden_session_id = f"collab_coordinator_hidden_{digest}"
@@ -5575,6 +5572,7 @@ class CollaborationAgentRunner:
         stored_session_id: str,
         employee_policy: dict[str, Any],
         session_kind: str,
+        conn=None,
     ) -> None:
         model = employee_policy["model"]
         self.session_db.create_session(
@@ -5593,6 +5591,7 @@ class CollaborationAgentRunner:
             worker_generation=self.runtime.worker_generation,
             session_kind=session_kind,
             visibility="internal",
+            conn=conn,
         )
 
     def run(

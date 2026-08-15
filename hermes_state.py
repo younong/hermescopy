@@ -188,7 +188,7 @@ def get_default_db_path() -> Path:
 
 DEFAULT_DB_PATH = get_default_db_path()
 
-SCHEMA_VERSION = 25
+SCHEMA_VERSION = 26
 
 # Cap on user-controlled FTS5 query input before regex/sanitizer processing.
 # Search queries do not need to be arbitrarily large, and bounding them keeps
@@ -924,6 +924,8 @@ CREATE TABLE IF NOT EXISTS collaboration_memberships (
     profile_fingerprint TEXT NOT NULL CHECK(length(trim(profile_fingerprint)) > 0),
     hidden_session_id TEXT NOT NULL UNIQUE CHECK(length(trim(hidden_session_id)) > 0),
     stored_session_id TEXT NOT NULL UNIQUE CHECK(length(trim(stored_session_id)) > 0),
+    current_session_generation INTEGER NOT NULL DEFAULT 1
+        CHECK(current_session_generation >= 1),
     role TEXT NOT NULL DEFAULT 'member' CHECK(role IN ('member', 'owner')),
     join_sequence INTEGER NOT NULL CHECK(join_sequence >= 1),
     leave_sequence INTEGER CHECK(leave_sequence IS NULL OR leave_sequence > join_sequence),
@@ -932,6 +934,31 @@ CREATE TABLE IF NOT EXISTS collaboration_memberships (
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_collaboration_membership_active
 ON collaboration_memberships(group_id, employee_id) WHERE leave_sequence IS NULL;
+CREATE TABLE IF NOT EXISTS collaboration_member_session_generations (
+    membership_id TEXT NOT NULL REFERENCES collaboration_memberships(membership_id),
+    generation INTEGER NOT NULL CHECK(generation >= 1),
+    profile_revision INTEGER NOT NULL CHECK(profile_revision >= 1),
+    profile_fingerprint TEXT NOT NULL CHECK(length(trim(profile_fingerprint)) > 0),
+    policy_fingerprint TEXT NOT NULL CHECK(length(trim(policy_fingerprint)) > 0),
+    policy_json TEXT NOT NULL
+        CHECK(json_valid(policy_json) AND json_type(policy_json) = 'object'),
+    hidden_session_id TEXT NOT NULL UNIQUE CHECK(length(trim(hidden_session_id)) > 0),
+    stored_session_id TEXT NOT NULL UNIQUE CHECK(length(trim(stored_session_id)) > 0),
+    activated_event_id TEXT NOT NULL REFERENCES collaboration_events(event_id),
+    activated_sequence INTEGER NOT NULL CHECK(activated_sequence >= 1),
+    created_at REAL NOT NULL,
+    PRIMARY KEY (membership_id, generation)
+);
+CREATE TRIGGER IF NOT EXISTS collaboration_member_session_generations_append_only_update
+BEFORE UPDATE ON collaboration_member_session_generations
+BEGIN
+    SELECT RAISE(ABORT, 'collaboration member session generations are append-only');
+END;
+CREATE TRIGGER IF NOT EXISTS collaboration_member_session_generations_append_only_delete
+BEFORE DELETE ON collaboration_member_session_generations
+BEGIN
+    SELECT RAISE(ABORT, 'collaboration member session generations are append-only');
+END;
 CREATE TABLE IF NOT EXISTS collaboration_tasks (
     task_id TEXT PRIMARY KEY,
     group_id TEXT NOT NULL REFERENCES collaboration_groups(group_id),
@@ -1013,6 +1040,7 @@ CREATE TABLE IF NOT EXISTS collaboration_turn_targets (
     turn_id TEXT NOT NULL REFERENCES collaboration_turns(turn_id),
     employee_id TEXT NOT NULL,
     membership_id TEXT NOT NULL REFERENCES collaboration_memberships(membership_id),
+    session_generation INTEGER NOT NULL DEFAULT 1 CHECK(session_generation >= 1),
     join_sequence INTEGER NOT NULL CHECK(join_sequence >= 1),
     snapshot_sequence INTEGER NOT NULL CHECK(snapshot_sequence >= join_sequence),
     status TEXT NOT NULL DEFAULT 'queued'
@@ -2195,6 +2223,62 @@ class SessionDB(SessionQueryMixin):
         cursor.execute("PRAGMA foreign_keys=ON")
         cursor.execute("UPDATE schema_version SET version=24")
 
+    @staticmethod
+    def _migrate_v25_to_v26_collaboration_session_generations(
+        cursor: sqlite3.Cursor,
+    ) -> None:
+        """Backfill immutable generation 1 from each valid retained member session."""
+        from hermes_cli.employee_policy import normalize_employee_snapshot_for_resume
+
+        rows = cursor.execute(
+            "SELECT m.*, s.model_config, e.event_id AS activated_event_id "
+            "FROM collaboration_memberships m "
+            "LEFT JOIN sessions s ON s.id=m.stored_session_id "
+            "LEFT JOIN collaboration_events e ON e.group_id=m.group_id "
+            "AND e.sequence=m.join_sequence AND e.event_kind='membership.joined'"
+        )
+        for row in rows:
+            try:
+                raw_config = row["model_config"]
+                model_config = (
+                    dict(raw_config)
+                    if isinstance(raw_config, dict)
+                    else json.loads(str(raw_config or "{}"))
+                )
+                raw_policy = model_config.get("hermes_employee_policy")
+                if not isinstance(raw_policy, dict):
+                    continue
+                policy = normalize_employee_snapshot_for_resume(raw_policy)
+                policy_fingerprint = str(policy["snapshot_fingerprint"])
+            except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+                continue
+            if row["activated_event_id"] is None:
+                continue
+            cursor.execute(
+                "INSERT OR IGNORE INTO collaboration_member_session_generations "
+                "(membership_id, generation, profile_revision, profile_fingerprint, "
+                "policy_fingerprint, policy_json, hidden_session_id, stored_session_id, "
+                "activated_event_id, activated_sequence, created_at) "
+                "VALUES (?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    row["membership_id"],
+                    row["profile_revision"],
+                    row["profile_fingerprint"],
+                    policy_fingerprint,
+                    json.dumps(
+                        policy,
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                        sort_keys=True,
+                    ),
+                    row["hidden_session_id"],
+                    row["stored_session_id"],
+                    row["activated_event_id"],
+                    row["join_sequence"],
+                    row["created_at"],
+                ),
+            )
+
     def _init_schema(self):
         """Create tables and FTS if they don't exist, reconcile columns.
 
@@ -2291,6 +2375,8 @@ class SessionDB(SessionQueryMixin):
                 )
             if current_version < 23:
                 self._rebuild_collaboration_phase3_tables(cursor)
+            if current_version < 26:
+                self._migrate_v25_to_v26_collaboration_session_generations(cursor)
             if current_version < 10 and SCHEMA_VERSION == 10:
                 # v10: trigram FTS5 table for CJK/substring search. The
                 # virtual table + triggers are created unconditionally via

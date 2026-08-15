@@ -3891,6 +3891,91 @@ class TestListSessionsRich:
         ).fetchone()) == ("web_group", 1)
         reopened.close()
 
+    def test_v26_backfills_immutable_collaboration_session_generation(self, tmp_path):
+        from hermes_cli.collaboration.models import CollaborationMemberProfile
+        from hermes_cli.collaboration.resolver import collaboration_member_policy
+        from hermes_cli.collaboration.store import CollaborationStore
+        from hermes_cli.employee_policy import (
+            canonical_employee_snapshot,
+            normalize_employee_snapshot_for_resume,
+        )
+
+        db_path = tmp_path / "state.db"
+        db = SessionDB(db_path=db_path)
+        store = CollaborationStore(db, owner_key="owner-a")
+        group = store.create_group(
+            "Legacy group",
+            members=[
+                CollaborationMemberProfile(
+                    "emp_user4", 1, "fingerprint-emp_user4-r1"
+                )
+            ],
+        )
+        membership = store.active_memberships(group.group_id)[0]
+        policy = collaboration_member_policy(
+            canonical_employee_snapshot(
+                {
+                    "employee_id": "emp_user4",
+                    "profile_revision": 1,
+                    "source_profile_fingerprint": "fingerprint-emp_user4-r1",
+                    "system_prompt": "Legacy policy",
+                    "model": {"provider": "openai", "model": "legacy-model"},
+                    "workspace_relative_path": "employees/new-employee",
+                    "knowledge_relative_paths": [],
+                }
+            )[0],
+            membership.membership_id,
+        )
+        db.create_session(
+            membership.stored_session_id,
+            "internal_collaboration",
+            model="legacy-model",
+            model_config={"hermes_employee_policy": policy},
+            session_kind="internal_collaboration_member",
+            visibility="internal",
+        )
+        db._conn.execute(
+            "DROP TRIGGER collaboration_member_session_generations_append_only_update"
+        )
+        db._conn.execute(
+            "DROP TRIGGER collaboration_member_session_generations_append_only_delete"
+        )
+        db._conn.execute("DROP TABLE collaboration_member_session_generations")
+        db._conn.execute("UPDATE schema_version SET version=25")
+        db._conn.commit()
+        db.close()
+
+        migrated = SessionDB(db_path=db_path)
+        generation = migrated._conn.execute(
+            "SELECT * FROM collaboration_member_session_generations "
+            "WHERE membership_id=?",
+            (membership.membership_id,),
+        ).fetchone()
+        assert generation["generation"] == 1
+        assert generation["policy_fingerprint"] == normalize_employee_snapshot_for_resume(
+            policy
+        )["snapshot_fingerprint"]
+        assert generation["stored_session_id"] == membership.stored_session_id
+        assert generation["hidden_session_id"] == membership.hidden_session_id
+        assert migrated._conn.execute(
+            "SELECT version FROM schema_version"
+        ).fetchone()[0] == 26
+        with pytest.raises(sqlite3.IntegrityError, match="append-only"):
+            migrated._conn.execute(
+                "UPDATE collaboration_member_session_generations "
+                "SET profile_revision=2 WHERE membership_id=?",
+                (membership.membership_id,),
+            )
+        migrated.close()
+
+        reopened = SessionDB(db_path=db_path)
+        assert reopened._conn.execute(
+            "SELECT COUNT(*) FROM collaboration_member_session_generations "
+            "WHERE membership_id=?",
+            (membership.membership_id,),
+        ).fetchone()[0] == 1
+        reopened.close()
+
     def test_v25_adds_durable_collaboration_discussion_tables(self, tmp_path):
         db_path = tmp_path / "state.db"
         db = SessionDB(db_path=db_path)
@@ -3912,7 +3997,9 @@ class TestListSessionsRich:
             "collaboration_discussions",
             "collaboration_discussion_rounds",
         }
-        assert migrated._conn.execute("SELECT version FROM schema_version").fetchone()[0] == 25
+        assert migrated._conn.execute(
+            "SELECT version FROM schema_version"
+        ).fetchone()[0] == SCHEMA_VERSION
         migrated.close()
 
     def test_v24_migration_rebuilds_empty_legacy_collaboration_schema(self, tmp_path):
@@ -3955,7 +4042,7 @@ class TestListSessionsRich:
         assert "account_id" not in columns
         assert migrated._conn.execute(
             "SELECT version FROM schema_version"
-        ).fetchone()[0] == 25
+        ).fetchone()[0] == SCHEMA_VERSION
         assert migrated._conn.execute("PRAGMA foreign_key_check").fetchall() == []
         migrated.close()
 

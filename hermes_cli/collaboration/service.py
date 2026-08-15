@@ -21,6 +21,7 @@ from hermes_cli.employee_policy import employee_policy_with_workspace
 from hermes_state import SessionDB
 
 from .agent_tools import CollaborationAgentContext
+from .models import CollaborationMembership
 from .parser import parse_discussion_round_count
 from .resolver import CollaborationEmployeeResolver, collaboration_member_policy
 from .store import CollaborationStore
@@ -47,7 +48,7 @@ class CollaborationService:
         resolver: CollaborationEmployeeResolver,
         emit: Callable[[str, dict[str, Any]], None],
         ensure_member_session: Callable[..., None],
-        provision_member_session: Callable[..., None] | None = None,
+        provision_session_generation: Callable[..., None] | None = None,
         filesystem_context: AuthenticatedWorkspaceContext | None = None,
         deliver_web_origin: Callable[..., None] | None = None,
         worker_id: str | None = None,
@@ -61,7 +62,7 @@ class CollaborationService:
         self.resolver = resolver
         self.emit = emit
         self.ensure_member_session = ensure_member_session
-        self.provision_member_session = provision_member_session
+        self.provision_session_generation = provision_session_generation
         self.filesystem_context = filesystem_context
         self.deliver_web_origin = deliver_web_origin
         self.worker_id = str(worker_id or "") or None
@@ -69,6 +70,20 @@ class CollaborationService:
         self.lease_version = lease_version
         self.recovery_generation = recovery_generation
         self.scheduler: SchedulerControl | None = None
+
+    def _provision_initial_session(
+        self,
+        membership: CollaborationMembership,
+        employee_policy: dict[str, Any],
+    ) -> None:
+        if self.provision_session_generation is None:
+            return
+        self.provision_session_generation(membership, employee_policy)
+        self.store.record_initial_member_session_generation(
+            self.db._conn,
+            membership=membership,
+            employee_policy=employee_policy,
+        )
 
     def bind_scheduler(self, scheduler: SchedulerControl) -> None:
         if self.scheduler is not None:
@@ -108,8 +123,7 @@ class CollaborationService:
             policy = collaboration_member_policy(
                 policies[member.employee_id], membership.membership_id
             )
-            if self.provision_member_session is not None:
-                self.provision_member_session(membership, policy)
+            self._provision_initial_session(membership, policy)
 
         group = self.store.create_group(
             name,
@@ -179,8 +193,7 @@ class CollaborationService:
             policy = collaboration_member_policy(
                 resolved_policies[member.employee_id], membership.membership_id
             )
-            if self.provision_member_session is not None:
-                self.provision_member_session(membership, policy)
+            self._provision_initial_session(membership, policy)
 
         memberships = self.store.update_memberships(
             group_id,
@@ -761,6 +774,8 @@ class CollaborationService:
         for key in (
             "hidden_session_id",
             "stored_session_id",
+            "current_session_generation",
+            "session_generation",
             "source_policy",
             "owner_key",
             "worker_owner_key",
