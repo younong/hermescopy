@@ -1617,11 +1617,16 @@ def _start_agent_build(sid: str, session: dict) -> None:
         runtime_token = _gateway_runtime.set(runtime)
         current = None
         notify_registered = False
+        epoch = None
         try:
             with _sessions_lock:
                 current = _sessions.get(sid)
             if current is None:
                 return
+            # A web direct employee re-pin bumps this epoch while swapping the
+            # session onto a fresh policy snapshot. If it moved mid-build, this
+            # agent carries a stale identity and must not land.
+            epoch = int(current.get("_agent_build_epoch", 0))
 
             try:
                 tokens = _set_session_context(key)
@@ -1661,6 +1666,16 @@ def _start_agent_build(sid: str, session: dict) -> None:
                 agent = _make_agent(sid, key, **kw)
             finally:
                 _clear_session_context(tokens)
+
+            if int(current.get("_agent_build_epoch", 0)) != epoch:
+                # Superseded by a re-pin while building: discard this agent and
+                # leave session state to the replacement build. The finally
+                # block still releases the (old) ready event and runtime token.
+                try:
+                    agent.close()
+                except Exception:
+                    pass
+                return
 
             # Session DB row deferred to first run_conversation() call.
             # pending_title applied post-first-message (see cli.exec handler).
@@ -1721,7 +1736,10 @@ def _start_agent_build(sid: str, session: dict) -> None:
             # _schedule_mcp_late_refresh. Cache-safe (pre-first-turn only).
             _schedule_mcp_late_refresh(sid, agent)
         except Exception as e:
-            if current is not None:
+            if current is not None and (
+                epoch is None
+                or int(current.get("_agent_build_epoch", 0)) == epoch
+            ):
                 current["agent_error"] = str(e)
             _emit("error", sid, {"message": f"agent init failed: {e}"})
         finally:
@@ -2818,6 +2836,26 @@ def _stored_session_runtime_overrides(row: dict | None) -> dict:
                 raise RuntimeError("built-in assistant session identity is inconsistent")
         elif builtin_id or employee_policy.get("builtin_assistant") is True:
             raise RuntimeError("built-in assistant authority is unavailable")
+        # Profile updated since this conversation was pinned? Adopt the fresh
+        # snapshot in place: the durable conversation keeps its history but
+        # runs the current model/toolsets/system prompt from here on.
+        fresh_policy = _resolve_current_web_direct_policy(
+            service, direct_employee_id
+        )
+        if _web_direct_policy_identity(
+            employee_policy
+        ) != _web_direct_policy_identity(fresh_policy):
+            employee_policy = fresh_policy
+            overrides["employee_policy"] = fresh_policy
+            overrides["model_override"] = _web_direct_model_override(fresh_policy)
+            # Route/reasoning entries derived from the OLD snapshot are stale;
+            # the rebuild derives them from the fresh policy.
+            overrides.pop("provider_override", None)
+            overrides.pop("reasoning_config_override", None)
+            overrides.pop("service_tier_override", None)
+            _persist_web_direct_policy_repin(
+                {"session_key": session_key}, fresh_policy
+            )
         overrides["collaboration_context"] = _web_direct_collaboration_context(
             service=service,
             employee_policy=employee_policy,
@@ -6231,12 +6269,42 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
         queued = session.get("queued_prompt")
         if not queued:
             return False
+        # A profile update arrived while the previous turn ran: swap onto the
+        # fresh snapshot BEFORE claiming this turn so it runs on the current
+        # employee identity (the finished turn kept the policy it started with).
+        retired_agent = None
+        repin_policy = None
+        pending_repin = session.pop("_pending_employee_repin", None)
+        if isinstance(pending_repin, dict):
+            retired_agent, applied = _apply_web_direct_repin_locked(
+                session, pending_repin
+            )
+            if applied:
+                repin_policy = pending_repin
         generation = _claim_turn_locked(session, queued["text"])
-        if generation is None:
-            return False
-        session["queued_prompt"] = None
-        if queued.get("transport") is not None:
-            session["transport"] = queued["transport"]
+        if generation is not None:
+            session["queued_prompt"] = None
+            if queued.get("transport") is not None:
+                session["transport"] = queued["transport"]
+    if repin_policy is not None:
+        _finish_web_direct_repin(sid, session, repin_policy, retired_agent)
+    if generation is None:
+        return False
+    if repin_policy is not None:
+        if err := _wait_agent(session, rid):
+            with session["history_lock"]:
+                session["running"] = False
+                _clear_inflight_turn(session, generation)
+            _emit(
+                "error",
+                sid,
+                {
+                    "message": err.get("error", {}).get(
+                        "message", "agent initialization failed"
+                    )
+                },
+            )
+            return True
     try:
         _run_prompt_submit(
             rid,
@@ -6429,6 +6497,32 @@ def _trusted_retained_collaboration_context(
         return None, str(exc)
 
 
+def _resolve_current_web_direct_policy(
+    service: Any,
+    employee_id: str,
+) -> dict[str, Any]:
+    """Resolve the CURRENT canonical policy snapshot for a web direct employee.
+
+    The built-in assistant snapshot is augmented with the runtime toolset list
+    before canonicalization. Every fresh-policy consumer (session.create pinning
+    AND drift detection in _repin_web_direct_employee_policy /
+    _stored_session_runtime_overrides) must go through this helper so the
+    produced snapshots are byte-identical — a raw resolve_current result lacks
+    ``runtime_toolsets`` and would never fingerprint-match a stored builtin
+    policy, causing a perpetual re-pin loop.
+    """
+    resolved = service.resolver.resolve_current(employee_id)
+    employee_policy = resolved.employee_policy
+    if resolved.may_manage_employees:
+        from hermes_cli.employee_policy import canonical_employee_snapshot
+
+        snapshot = dict(employee_policy)
+        snapshot.pop("snapshot_fingerprint", None)
+        snapshot["runtime_toolsets"] = _load_enabled_toolsets()
+        employee_policy, _ = canonical_employee_snapshot(snapshot)
+    return employee_policy
+
+
 def _web_direct_employee(
     params: dict,
     *,
@@ -6449,16 +6543,7 @@ def _web_direct_employee(
         return None, None, "employee direct chat requires an owner worker runtime"
     try:
         service = _collaboration_service()
-        resolved = service.resolver.resolve_current(employee_id)
-        employee_policy = resolved.employee_policy
-        if resolved.may_manage_employees:
-            from hermes_cli.employee_policy import canonical_employee_snapshot
-
-            snapshot = dict(employee_policy)
-            snapshot.pop("snapshot_fingerprint", None)
-            snapshot["runtime_toolsets"] = _load_enabled_toolsets()
-            employee_policy, _ = canonical_employee_snapshot(snapshot)
-        return employee_policy, service, None
+        return _resolve_current_web_direct_policy(service, employee_id), service, None
     except (TypeError, ValueError, RuntimeError) as exc:
         return None, None, str(exc)
 
@@ -6509,6 +6594,171 @@ def _web_direct_binding_is_current(session: dict) -> bool:
         return db.web_direct_employee_binding_matches(**binding)
     except (TypeError, ValueError):
         return False
+
+
+def _web_direct_policy_identity(policy: dict) -> tuple[int, str]:
+    """Return the (revision, fingerprint) pair used for policy drift checks."""
+    return (
+        int(policy.get("profile_revision") or 0),
+        str(policy.get("snapshot_fingerprint") or ""),
+    )
+
+
+def _web_direct_model_override(fresh_policy: dict) -> dict:
+    """Build the session model_override for an employee policy snapshot."""
+    model = fresh_policy["model"]
+    return {
+        "model": model["model"],
+        "provider": model["provider"],
+        "base_url": model.get("base_url") or None,
+        "api_mode": model.get("api_mode") or None,
+    }
+
+
+def _persist_web_direct_policy_repin(session: dict, fresh_policy: dict) -> None:
+    """Merge a re-pinned snapshot into the stored sessions row.
+
+    The merge preserves the web direct identity keys (and any unrelated keys)
+    while replacing the policy snapshot and model route. A conversation that
+    was reserved but never messaged has no row yet; its next prompt.submit
+    persists the fresh policy via _ensure_session_db_row.
+    """
+    db = _get_db()
+    key = str(session.get("session_key") or "")
+    if db is None or not key:
+        return
+    row = db.get_session(key)
+    if not row:
+        return
+    raw_config = row.get("model_config")
+    try:
+        model_config = (
+            dict(raw_config)
+            if isinstance(raw_config, dict)
+            else json.loads(str(raw_config or "{}"))
+        )
+    except (TypeError, ValueError):
+        model_config = {}
+    model = fresh_policy["model"]
+    for cfg_key in ("model", "provider", "base_url", "api_mode"):
+        if val := model.get(cfg_key):
+            model_config[cfg_key] = val
+        else:
+            model_config.pop(cfg_key, None)
+    model_config[_EMPLOYEE_POLICY_CONFIG_KEY] = fresh_policy
+    # Per-chat reasoning/tier picks have no meaning under an employee policy
+    # (the 4032 pin forbids them); drop stale entries so a later resume derives
+    # them from the fresh snapshot's reasoning_effort.
+    model_config.pop("reasoning_config", None)
+    model_config.pop("service_tier", None)
+    db.update_session_meta(
+        key,
+        json.dumps(model_config),
+        model=str(model.get("model") or ""),
+    )
+
+
+def _apply_web_direct_repin_locked(
+    session: dict,
+    fresh_policy: dict,
+) -> tuple[Any | None, bool]:
+    """Swap a live session onto a fresh policy snapshot.
+
+    Callers hold ``session["history_lock"]``. Returns ``(retired_agent,
+    changed)``. History is deliberately untouched — the durable conversation
+    keeps its transcript; only the runtime identity (policy, model override,
+    agent build state) is re-pinned. ``_agent_build_epoch`` invalidates any
+    in-flight build so a stale-policy agent can't land after the swap (see
+    _start_agent_build).
+    """
+    pinned = session.get("employee_policy")
+    if not isinstance(pinned, dict) or (
+        _web_direct_policy_identity(pinned)
+        == _web_direct_policy_identity(fresh_policy)
+    ):
+        return None, False
+    session["employee_policy"] = fresh_policy
+    session["model_override"] = _web_direct_model_override(fresh_policy)
+    # A stale deferred-resume overrides dict would win over the fresh session
+    # fields in _start_agent_build; clear it so the rebuild derives everything
+    # (including reasoning config) from the fresh snapshot.
+    session["resume_runtime_overrides"] = None
+    session.pop("_pending_employee_repin", None)
+    session["_agent_build_epoch"] = int(session.get("_agent_build_epoch", 0)) + 1
+    retired = session.get("agent")
+    if retired is not None or session.get("agent_build_started"):
+        session["agent"] = None
+        session["agent_ready"] = threading.Event()
+        session.pop("agent_build_started", None)
+        session["agent_error"] = None
+    return retired, True
+
+
+def _finish_web_direct_repin(
+    sid: str,
+    session: dict,
+    fresh_policy: dict,
+    retired_agent: Any | None,
+) -> None:
+    """Persist and rebuild after a re-pin swap (call WITHOUT any session lock)."""
+    _persist_web_direct_policy_repin(session, fresh_policy)
+    if retired_agent is not None:
+        try:
+            retired_agent.close()
+        except Exception:
+            logger.debug("re-pin retired agent close failed", exc_info=True)
+    _start_agent_build(sid, session)
+    # The rebuilt agent assembles the full employee system prompt (capability
+    # lines, skills prompt) internally; refresh the stored snapshot only once
+    # the build lands rather than duplicating that assembly here.
+    ready = session.get("agent_ready")
+
+    def _persist_prompt_when_ready() -> None:
+        if ready is None or not ready.wait(timeout=60.0):
+            return
+        if session.get("agent_error"):
+            return
+        _persist_live_session_system_prompt(session)
+
+    threading.Thread(
+        target=_persist_prompt_when_ready,
+        daemon=True,
+        name=f"web-direct-repin-{sid}",
+    ).start()
+
+
+def _repin_web_direct_employee_policy(
+    sid: str,
+    session: dict,
+    fresh_policy: dict,
+) -> bool:
+    """Re-pin a live web direct session to the current employee policy.
+
+    Returns True when a re-pin was applied or deferred. An idle session swaps
+    immediately; a running session defers to the next drain via
+    ``_pending_employee_repin`` so the in-flight turn finishes on the policy it
+    started with. Callers must NOT hold ``session["history_lock"]``.
+    """
+    if not isinstance(session.get("web_direct_binding"), dict):
+        return False
+    if not isinstance(fresh_policy, dict):
+        return False
+    pinned = session.get("employee_policy")
+    if not isinstance(pinned, dict):
+        return False
+    if _web_direct_policy_identity(pinned) == _web_direct_policy_identity(
+        fresh_policy
+    ):
+        return False
+    with session["history_lock"]:
+        if session.get("running"):
+            session["_pending_employee_repin"] = fresh_policy
+            return True
+        retired, changed = _apply_web_direct_repin_locked(session, fresh_policy)
+    if not changed:
+        return False
+    _finish_web_direct_repin(sid, session, fresh_policy, retired)
+    return True
 
 
 def _collaboration_call(rid, callback) -> dict:
@@ -6777,6 +7027,9 @@ def _session_create(rid, params: dict) -> dict:
                 "session_id": key,
                 "_dashboard_attach": True,
                 "display_history": {"limit": 100},
+                # Freshly resolved current policy: lets the resume fast path
+                # re-pin a still-live session whose profile was edited.
+                "_employee_policy_repin": direct_employee_policy,
             }
             try:
                 response = _session_resume(rid, resume_params)
@@ -6863,12 +7116,7 @@ def _session_create(rid, params: dict) -> dict:
         else (str(params.get("model") or "").strip(), str(params.get("provider") or "").strip())
     )
     session_model_override = (
-        {
-            "model": employee_policy["model"]["model"],
-            "provider": employee_policy["model"]["provider"],
-            "base_url": employee_policy["model"].get("base_url") or None,
-            "api_mode": employee_policy["model"].get("api_mode") or None,
-        }
+        _web_direct_model_override(employee_policy)
         if employee_policy is not None
         else (
             {
@@ -6953,6 +7201,12 @@ def _session_create(rid, params: dict) -> dict:
         live_session["collaboration_context"] = live_context
         if live_session.get("agent") is not None:
             live_session["agent"].collaboration_context = live_context
+        # Profile edited while this conversation was live? Re-pin it onto the
+        # fresh snapshot (history preserved) so the payload below and the next
+        # turn reflect the current model/toolsets/prompt.
+        _repin_web_direct_employee_policy(
+            live_sid, live_session, direct_employee_policy
+        )
         response = _ok(
             rid,
             {
@@ -7627,6 +7881,13 @@ def _session_resume(rid, params: dict) -> dict:
     with _session_resume_lock:
         live = _find_live_session_by_key(target)
         if live is not None:
+            # A web direct reopen carries the freshly resolved employee policy
+            # ("_employee_policy_repin", set by _session_create); re-pin a live
+            # session whose profile was edited since it was pinned. Lock order
+            # resume_lock -> history_lock matches _reuse_live_payload.
+            repin_policy = params.get("_employee_policy_repin")
+            if isinstance(repin_policy, dict):
+                _repin_web_direct_employee_policy(live[0], live[1], repin_policy)
             response = _ok(rid, _reuse_live_payload(*live))
             log_latency_stage(
                 logger,
@@ -8148,10 +8409,24 @@ def _fallback_session_info(session: dict) -> dict:
     agent = session.get("agent")
     if agent is not None:
         return _session_info(agent)
+    # An employee session mid-rebuild (e.g. right after a policy re-pin retired
+    # the old agent) must keep reporting its pinned model, never the global
+    # default — otherwise the composer badge flashes the wrong model.
+    override = session.get("model_override")
+    pinned_model = (
+        str(override.get("model") or "").strip()
+        if isinstance(override, dict) and session.get("employee_policy") is not None
+        else ""
+    )
     return {
         "cwd": os.getenv("TERMINAL_CWD", os.getcwd()),
         "lazy": True,
-        "model": _resolve_model(),
+        "model": pinned_model or _resolve_model(),
+        **(
+            {"provider": str(override.get("provider"))}
+            if pinned_model and override.get("provider")
+            else {}
+        ),
         "skills": {},
         "tools": {},
     }
@@ -10691,6 +10966,22 @@ def _(rid, params: dict) -> dict:
         session["transport"] = t
     if not _web_direct_binding_is_current(session):
         return _err(rid, 4093, "employee conversation was reset — reopen the contact")
+    # Adopt employee profile updates (model/toolsets/system prompt) in place:
+    # resolve the current policy and re-pin this conversation before the turn
+    # claims it. A resolution failure must not break chatting — the pinned
+    # snapshot stays in effect, exactly as before this check existed.
+    if isinstance(session.get("web_direct_binding"), dict) and isinstance(
+        session.get("employee_policy"), dict
+    ):
+        try:
+            fresh_policy = _resolve_current_web_direct_policy(
+                _collaboration_service(),
+                str(session["web_direct_binding"]["employee_id"]),
+            )
+        except Exception:
+            logger.debug("web direct policy refresh failed", exc_info=True)
+        else:
+            _repin_web_direct_employee_policy(sid, session, fresh_policy)
     with session["history_lock"]:
         if session.get("running"):
             # Don't reject a mid-turn prompt — queue it (and, by default,

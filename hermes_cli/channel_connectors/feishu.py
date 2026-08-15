@@ -376,23 +376,11 @@ def enqueue_verified_event(
                 if scope_seed
                 else ""
             )
+        # Always stamp the CURRENT profile revision. Drift against an existing
+        # channel_sessions mapping is handled by rotation at dispatch time
+        # (open_binding_session), so an employee profile update takes effect on
+        # the next inbound message instead of wedging the scope.
         profile_revision = int(account["revision"])
-        peer_hash = store.crypto.lookup_hash(
-            f"conversation:{PROVIDER}", envelope.conversation_id
-        )
-        with store.read() as conn:
-            session = conn.execute(
-                """
-                SELECT s.profile_revision FROM channel_bindings b
-                JOIN channel_sessions s ON s.binding_id=b.binding_id
-                                       AND s.dispatch_scope=?
-                WHERE b.account_id=? AND b.peer_lookup_hash=?
-                  AND b.status='active'
-                """,
-                (dispatch_scope, account_id, peer_hash),
-            ).fetchone()
-        if session is not None and session["profile_revision"] is not None:
-            profile_revision = int(session["profile_revision"])
         envelope = replace(
             envelope,
             dispatch_scope=dispatch_scope,
