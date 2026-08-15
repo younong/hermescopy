@@ -104,6 +104,7 @@ vi.mock("../Composer", () => ({
         {(props.attachmentToQueue as { file?: File } | undefined)?.file?.name}
       </span>
       <div data-composer-model-picker>{props.modelPicker as ReactNode}</div>
+      <div data-composer-reasoning-picker-slot>{props.reasoningPicker as ReactNode}</div>
       <button
         data-composer-ack-reused-file
         onClick={() => {
@@ -444,6 +445,19 @@ describe("GuiChatShell", () => {
       { employeeId: "employee-a" },
     );
     expect(document.querySelector("[data-composer-send]")).not.toBeNull();
+  });
+
+  it("hides the model and reasoning pickers in employee conversations", async () => {
+    const connection = createConnection();
+    mocks.getAuthMe.mockResolvedValue(authIdentity());
+    mocks.connectGuiChat.mockReturnValue(connection);
+    mocks.getEmployees.mockResolvedValue({ employees: [employee()] });
+
+    await renderShellAt("/chat?employee=employee-a");
+
+    expect(document.querySelector("[data-composer-send]")).not.toBeNull();
+    expect(document.querySelector("[data-composer-model-picker]")?.childElementCount).toBe(0);
+    expect(document.querySelector("[data-composer-reasoning-picker-slot]")?.childElementCount).toBe(0);
   });
 
   it("reopens employee routes across A to B to A navigation and reload", async () => {

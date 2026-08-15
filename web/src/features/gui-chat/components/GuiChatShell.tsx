@@ -1172,13 +1172,15 @@ export function GuiChatShell() {
           disabled={disabled}
           isGenerating={state.isGenerating}
           modelPicker={
-            <ComposerModelPicker
-              canSelect={Boolean(state.sessionId && state.connection === "open")}
-              currentModel={selectedChatRegistration?.model ?? state.model}
-              currentProvider={selectedChatRegistration?.provider ?? state.provider}
-              onManageModels={() => navigate("/chat/models")}
-              onSelect={selectChatModel}
-            />
+            employeeId ? undefined : (
+              <ComposerModelPicker
+                canSelect={Boolean(state.sessionId && state.connection === "open")}
+                currentModel={selectedChatRegistration?.model ?? state.model}
+                currentProvider={selectedChatRegistration?.provider ?? state.provider}
+                onManageModels={() => navigate("/chat/models")}
+                onSelect={selectChatModel}
+              />
+            )
           }
           onAttachmentQueued={(requestId) => {
             setAttachmentsToQueue((current) =>
@@ -1186,15 +1188,17 @@ export function GuiChatShell() {
             );
           }}
           reasoningPicker={
-            <ComposerReasoningPicker
-              busy={state.isGenerating}
-              currentLevel={state.reasoningEffort}
-              levels={state.supportedReasoningLevels}
-              onChange={async (level: ReasoningLevel) => {
-                if (!state.sessionId) return;
-                await connectionRef.current?.setReasoningLevel(state.sessionId, level);
-              }}
-            />
+            employeeId ? undefined : (
+              <ComposerReasoningPicker
+                busy={state.isGenerating}
+                currentLevel={state.reasoningEffort}
+                levels={state.supportedReasoningLevels}
+                onChange={async (level: ReasoningLevel) => {
+                  if (!state.sessionId) return;
+                  await connectionRef.current?.setReasoningLevel(state.sessionId, level);
+                }}
+              />
+            )
           }
           onSend={send}
           onStop={stop}
