@@ -812,6 +812,7 @@ def test_state_machine_schema_has_durable_scheduler_fields(db):
     }
     assert {
         "execution_id",
+        "session_generation",
         "error",
         "result_json",
         "last_delivered_sequence",
@@ -874,3 +875,24 @@ def test_state_machine_schema_has_durable_scheduler_fields(db):
     }
     assert "storage_key" in attachment_columns
     assert "source_path" not in attachment_columns
+    membership_columns = {
+        row["name"]
+        for row in db._conn.execute("PRAGMA table_info(collaboration_memberships)")
+    }
+    assert "current_session_generation" in membership_columns
+    generation_columns = {
+        row["name"]
+        for row in db._conn.execute(
+            "PRAGMA table_info(collaboration_member_session_generations)"
+        )
+    }
+    assert {
+        "membership_id",
+        "generation",
+        "policy_fingerprint",
+        "policy_json",
+        "hidden_session_id",
+        "stored_session_id",
+        "activated_event_id",
+        "activated_sequence",
+    } <= generation_columns

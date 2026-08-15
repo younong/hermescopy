@@ -45,8 +45,17 @@ class CollaborationPromptRunner(Protocol):
     ) -> dict[str, Any]: ...
 
     def ensure_coordinator_session(
-        self, *, task_id: str, employee_policy: dict[str, Any]
+        self,
+        *,
+        task_id: str,
+        membership_id: str,
+        session_generation: int,
+        employee_policy: dict[str, Any],
     ) -> tuple[str, str]: ...
+
+    def provision_session_generation(
+        self, generation, employee_policy: dict[str, Any]
+    ) -> None: ...
 
     def interrupt(self, hidden_session_id: str) -> bool: ...
 
@@ -264,17 +273,21 @@ class CollaborationScheduler:
         from tools.approval import resolve_gateway_approval
 
         with self.db._lock:
-            membership = self.db._conn.execute(
-                "SELECT stored_session_id FROM collaboration_memberships WHERE membership_id=?",
-                (target["membership_id"],),
+            generation = self.db._conn.execute(
+                "SELECT COALESCE(sg.stored_session_id, m.stored_session_id) "
+                "AS stored_session_id FROM collaboration_memberships m "
+                "LEFT JOIN collaboration_member_session_generations sg "
+                "ON sg.membership_id=m.membership_id AND sg.generation=? "
+                "WHERE m.membership_id=?",
+                (target["session_generation"], target["membership_id"]),
             ).fetchone()
         resolved = (
             resolve_gateway_approval(
-                str(membership["stored_session_id"]),
+                str(generation["stored_session_id"]),
                 choice,
                 tool_call_id=str(approval["tool_call_id"]),
             )
-            if membership
+            if generation
             else 0
         )
         if resolved == 0:
@@ -375,11 +388,17 @@ class CollaborationScheduler:
                 return dict(self._owned_target(conn, target_id)), None
             updated = dict(self._owned_target(conn, target_id))
             aggregate_collaboration_turn(conn, str(updated["turn_id"]), now)
-            membership = conn.execute(
-                "SELECT hidden_session_id FROM collaboration_memberships WHERE membership_id=?",
-                (updated["membership_id"],),
+            generation = conn.execute(
+                "SELECT COALESCE(sg.hidden_session_id, m.hidden_session_id) "
+                "AS hidden_session_id FROM collaboration_memberships m "
+                "LEFT JOIN collaboration_member_session_generations sg "
+                "ON sg.membership_id=m.membership_id AND sg.generation=? "
+                "WHERE m.membership_id=?",
+                (updated["session_generation"], updated["membership_id"]),
             ).fetchone()
-            return updated, str(membership["hidden_session_id"])
+            return updated, (
+                str(generation["hidden_session_id"]) if generation is not None else None
+            )
 
         row, hidden_id = self.db._execute_write(_write)
         self._notify_budget_state(target_id)
@@ -458,11 +477,9 @@ class CollaborationScheduler:
     def _claim_next(self) -> dict[str, Any] | None:
         with self.db._lock:
             candidate = self.db._conn.execute(
-                "SELECT tt.target_id, tt.employee_id, m.profile_revision, "
-                "m.profile_fingerprint FROM collaboration_turn_targets tt "
+                "SELECT tt.target_id, tt.employee_id FROM collaboration_turn_targets tt "
                 "JOIN collaboration_turns t ON t.turn_id=tt.turn_id "
                 "JOIN collaboration_groups g ON g.group_id=t.group_id "
-                "JOIN collaboration_memberships m ON m.membership_id=tt.membership_id "
                 "WHERE g.owner_key=? AND g.status='active' AND tt.status='queued' "
                 "AND NOT EXISTS (SELECT 1 FROM collaboration_turn_targets active "
                 "WHERE active.membership_id=tt.membership_id "
@@ -473,11 +490,9 @@ class CollaborationScheduler:
         if candidate is None:
             return None
         try:
-            resolved = self.resolver.resolve_pinned(
-                employee_id=str(candidate["employee_id"]),
-                profile_revision=int(candidate["profile_revision"]),
-                profile_fingerprint=str(candidate["profile_fingerprint"]),
-            )
+            resolved = self.resolver.resolve_current(str(candidate["employee_id"]))
+            if not resolved.may_participate:
+                raise RuntimeError("collaboration participation is revoked")
         except Exception as exc:
             self._reject_candidate(str(candidate["target_id"]), str(exc))
             return None
@@ -498,9 +513,6 @@ class CollaborationScheduler:
             if (
                 membership is None
                 or membership["leave_sequence"] is not None
-                or int(membership["profile_revision"]) != resolved.member.profile_revision
-                or str(membership["profile_fingerprint"])
-                != resolved.member.profile_fingerprint
                 or group is None
                 or group["status"] != "active"
             ):
@@ -510,6 +522,21 @@ class CollaborationScheduler:
                     ("collaboration membership is no longer eligible", now, now, row["target_id"]),
                 )
                 aggregate_collaboration_turn(conn, str(row["turn_id"]), now)
+                return None
+            policy = collaboration_member_policy(
+                resolved.employee_policy,
+                str(membership["membership_id"]),
+            )
+            generation, rotation_event = self.store.ensure_current_member_session_generation(
+                conn,
+                membership_id=str(membership["membership_id"]),
+                member=resolved.member,
+                employee_policy=policy,
+                provision_session=self.runner.provision_session_generation,
+                now=now,
+            )
+            row = self._owned_target(conn, str(candidate["target_id"]))
+            if row is None or row["status"] != "queued":
                 return None
             changed = conn.execute(
                 "UPDATE collaboration_turn_targets SET status='running', "
@@ -532,17 +559,20 @@ class CollaborationScheduler:
                 (*self.fence.values(), now, row["turn_id"]),
             )
             claimed = dict(self._owned_target(conn, str(row["target_id"])))
-            claimed["hidden_session_id"] = str(membership["hidden_session_id"])
-            claimed["stored_session_id"] = str(membership["stored_session_id"])
-            claimed["employee_policy"] = collaboration_member_policy(
-                resolved.employee_policy,
-                str(membership["membership_id"]),
-            )
+            claimed["hidden_session_id"] = generation.hidden_session_id
+            claimed["stored_session_id"] = generation.stored_session_id
+            claimed["employee_policy"] = generation.employee_policy
             claimed["may_create_groups"] = bool(resolved.may_create_groups)
+            claimed["rotation_event"] = (
+                asdict(rotation_event) if rotation_event is not None else None
+            )
             return claimed
 
         claimed = self.db._execute_write(_write)
         if claimed is not None:
+            rotation_event = claimed.pop("rotation_event", None)
+            if rotation_event is not None:
+                self.emit("collaboration.event.appended", rotation_event)
             self.emit("collaboration.target.changed", self._public_target(claimed))
         return claimed
 
@@ -572,13 +602,14 @@ class CollaborationScheduler:
                 "JOIN collaboration_turns t ON t.turn_id=tt.turn_id "
                 "JOIN collaboration_groups g ON g.group_id=t.group_id "
                 "WHERE g.owner_key=? AND g.status='active' AND t.group_id=? "
-                "AND tt.membership_id=? AND tt.status='queued' "
-                "AND tt.snapshot_sequence>? "
+                "AND tt.membership_id=? AND tt.session_generation=? "
+                "AND tt.status='queued' AND tt.snapshot_sequence>? "
                 "ORDER BY tt.snapshot_sequence, tt.target_id",
                 (
                     self.fence.owner_key,
                     primary["group_id"],
                     primary["membership_id"],
+                    primary["session_generation"],
                     primary["snapshot_sequence"],
                 ),
             ).fetchall()
@@ -872,11 +903,7 @@ class CollaborationScheduler:
             before_round = int(turn_body.get("ai_round") or 0)
             if before_round < 1:
                 raise RuntimeError("creator coordinator source round is invalid")
-            resolved = self.resolver.resolve_pinned(
-                employee_id=str(row["creator_employee_id"]),
-                profile_revision=int(row["creator_profile_revision"]),
-                profile_fingerprint=str(row["creator_profile_fingerprint"]),
-            )
+            resolved = self.resolver.resolve_current(str(row["creator_employee_id"]))
             if not resolved.may_participate:
                 raise RuntimeError("collaboration participation is revoked")
             from .agent_tools import CollaborationAgentContext
@@ -927,8 +954,22 @@ class CollaborationScheduler:
             coordinator_policy = collaboration_member_policy(
                 resolved.employee_policy, str(row["creator_membership_id"])
             )
+            generation, rotation_event = self.db._execute_write(
+                lambda conn: self.store.ensure_current_member_session_generation(
+                    conn,
+                    membership_id=str(row["creator_membership_id"]),
+                    member=resolved.member,
+                    employee_policy=coordinator_policy,
+                    provision_session=self.runner.provision_session_generation,
+                    now=time.time(),
+                )
+            )
+            if rotation_event is not None:
+                self.emit("collaboration.event.appended", asdict(rotation_event))
             stored_session_id, hidden_session_id = self.runner.ensure_coordinator_session(
                 task_id=task_id,
+                membership_id=str(row["creator_membership_id"]),
+                session_generation=generation.generation,
                 employee_policy=coordinator_policy,
             )
             receipt_key = f"collaboration-coordinator:{task_id}:{turn_id}"
