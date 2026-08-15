@@ -530,7 +530,7 @@ export function GuiChatShell() {
   const refreshEmployees = useCallback(async () => {
     setEmployeeLoadStatus("loading");
     try {
-      const response = await api.getEmployees();
+      const response = await api.getEmployees({ pageSize: 200 });
       setEmployees(response.employees);
       setEmployeeLoadStatus("ready");
     } catch {
@@ -1398,8 +1398,6 @@ export function GuiChatShell() {
             {(!narrow || !selectedEmployeeId) ? (
               <div className={cn("min-h-0 w-full shrink-0", !narrow && "w-[18rem] border-r border-[#ebecef]")}>
                 <EmployeeContactsPane
-                  employees={employees}
-                  loadStatus={employeeLoadStatus}
                   onEmployeeSelect={pickContact}
                   onRefresh={refreshEmployees}
                   selectedEmployeeId={selectedEmployeeId}

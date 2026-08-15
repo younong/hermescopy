@@ -791,7 +791,15 @@ export const api = {
       { method: "POST" },
     ),
   getEmployeeCatalog: () => fetchJSON<EmployeeCatalog>("/api/employees/catalog"),
-  getEmployees: () => fetchJSON<{ employees: Employee[] }>("/api/employees"),
+  getEmployees: (options: EmployeeListQuery = {}) => {
+    const params = new URLSearchParams();
+    const query = options.query?.trim();
+    if (query) params.set("query", query);
+    if (options.status) params.set("status", options.status);
+    params.set("page", String(options.page ?? 1));
+    params.set("page_size", String(options.pageSize ?? 50));
+    return fetchJSON<EmployeeListResult>(`/api/employees?${params.toString()}`);
+  },
   createEmployee: (body: EmployeeCreate) =>
     fetchJSON<Employee>("/api/employees", {
       method: "POST",
@@ -1589,6 +1597,20 @@ export interface EmployeeCatalog {
 export interface EmployeeCreate {
   profile: EmployeePolicyDraft;
   activate?: boolean;
+}
+
+export interface EmployeeListQuery {
+  page?: number;
+  pageSize?: number;
+  query?: string;
+  status?: EmployeeLifecycleStatus;
+}
+
+export interface EmployeeListResult {
+  employees: Employee[];
+  page: number;
+  page_size: number;
+  total: number;
 }
 
 export interface EmployeeFeishuBindingCreate {

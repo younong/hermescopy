@@ -154,6 +154,51 @@ def test_create_without_channel_and_list_detail_are_owner_scoped(authenticated_c
     assert len(listed_ids) == 2
 
 
+def test_list_employees_filters_keyword_status_and_paginates(authenticated_client):
+    client, _session = authenticated_client
+    client.post("/api/employees", json={"profile": _policy("Alpha")})
+    client.post("/api/employees", json={"profile": _policy("Beta")})
+    gamma = client.post("/api/employees", json={"profile": _policy("Gamma")}).json()
+    revoked = client.put(
+        f"/api/employees/{gamma['employee_id']}/lifecycle", json={"status": "revoked"}
+    )
+    assert revoked.status_code == 200
+
+    listed = client.get("/api/employees").json()
+    names = [item["profile"]["name"] for item in listed["employees"] if item["profile"]]
+    assert listed["total"] == 3
+    assert listed["page"] == 1
+    assert listed["page_size"] == 50
+    assert names == ["Alpha", "Beta"]
+
+    revoked_only = client.get("/api/employees", params={"status": "revoked"}).json()
+    assert revoked_only["total"] == 1
+    assert revoked_only["employees"][0]["employee_id"] == gamma["employee_id"]
+
+    active_only = client.get("/api/employees", params={"status": "active"}).json()
+    assert active_only["total"] == 3
+
+    matched = client.get("/api/employees", params={"query": "alpha"}).json()
+    assert matched["total"] == 1
+    assert matched["employees"][0]["profile"]["name"] == "Alpha"
+
+    second_page = client.get(
+        "/api/employees", params={"page": 2, "page_size": 2}
+    ).json()
+    assert second_page["total"] == 3
+    assert len(second_page["employees"]) == 1
+    assert second_page["page"] == 2
+    assert second_page["page_size"] == 2
+
+    assert (
+        client.get("/api/employees", params={"status": "unknown"}).status_code == 400
+    )
+    assert client.get("/api/employees", params={"page": 0}).status_code == 400
+    assert client.get("/api/employees", params={"page": "x"}).status_code == 400
+    assert client.get("/api/employees", params={"page_size": 0}).status_code == 400
+    assert client.get("/api/employees", params={"page_size": 201}).status_code == 400
+
+
 def test_create_rejects_invalid_reasoning_effort(authenticated_client):
     client, _session = authenticated_client
 

@@ -5584,16 +5584,66 @@ async def get_employee_catalog(request: Request):
     return employee_catalog_payload(owner_home)
 
 
+_EMPLOYEE_LIST_STATUSES = frozenset({"active", "suspended", "revoked"})
+_EMPLOYEE_LIST_DEFAULT_PAGE_SIZE = 50
+_EMPLOYEE_LIST_MAX_PAGE_SIZE = 200
+
+
+def _employee_list_page_params(request: Request) -> tuple[int, int]:
+    try:
+        page = int(request.query_params.get("page", "1"))
+        page_size = int(
+            request.query_params.get(
+                "page_size", str(_EMPLOYEE_LIST_DEFAULT_PAGE_SIZE)
+            )
+        )
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=400, detail="employee list pagination is invalid"
+        ) from exc
+    if page < 1 or not 1 <= page_size <= _EMPLOYEE_LIST_MAX_PAGE_SIZE:
+        raise HTTPException(
+            status_code=400, detail="employee list pagination is invalid"
+        )
+    return page, page_size
+
+
+def _employee_matches_keyword(payload: dict[str, Any], keyword: str) -> bool:
+    profile = payload.get("profile") or {}
+    haystack = f"{profile.get('name') or ''}\n{profile.get('role') or ''}".lower()
+    return keyword in haystack
+
+
 @app.get("/api/employees")
 async def list_employee_records(request: Request):
     runtime, store, owner = _employee_authority_context(request)
     from hermes_cli.channel_identity import list_employees
 
+    status = str(request.query_params.get("status") or "").strip().lower()
+    if status and status not in _EMPLOYEE_LIST_STATUSES:
+        raise HTTPException(status_code=400, detail="employee status is invalid")
+    keyword = str(request.query_params.get("query") or "").strip().lower()
+    page, page_size = _employee_list_page_params(request)
+
+    payloads: list[dict[str, Any]] = []
+    for employee in list_employees(store, owner=owner):
+        if status:
+            if employee.lifecycle_status != status:
+                continue
+        elif employee.lifecycle_status == "revoked":
+            # Deleted employees stay hidden unless explicitly requested.
+            continue
+        payload = _employee_payload(runtime, store, owner, employee)
+        if keyword and not _employee_matches_keyword(payload, keyword):
+            continue
+        payloads.append(payload)
+    total = len(payloads)
+    start = (page - 1) * page_size
     return {
-        "employees": [
-            _employee_payload(runtime, store, owner, employee)
-            for employee in list_employees(store, owner=owner)
-        ]
+        "employees": payloads[start : start + page_size],
+        "page": page,
+        "page_size": page_size,
+        "total": total,
     }
 
 

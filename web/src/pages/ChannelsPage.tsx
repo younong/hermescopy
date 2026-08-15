@@ -95,7 +95,12 @@ export default function ChannelsPage() {
   const load = useCallback(async () => {
     const [, employeeResponse] = await Promise.all([
       refreshPlatforms(),
-      api.getEmployees().catch(() => ({ employees: [] })),
+      api.getEmployees({ pageSize: 200 }).catch(() => ({
+        employees: [],
+        page: 1,
+        page_size: 200,
+        total: 0,
+      })),
     ]);
     setEmployees(employeeResponse.employees);
   }, [refreshPlatforms]);
