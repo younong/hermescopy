@@ -986,6 +986,8 @@ export const zh: Translations = {
       reasoningEffort: "思考强度",
       reasoningDefault: "默认",
       systemPrompt: "系统提示词",
+      toolsets: "工具",
+      noToolsets: "暂无可用工具。",
       skills: "技能",
       noSkills: "暂无可用技能。",
       maxIterations: "最大迭代次数",

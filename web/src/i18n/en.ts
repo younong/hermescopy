@@ -1049,6 +1049,8 @@ export const en: Translations = {
       reasoningEffort: "Reasoning level",
       reasoningDefault: "Default",
       systemPrompt: "System prompt",
+      toolsets: "Tools",
+      noToolsets: "No tools available.",
       skills: "Skills",
       noSkills: "No skills available.",
       maxIterations: "Maximum iterations",

@@ -490,6 +490,8 @@ export interface GuiChatTranslations {
     reasoningEffort: string;
     reasoningDefault: string;
     systemPrompt: string;
+    toolsets: string;
+    noToolsets: string;
     skills: string;
     noSkills: string;
     maxIterations: string;

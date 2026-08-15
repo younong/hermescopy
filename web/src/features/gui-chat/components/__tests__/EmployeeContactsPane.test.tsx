@@ -95,6 +95,13 @@ function buttonNamed(name: string) {
     ?? null;
 }
 
+function pickerCheckbox(pickerId: string, name: string) {
+  const picker = document.querySelector(`#${pickerId}`);
+  const label = Array.from(picker?.querySelectorAll("label") ?? [])
+    .find((item) => item.textContent?.trim() === name);
+  return label?.querySelector("input") ?? null;
+}
+
 beforeEach(() => {
   (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT: boolean })
     .IS_REACT_ACT_ENVIRONMENT = true;
@@ -280,6 +287,67 @@ describe("EmployeeContactsPane", () => {
     const dialog = document.querySelector('[role="dialog"]');
     expect(dialog?.textContent).not.toContain("Reasoning level");
     expect(dialog?.querySelectorAll("select")).toHaveLength(1);
+  });
+
+  it("lets the owner pick toolsets on create and preserves saved toolsets on edit", async () => {
+    vi.spyOn(api, "getEmployeeCatalog").mockResolvedValue({
+      ...catalog,
+      toolsets: [
+        { description: "Terminal", name: "terminal" },
+        { description: "Web research", name: "web" },
+      ],
+    });
+    const createEmployee = vi.spyOn(api, "createEmployee").mockResolvedValue(employee());
+    const updateProfile = vi.spyOn(api, "updateEmployeeProfile").mockResolvedValue(employee());
+
+    await renderPane({ employees: [employee()], onRefresh: vi.fn() });
+    await act(async () => buttonNamed("Add employee")?.click());
+
+    const createDialog = () => Array.from(document.querySelectorAll('[role="dialog"]'))
+      .find((dialog) => dialog.textContent?.includes("Add employee"));
+    expect(createDialog()?.textContent).toContain("Tools");
+    expect(pickerCheckbox("employee-toolsets", "terminal")?.checked).toBe(true);
+    expect(pickerCheckbox("employee-toolsets", "web")?.checked).toBe(true);
+    await act(async () => pickerCheckbox("employee-toolsets", "web")?.click());
+    expect(pickerCheckbox("employee-toolsets", "web")?.checked).toBe(false);
+
+    const nameInput = Array.from(createDialog()?.querySelectorAll("input") ?? [])
+      .find((input) => input.type === "text");
+    changeValue(nameInput ?? null, "Researcher");
+    changeValue(createDialog()?.querySelector("textarea") ?? null, "Research carefully.");
+    await act(async () => {
+      Array.from(createDialog()?.querySelectorAll("button") ?? [])
+        .find((button) => button.textContent === "Save")
+        ?.click();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(createEmployee).toHaveBeenCalledWith({
+      activate: true,
+      profile: expect.objectContaining({ toolsets: ["terminal"] }),
+    });
+
+    await act(async () => buttonNamed("Manage employee: Researcher")?.click());
+    await act(async () => Array.from(document.querySelectorAll("button"))
+      .find((button) => button.textContent === "Edit profile")?.click());
+    const editDialog = () => Array.from(document.querySelectorAll('[role="dialog"]'))
+      .find((dialog) => dialog.textContent?.includes("Edit employee"));
+    expect(pickerCheckbox("employee-toolsets", "terminal")?.checked).toBe(true);
+    expect(pickerCheckbox("employee-toolsets", "web")?.checked).toBe(false);
+    await act(async () => pickerCheckbox("employee-toolsets", "web")?.click());
+    await act(async () => {
+      Array.from(editDialog()?.querySelectorAll("button") ?? [])
+        .find((button) => button.textContent === "Save")
+        ?.click();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(updateProfile).toHaveBeenCalledWith(
+      "employee-a",
+      expect.objectContaining({
+        profile: expect.objectContaining({ toolsets: ["terminal", "web"] }),
+      }),
+    );
   });
 
   it("preserves profile, collaboration, lifecycle, rollover, and optional binding management", async () => {
