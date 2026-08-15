@@ -1,0 +1,1917 @@
+import { describe, expect, it, vi } from "vitest";
+
+import { buildSessionFileDownloadUrl } from "../files";
+import { guiChatReducer, type GuiChatAction } from "../reducer";
+import {
+  initialGuiChatState,
+  type FileArtifactState,
+  type GuiChatState,
+  type ImageArtifactState,
+} from "../types";
+
+const RENDERED_TEXT_TRUNCATION_NOTICE =
+  "\n\n[… output truncated in Chat GUI to keep the browser responsive …]";
+
+function restoreWithMessage(text: string, info?: { cwd?: string; model?: string }) {
+  return guiChatReducer(initialGuiChatState, {
+    type: "session.created",
+    response: {
+      info,
+      messages: [{ role: "assistant", text }],
+      session_id: "sid",
+    },
+  });
+}
+
+function restoreWithTool(text: string, info?: { cwd?: string }) {
+  return guiChatReducer(initialGuiChatState, {
+    type: "session.created",
+    response: {
+      info,
+      messages: [{ role: "tool", name: "write_file", text, tool_call_id: "tool-history-1" }],
+      session_id: "sid",
+    },
+  });
+}
+
+function imageArtifact(state: GuiChatState, id: string): ImageArtifactState {
+  const artifact = state.artifacts[id];
+  if (!artifact || artifact.kind === "file") throw new Error(`Expected image artifact ${id}`);
+  return artifact;
+}
+
+function fileArtifact(state: GuiChatState, id: string): FileArtifactState {
+  const artifact = state.artifacts[id];
+  if (!artifact || artifact.kind !== "file") throw new Error(`Expected file artifact ${id}`);
+  return artifact;
+}
+
+describe("guiChatReducer model identity", () => {
+  it("tracks provider with model from snapshots and live session info", () => {
+    const created = guiChatReducer(initialGuiChatState, {
+      type: "session.created",
+      response: {
+        info: {
+          model: "model-a",
+          provider: "provider-a",
+          reasoning_effort: "high",
+          supported_reasoning_levels: ["high", "xhigh", "max"],
+        },
+        session_id: "runtime-a",
+      },
+    });
+    const updated = guiChatReducer(created, {
+      type: "event",
+      event: {
+        payload: {
+          model: "model-b",
+          provider: "provider-b",
+          reasoning_effort: "max",
+          supported_reasoning_levels: ["high", "max"],
+        },
+        session_id: "runtime-a",
+        type: "session.info",
+      },
+    });
+
+    expect(created).toMatchObject({
+      model: "model-a",
+      provider: "provider-a",
+      reasoningEffort: "high",
+      supportedReasoningLevels: ["high", "xhigh", "max"],
+    });
+    expect(updated).toMatchObject({
+      model: "model-b",
+      provider: "provider-b",
+      reasoningEffort: "max",
+      supportedReasoningLevels: ["high", "max"],
+    });
+  });
+});
+
+describe("guiChatReducer collaboration origin cards", () => {
+  it("hydrates durable cards and appends live cards without creating assistant output", () => {
+    const hydrated = guiChatReducer(initialGuiChatState, {
+      type: "session.created",
+      response: {
+        messages: [{
+          collaboration_card: {
+            group_id: "group-a",
+            status: "created",
+            text: "Review the launch",
+            title: "Launch review",
+          },
+          role: "system",
+          text: "persisted card",
+        }],
+        session_id: "runtime-a",
+      },
+    });
+    const live = guiChatReducer(hydrated, {
+      type: "event",
+      event: {
+        payload: {
+          card_id: "card-completed-a",
+          group_id: "group-a",
+          status: "completed",
+          summary: "Approved",
+          task_id: "task-a",
+          title: "Launch review",
+        },
+        session_id: "runtime-a",
+        type: "collaboration.origin.card",
+      },
+    });
+
+    expect(live.messages).toHaveLength(2);
+    expect(live.messages[0].collaborationCard).toEqual({
+      groupId: "group-a",
+      status: "created",
+      text: "Review the launch",
+      title: "Launch review",
+    });
+    expect(live.messages[1]).toMatchObject({
+      id: "card-completed-a",
+      collaborationCard: {
+        groupId: "group-a",
+        status: "completed",
+        taskId: "task-a",
+        text: "Approved",
+        title: "Launch review",
+      },
+      role: "system",
+      text: "Approved",
+    });
+    const replayed = guiChatReducer(live, {
+      type: "event",
+      event: {
+        payload: {
+          card_id: "card-completed-a",
+          group_id: "group-a",
+          status: "completed",
+          summary: "Approved",
+          task_id: "task-a",
+          title: "Launch review",
+        },
+        session_id: "runtime-a",
+        type: "collaboration.origin.card",
+      },
+    });
+    expect(replayed.messages).toHaveLength(2);
+    expect(live.isGenerating).toBe(false);
+  });
+});
+
+describe("guiChatReducer live attach restoration", () => {
+  it("restores an in-flight user prompt and partial assistant response", () => {
+    const state = guiChatReducer(initialGuiChatState, {
+      type: "session.created",
+      response: {
+        inflight: { assistant: "partial answer", streaming: true, user: "question" },
+        messages: [{ role: "assistant", text: "previous" }],
+        running: true,
+        session_id: "runtime-a",
+      },
+    });
+
+    expect(state.messages.map(({ role, streaming, text }) => ({ role, streaming, text }))).toEqual([
+      { role: "assistant", streaming: undefined, text: "previous" },
+      { role: "user", streaming: undefined, text: "question" },
+      { role: "assistant", streaming: true, text: "partial answer" },
+    ]);
+    expect(state.isGenerating).toBe(true);
+  });
+
+  it("hydrates an empty streaming assistant turn", () => {
+    const state = guiChatReducer(initialGuiChatState, {
+      type: "session.created",
+      response: {
+        inflight: { streaming: true, user: "question" },
+        session_id: "runtime-a",
+      },
+    });
+
+    expect(state.messages.at(-1)).toMatchObject({ role: "assistant", streaming: true, text: "" });
+    expect(state.isGenerating).toBe(true);
+  });
+
+  it("does not duplicate in-flight content already present in persisted messages", () => {
+    const state = guiChatReducer(initialGuiChatState, {
+      type: "session.created",
+      response: {
+        inflight: { assistant: "partial answer", streaming: true, user: "question" },
+        messages: [
+          { role: "user", text: "question" },
+          { role: "assistant", text: "partial answer" },
+        ],
+        session_id: "runtime-a",
+      },
+    });
+
+    expect(state.messages).toHaveLength(2);
+    expect(state.messages.at(-1)).toMatchObject({
+      role: "assistant",
+      streaming: true,
+      text: "partial answer",
+    });
+  });
+
+  it("leaves a cold attach without inflight idle", () => {
+    const state = guiChatReducer(initialGuiChatState, {
+      type: "session.created",
+      response: { messages: [{ role: "user", text: "saved" }], session_id: "runtime-a" },
+    });
+
+    expect(state.messages).toHaveLength(1);
+    expect(state.isGenerating).toBe(false);
+  });
+});
+
+describe("guiChatReducer clarification lifecycle", () => {
+  it("hydrates only the current session snapshot and clears stale prompts", () => {
+    const previous = {
+      ...initialGuiChatState,
+      clarificationOrder: ["old"],
+      clarifications: {
+        old: {
+          choices: null,
+          id: "old",
+          question: "Old question",
+          status: "pending" as const,
+        },
+      },
+    };
+
+    const state = guiChatReducer(previous, {
+      type: "session.created",
+      response: {
+        pending_prompts: [
+          {
+            choices: ["A", "B"],
+            expires_at_ms: 123_456,
+            question: "Pick one",
+            request_id: "current",
+            timeout_ms: 60_000,
+            type: "clarify",
+          },
+        ],
+        session_id: "runtime-a",
+      },
+    });
+
+    expect(state.clarificationOrder).toEqual(["current"]);
+    expect(state.clarifications).toEqual({
+      current: {
+        choices: ["A", "B"],
+        expiresAtMs: 123_456,
+        id: "current",
+        question: "Pick one",
+        status: "pending",
+        timeoutMs: 60_000,
+      },
+    });
+  });
+
+  it("deduplicates live requests and applies explicit terminal outcomes", () => {
+    const requested = guiChatReducer(initialGuiChatState, {
+      type: "event",
+      event: {
+        payload: {
+          choices: null,
+          question: "What value?",
+          request_id: "clarify-1",
+        },
+        session_id: "sid",
+        type: "clarify.request",
+      },
+    });
+    const duplicate = guiChatReducer(requested, {
+      type: "event",
+      event: {
+        payload: {
+          choices: null,
+          question: "What value?",
+          request_id: "clarify-1",
+        },
+        session_id: "sid",
+        type: "clarify.request",
+      },
+    });
+    const submitting = guiChatReducer(duplicate, {
+      id: "clarify-1",
+      type: "clarify.submitting",
+    });
+    const resolved = guiChatReducer(submitting, {
+      type: "event",
+      event: {
+        payload: { outcome: "timed_out", request_id: "clarify-1" },
+        session_id: "sid",
+        type: "clarify.resolved",
+      },
+    });
+
+    expect(duplicate.clarificationOrder).toEqual(["clarify-1"]);
+    expect(submitting.clarifications["clarify-1"].status).toBe("submitting");
+    expect(resolved.clarifications["clarify-1"].status).toBe("timed_out");
+    expect(resolved.statusLines.at(-1)).toBe("Hermes needs your answer.");
+  });
+
+  it("ignores clarification events from another live session", () => {
+    const state = guiChatReducer(
+      { ...initialGuiChatState, sessionId: "session-a" },
+      {
+        type: "event",
+        event: {
+          payload: { question: "Wrong session", request_id: "other" },
+          session_id: "session-b",
+          type: "clarify.request",
+        },
+      },
+    );
+
+    expect(state.clarificationOrder).toEqual([]);
+  });
+});
+
+describe("guiChatReducer compression lifecycle", () => {
+  it("stores active stages with one timer without appending transcript status lines", () => {
+    const startedAt = 123_456;
+    vi.spyOn(Date, "now").mockReturnValue(startedAt);
+    const preparing = guiChatReducer(initialGuiChatState, {
+      type: "event",
+      event: {
+        payload: {
+          kind: "compression.preparing",
+          text: "Summarizing earlier conversation…",
+        },
+        session_id: "sid",
+        type: "status.update",
+      },
+    });
+
+    expect(preparing.compressionStatus).toEqual({
+      kind: "compression.preparing",
+      startedAt,
+      text: "Summarizing earlier conversation…",
+    });
+    expect(preparing.statusLines).toEqual([]);
+
+    const ready = guiChatReducer(preparing, {
+      type: "event",
+      event: {
+        payload: { kind: "compression.ready", text: "Summary ready" },
+        session_id: "sid",
+        type: "status.update",
+      },
+    });
+
+    expect(ready.compressionStatus).toEqual({
+      kind: "compression.ready",
+      startedAt,
+      text: "Summary ready",
+    });
+    expect(ready.statusLines).toEqual([]);
+    vi.restoreAllMocks();
+  });
+
+  it("ignores compression statuses from another live session", () => {
+    const state = guiChatReducer(
+      { ...initialGuiChatState, sessionId: "session-a" },
+      {
+        type: "event",
+        event: {
+          payload: { kind: "compression.blocked", text: "Run /compress or /new" },
+          session_id: "session-b",
+          type: "status.update",
+        },
+      },
+    );
+
+    expect(state.compressionStatus).toBeUndefined();
+    expect(state.statusLines).toEqual([]);
+  });
+});
+
+describe("guiChatReducer terminal error completion", () => {
+  it("clears generating state and preserves visible error text", () => {
+    const streaming = guiChatReducer(
+      { ...initialGuiChatState, isGenerating: true },
+      {
+        type: "event",
+        event: { payload: { text: "partial" }, type: "message.delta" },
+      },
+    );
+
+    const state = guiChatReducer(streaming, {
+      type: "event",
+      event: {
+        payload: { status: "error", text: "Error: upstream returned 502" },
+        type: "message.complete",
+      },
+    });
+
+    expect(state.isGenerating).toBe(false);
+    expect(state.messages.at(-1)).toMatchObject({
+      role: "assistant",
+      status: "error",
+      streaming: false,
+      text: "Error: upstream returned 502",
+    });
+  });
+});
+
+describe("guiChatReducer history image restoration", () => {
+  it("keeps a sent prompt with two WeChat article URLs as plain message text", () => {
+    const prompt =
+      "分析咿呀咿呀哟喂公众号的两篇文章的阅读量差异化，链接：https://mp.weixin.qq.com/s/Dl28D1x2ti1ZfqIBD_axYw https://mp.weixin.qq.com/s/ZglvujhgYZ7ggnPTlubaBA";
+    const state = guiChatReducer(initialGuiChatState, {
+      id: "user-1",
+      text: prompt,
+      type: "user.sent",
+    });
+
+    expect(state.messages).toHaveLength(1);
+    expect(state.messages[0]).toMatchObject({
+      artifactIds: [],
+      id: "user-1",
+      role: "user",
+      text: prompt,
+    });
+    expect(state.artifacts).toEqual({});
+  });
+
+  it("caps streaming assistant text so large output stays responsive", () => {
+    const largeDelta = "x".repeat(130_000);
+    const state = guiChatReducer(initialGuiChatState, {
+      event: { payload: { text: largeDelta }, type: "message.delta" },
+      type: "event",
+    });
+
+    expect(state.messages[0].text).toHaveLength(120_000 + RENDERED_TEXT_TRUNCATION_NOTICE.length);
+    expect(state.messages[0].text.endsWith(RENDERED_TEXT_TRUNCATION_NOTICE)).toBe(true);
+
+    const afterMoreDelta = guiChatReducer(state, {
+      event: { payload: { text: "more" }, type: "message.delta" },
+      type: "event",
+    });
+    expect(afterMoreDelta.messages[0].text).toBe(state.messages[0].text);
+  });
+
+  it("caps tool progress output before rendering", () => {
+    const withTool = guiChatReducer(initialGuiChatState, {
+      event: { payload: { id: "tool-1", name: "WebFetch" }, type: "tool.start" },
+      type: "event",
+    });
+    const state = guiChatReducer(withTool, {
+      event: { payload: { text: "x".repeat(130_000) }, type: "tool.progress" },
+      type: "event",
+    });
+
+    expect(state.toolCalls["tool-1"].output).toHaveLength(
+      120_000 + RENDERED_TEXT_TRUNCATION_NOTICE.length,
+    );
+    expect(state.toolCalls["tool-1"].output.endsWith(RENDERED_TEXT_TRUNCATION_NOTICE)).toBe(true);
+  });
+
+  it("caps final tool output before rendering", () => {
+    const state = guiChatReducer(initialGuiChatState, {
+      event: {
+        payload: { id: "tool-1", name: "WebFetch", result_text: "x".repeat(130_000) },
+        type: "tool.complete",
+      },
+      type: "event",
+    });
+
+    expect(state.toolCalls["tool-1"].output).toHaveLength(
+      120_000 + RENDERED_TEXT_TRUNCATION_NOTICE.length,
+    );
+    expect(state.toolCalls["tool-1"].output.endsWith(RENDERED_TEXT_TRUNCATION_NOTICE)).toBe(true);
+  });
+
+  it("keeps filesystem image tool results downloadable from their original path", () => {
+    const withCwd = guiChatReducer(initialGuiChatState, {
+      event: { payload: { cwd: "/workspace" }, type: "session.info" },
+      type: "event",
+    });
+    const withTool = guiChatReducer(withCwd, {
+      event: { payload: { id: "tool-image", name: "image_generate" }, type: "tool.start" },
+      type: "event",
+    });
+    const state = guiChatReducer(withTool, {
+      event: {
+        payload: {
+          id: "tool-image",
+          name: "image_generate",
+          result: { image: "outputs/result.png", success: true },
+        },
+        type: "tool.complete",
+      },
+      type: "event",
+    });
+
+    expect(imageArtifact(state, "tool-image-image")).toMatchObject({
+      downloadUrl:
+        "/api/files/download?path=outputs%2Fresult.png&cwd=%2Fworkspace&filename=result.png",
+      url: "/api/fs/read-data-url?path=outputs%2Fresult.png&cwd=%2Fworkspace",
+    });
+  });
+
+  it("attaches generated images to the active reply and hides the storage path", () => {
+    const imagePath = "/workspace/.hermes/users/owner/images/result.png";
+    const actions = [
+      { event: { payload: { cwd: "/workspace" }, type: "session.info" }, type: "event" },
+      { event: { type: "message.start" }, type: "event" },
+      {
+        event: { payload: { id: "tool-image", name: "image_generate" }, type: "tool.start" },
+        type: "event",
+      },
+      {
+        event: {
+          payload: {
+            id: "tool-image",
+            name: "image_generate",
+            result: { image: imagePath, success: true },
+          },
+          type: "tool.complete",
+        },
+        type: "event",
+      },
+      {
+        event: {
+          payload: { text: `图片已生成。\n\n生成路径：\`${imagePath}\`` },
+          type: "message.complete",
+        },
+        type: "event",
+      },
+    ] as const;
+    const state = actions.reduce(guiChatReducer, initialGuiChatState);
+    const message = state.messages[0];
+
+    expect(message.text).toBe("图片已生成。");
+    expect(message.artifactIds).toEqual(["tool-image-image"]);
+    expect(state.toolCalls["tool-image"].artifactIds).toEqual([]);
+    expect(Object.keys(state.artifacts)).toEqual(["tool-image-image"]);
+    expect(imageArtifact(state, "tool-image-image")).toMatchObject({
+      downloadUrl:
+        "/api/files/download?path=%2Fworkspace%2F.hermes%2Fusers%2Fowner%2Fimages%2Fresult.png&cwd=%2Fworkspace&filename=result.png",
+      messageId: message.id,
+      toolCallId: "tool-image",
+      url: "/api/fs/read-data-url?path=%2Fworkspace%2F.hermes%2Fusers%2Fowner%2Fimages%2Fresult.png",
+    });
+    expect(message.streaming).toBe(false);
+    expect(message.status).toBe("complete");
+  });
+
+  it("reconciles translated tool and reply image paths without duplicating the image", () => {
+    const started = guiChatReducer(initialGuiChatState, {
+      event: { type: "message.start" },
+      type: "event",
+    });
+    const completedTool = guiChatReducer(started, {
+      event: {
+        payload: {
+          id: "tool-image",
+          name: "image_generate",
+          result: {
+            host_image: "/host/.hermes/users/owner/images/result.png",
+            image: "/sandbox/.hermes/cache/images/result.png",
+            success: true,
+          },
+        },
+        type: "tool.complete",
+      },
+      type: "event",
+    });
+    const state = guiChatReducer(completedTool, {
+      event: {
+        payload: { text: "已生成： `/sandbox/.hermes/cache/images/result.png`" },
+        type: "message.complete",
+      },
+      type: "event",
+    });
+
+    expect(state.messages[0].text).toBe("");
+    expect(state.messages[0].artifactIds).toEqual(["tool-image-image"]);
+    expect(Object.keys(state.artifacts)).toEqual(["tool-image-image"]);
+  });
+
+  it("reconciles final structured image artifacts with streamed tool images", () => {
+    const cwd = "/workspace";
+    const actions = [
+      { event: { payload: { cwd }, type: "session.info" }, type: "event" },
+      { event: { type: "message.start" }, type: "event" },
+      {
+        event: { payload: { id: "tool-image", name: "image_generate" }, type: "tool.start" },
+        type: "event",
+      },
+      {
+        event: {
+          payload: {
+            id: "tool-image",
+            name: "image_generate",
+            result: { host_image: `${cwd}/generated/images/result.png`, success: true },
+          },
+          type: "tool.complete",
+        },
+        type: "event",
+      },
+    ] satisfies GuiChatAction[];
+    const streamed = actions.reduce(guiChatReducer, initialGuiChatState);
+    const state = guiChatReducer(streamed, {
+      event: {
+        payload: {
+          id: "artifact-result",
+          mime_type: "image/png",
+          path: "generated/images/result.png",
+        },
+        type: "artifact.created",
+      },
+      type: "event",
+    });
+
+    expect(state.messages[0].artifactIds).toEqual(["tool-image-image"]);
+    expect(state.toolCalls["tool-image"].artifactIds).toEqual([]);
+    expect(Object.keys(state.artifacts)).toEqual(["tool-image-image"]);
+    expect(imageArtifact(state, "tool-image-image")).toMatchObject({
+      messageId: state.messages[0].id,
+      sourcePath: "generated/images/result.png",
+      toolCallId: "tool-image",
+    });
+  });
+
+  it("creates message-owned image artifacts without trusting final reply file paths", () => {
+    const state = guiChatReducer(initialGuiChatState, {
+      event: {
+        payload: {
+          text: "结果如下：\n![cat](https://example.com/cat.png)\n文件路径： `/workspace/report.html`",
+        },
+        type: "message.complete",
+      },
+      type: "event",
+    });
+    const message = state.messages[0];
+    const artifacts = message.artifactIds.map((id) => state.artifacts[id]);
+
+    expect(message.text).toBe("结果如下：\n\n文件路径： `/workspace/report.html`");
+    expect(artifacts).toEqual([
+      expect.objectContaining({
+        messageId: message.id,
+        url: "https://example.com/cat.png",
+      }),
+    ]);
+  });
+
+  it("keeps image results tool-owned when no assistant reply is active", () => {
+    const state = guiChatReducer(initialGuiChatState, {
+      event: {
+        payload: {
+          id: "tool-image",
+          name: "image_generate",
+          result: { image: "/tmp/result.png", success: true },
+        },
+        type: "tool.complete",
+      },
+      type: "event",
+    });
+
+    expect(state.messages).toEqual([]);
+    expect(state.toolCalls["tool-image"].artifactIds).toEqual(["tool-image-image"]);
+    expect(imageArtifact(state, "tool-image-image")).toMatchObject({
+      messageId: undefined,
+      toolCallId: "tool-image",
+    });
+  });
+
+  it("does not retain large non-rendered tool results in chat state", () => {
+    const state = guiChatReducer(initialGuiChatState, {
+      event: {
+        payload: {
+          id: "tool-1",
+          name: "terminal",
+          output: "done",
+          result: { html: "x".repeat(130_000) },
+        },
+        type: "tool.complete",
+      },
+      type: "event",
+    });
+
+    expect(state.toolCalls["tool-1"].output).toBe("done");
+    expect(state.toolCalls["tool-1"].result).toBeUndefined();
+  });
+
+  it("replaces object tool inputs with a lightweight display notice", () => {
+    const state = guiChatReducer(initialGuiChatState, {
+      event: {
+        payload: { context: { html: "x".repeat(130_000) }, id: "tool-1", name: "terminal" },
+        type: "tool.start",
+      },
+      type: "event",
+    });
+
+    expect(state.toolCalls["tool-1"].input).toBe(
+      "[… non-rendered tool result omitted in Chat GUI to keep the browser responsive …]",
+    );
+  });
+
+  it("refreshes historical relative file downloads when attach supplies cwd", () => {
+    const selected = guiChatReducer(initialGuiChatState, {
+      type: "session.selected",
+      generation: 1,
+      sessionId: "stored",
+    });
+    const history = guiChatReducer(selected, {
+      type: "history.initial.succeeded",
+      generation: 1,
+      requestedSessionId: "stored",
+      response: {
+        history_page: { cursor: null, has_more: false, returned_count: 1 },
+        messages: [{
+          attachments: [{
+            kind: "file",
+            name: "使用说明.txt",
+            path: "使用说明.txt",
+            size_bytes: 12,
+          }],
+          id: "db-s-1",
+          role: "assistant",
+          text: "[下载](公众号数据自动清洗_可直接使用.zip)",
+        }],
+        session_id: "stored",
+      },
+    });
+    expect(history.messages[0].artifactIds).toEqual([]);
+    expect(history.artifacts).toEqual({});
+    expect(history.messages[0].attachments?.[0].downloadUrl).toBe(
+      buildSessionFileDownloadUrl("使用说明.txt", undefined, "使用说明.txt"),
+    );
+
+    const state = guiChatReducer(history, {
+      type: "session.created",
+      response: {
+        info: { cwd: "/workspace" },
+        messages: [],
+        session_id: "runtime",
+        session_key: "stored",
+      },
+    });
+
+    expect(state.messages[0].artifactIds).toEqual([]);
+    expect(state.artifacts).toEqual({});
+    expect(state.messages[0].attachments?.[0].downloadUrl).toBe(
+      buildSessionFileDownloadUrl("使用说明.txt", "/workspace", "使用说明.txt"),
+    );
+  });
+
+  it("refreshes existing file downloads when a later session info event supplies cwd", () => {
+    const restored = restoreWithMessage(
+      "[下载](公众号数据自动清洗_可直接使用.zip)",
+    );
+    const artifactId = restored.messages[0].artifactIds[0];
+    const state = guiChatReducer(restored, {
+      event: { payload: { cwd: "/workspace" }, type: "session.info" },
+      type: "event",
+    });
+
+    expect(state.artifacts[artifactId]).toMatchObject({
+      downloadUrl: buildSessionFileDownloadUrl(
+        "公众号数据自动清洗_可直接使用.zip",
+        "/workspace",
+        "公众号数据自动清洗_可直接使用.zip",
+      ),
+    });
+  });
+
+  it("prepends an earlier display page with stable IDs and deduplicates overlap", () => {
+    const selected = guiChatReducer(initialGuiChatState, {
+      type: "session.selected",
+      generation: 1,
+      sessionId: "stored",
+    });
+    const current = guiChatReducer(selected, {
+      type: "history.initial.succeeded",
+      generation: 1,
+      requestedSessionId: "stored",
+      response: {
+        history_page: { cursor: "cursor-2", has_more: true, returned_count: 2 },
+        messages: [
+          { id: "db-s-2", role: "user", text: "second" },
+          { id: "db-s-3", role: "assistant", text: "third" },
+        ],
+        session_id: "stored",
+      },
+    });
+    const loading = guiChatReducer(current, {
+      type: "history.prepend.started",
+      generation: 1,
+      sessionId: "stored",
+    });
+    const state = guiChatReducer(loading, {
+      type: "history.prepend.succeeded",
+      generation: 1,
+      response: {
+        history_page: { cursor: null, has_more: false, returned_count: 2 },
+        messages: [
+          { id: "db-s-1", role: "assistant", text: "first" },
+          { id: "db-s-2", role: "user", text: "second" },
+        ],
+        session_id: "stored",
+      },
+    });
+
+    expect(state.messages.map((message) => message.id)).toEqual([
+      "db-s-1",
+      "db-s-2",
+      "db-s-3",
+    ]);
+    expect(state.historyCursor).toBeUndefined();
+    expect(state.historyHasMore).toBe(false);
+    expect(state.historyLoading).toBe(false);
+  });
+
+  it("keeps tool-owned HTML artifacts when prepending an earlier history page", () => {
+    const selected = guiChatReducer(initialGuiChatState, {
+      type: "session.selected",
+      generation: 1,
+      sessionId: "stored",
+    });
+    const current = guiChatReducer(selected, {
+      type: "history.initial.succeeded",
+      generation: 1,
+      requestedSessionId: "stored",
+      response: {
+        history_page: { cursor: "cursor-2", has_more: true, returned_count: 1 },
+        messages: [{ id: "db-s-2", role: "assistant", text: "current" }],
+        session_id: "stored",
+      },
+    });
+    const state = guiChatReducer(
+      guiChatReducer(current, {
+        type: "history.prepend.started",
+        generation: 1,
+        sessionId: "stored",
+      }),
+      {
+        type: "history.prepend.succeeded",
+        generation: 1,
+        response: {
+          history_page: { cursor: null, has_more: false, returned_count: 2 },
+          messages: [
+            {
+              id: "db-tool-1",
+              name: "write_file",
+              role: "tool",
+              text: "Full output saved to: /workspace/older/report.html",
+              tool_call_id: "tool-older",
+            },
+            { id: "db-s-2", role: "assistant", text: "current" },
+          ],
+          session_id: "stored",
+        },
+      },
+    );
+
+    expect(state.messages.map((message) => message.id)).toEqual(["db-s-2"]);
+    expect(state.toolOrder).toEqual(["db-tool-1"]);
+    expect(state.toolCalls["db-tool-1"].artifactIds).toEqual(["db-tool-1-file-0"]);
+    expect(fileArtifact(state, "db-tool-1-file-0")).toMatchObject({
+      name: "report.html",
+      toolCallId: "db-tool-1",
+    });
+  });
+
+  it("ignores a stale earlier-history response for another durable session", () => {
+    const selected = guiChatReducer(initialGuiChatState, {
+      type: "session.selected",
+      generation: 3,
+      sessionId: "stored-current",
+    });
+    const current = guiChatReducer(selected, {
+      type: "history.initial.succeeded",
+      generation: 3,
+      requestedSessionId: "stored-current",
+      response: {
+        history_page: { cursor: "cursor-2", has_more: true, returned_count: 1 },
+        messages: [{ id: "db-s-2", role: "assistant", text: "current" }],
+        session_id: "stored-current",
+      },
+    });
+    const state = guiChatReducer(
+      guiChatReducer(current, {
+        type: "history.prepend.started",
+        generation: 3,
+        sessionId: "stored-current",
+      }),
+      {
+        type: "history.prepend.succeeded",
+        generation: 3,
+        response: {
+          history_page: { cursor: null, has_more: false, returned_count: 1 },
+          messages: [{ id: "db-other-1", role: "assistant", text: "stale" }],
+          session_id: "stored-stale",
+        },
+      },
+    );
+
+    expect(state.messages).toEqual(current.messages);
+    expect(state.historyLoading).toBe(false);
+  });
+
+  it("restores uploaded files with download URLs", () => {
+    const state = guiChatReducer(initialGuiChatState, {
+      type: "session.created",
+      response: {
+        info: { cwd: "/workspace" },
+        messages: [{
+          attachments: [{
+            kind: "pdf",
+            mime_type: "application/pdf",
+            name: "brief.pdf",
+            path: "/workspace/.hermes/desktop-attachments/brief.pdf",
+            size_bytes: 123,
+          }],
+          role: "user",
+          text: "",
+        }],
+        session_id: "sid",
+      },
+    });
+
+    expect(state.messages[0].attachments?.[0]).toMatchObject({
+      downloadUrl: "/api/files/download?path=%2Fworkspace%2F.hermes%2Fdesktop-attachments%2Fbrief.pdf&cwd=%2Fworkspace&filename=brief.pdf",
+      name: "brief.pdf",
+      sourcePath: "/workspace/.hermes/desktop-attachments/brief.pdf",
+    });
+  });
+
+  it("turns explicit generated file references into download artifacts", () => {
+    const state = restoreWithMessage(
+      "Done.\nFull output saved to: outputs/report.html\n[PDF](sandbox:/workspace/report.pdf)",
+      { cwd: "/workspace" },
+    );
+
+    const artifacts = state.messages[0].artifactIds.map((id) => state.artifacts[id]);
+    expect(artifacts).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        kind: "file",
+        mimeType: "text/html",
+        name: "report.html",
+        sourcePath: "outputs/report.html",
+      }),
+      expect.objectContaining({
+        kind: "file",
+        mimeType: "application/pdf",
+        name: "report.pdf",
+        sourcePath: "/workspace/report.pdf",
+      }),
+    ]));
+  });
+
+  it("restores a labeled inline HTML path as a download artifact", () => {
+    const state = restoreWithMessage(
+      "已生成互动版“乌鸦喝水”HTML：\n\n**文件路径：** `/workspace/crow-drinks-water.html`",
+      { cwd: "/workspace" },
+    );
+
+    const artifact = state.artifacts[state.messages[0].artifactIds[0]];
+    expect(artifact).toMatchObject({
+      downloadUrl:
+        "/api/files/download?path=%2Fworkspace%2Fcrow-drinks-water.html&cwd=%2Fworkspace&filename=crow-drinks-water.html",
+      kind: "file",
+      mimeType: "text/html",
+      name: "crow-drinks-water.html",
+      sourcePath: "/workspace/crow-drinks-water.html",
+    });
+  });
+
+  it("does not trust a live assistant labeled path without a structured artifact event", () => {
+    const withDelta = guiChatReducer(initialGuiChatState, {
+      event: {
+        payload: { text: "文件路径： `/workspace/crow-drinks-water.html`" },
+        type: "message.delta",
+      },
+      type: "event",
+    });
+    const state = guiChatReducer(withDelta, {
+      event: {
+        payload: { text: "文件路径： `/workspace/crow-drinks-water.html`" },
+        type: "message.complete",
+      },
+      type: "event",
+    });
+
+    expect(state.messages[0].artifactIds).toEqual([]);
+    expect(state.artifacts).toEqual({});
+  });
+
+  it("recognizes generated HTML paths returned on a labeled or standalone line", () => {
+    const labeled = restoreWithMessage(
+      "HTML 文件已生成：\n\n/workspace/user3/generated/report.html",
+      { cwd: "/workspace" },
+    );
+    const labeledArtifact = fileArtifact(labeled, labeled.messages[0].artifactIds[0]);
+    expect(labeledArtifact).toMatchObject({
+      downloadUrl:
+        "/api/files/download?path=%2Fworkspace%2Fuser3%2Fgenerated%2Freport.html&cwd=%2Fworkspace&filename=report.html",
+      kind: "file",
+      mimeType: "text/html",
+      name: "report.html",
+      sourcePath: "/workspace/user3/generated/report.html",
+    });
+
+    const standalone = restoreWithMessage(
+      "文件已生成，下载路径如下：\n`/workspace/user3/generated/standalone.html`",
+      { cwd: "/workspace" },
+    );
+    expect(standalone.messages[0].artifactIds).toHaveLength(1);
+    expect(fileArtifact(standalone, standalone.messages[0].artifactIds[0])).toMatchObject({
+      kind: "file",
+      mimeType: "text/html",
+      name: "standalone.html",
+      sourcePath: "/workspace/user3/generated/standalone.html",
+    });
+  });
+
+  it("restores HTML artifacts from persisted tool output without a visible tool message", () => {
+    const state = restoreWithTool(
+      "Full output saved to: /workspace/user3/generated/report.html\n/workspace/user3/generated/report.html\n/workspace/user3/generated/standalone.html",
+      { cwd: "/workspace" },
+    );
+
+    expect(state.messages).toEqual([]);
+    expect(state.toolOrder).toEqual(["tool-history-1"]);
+    expect(state.toolCalls["tool-history-1"]).toMatchObject({
+      artifactIds: ["tool-history-1-file-0", "tool-history-1-file-1"],
+      name: "write_file",
+      status: "succeeded",
+    });
+    expect(fileArtifact(state, "tool-history-1-file-0")).toMatchObject({
+      downloadUrl:
+        "/api/files/download?path=%2Fworkspace%2Fuser3%2Fgenerated%2Freport.html&cwd=%2Fworkspace&filename=report.html",
+      kind: "file",
+      mimeType: "text/html",
+      name: "report.html",
+      sourcePath: "/workspace/user3/generated/report.html",
+      toolCallId: "tool-history-1",
+    });
+    expect(fileArtifact(state, "tool-history-1-file-1")).toMatchObject({
+      name: "standalone.html",
+      sourcePath: "/workspace/user3/generated/standalone.html",
+      toolCallId: "tool-history-1",
+    });
+  });
+
+  it("restores HTML paths from structured write-file tool output", () => {
+    const state = restoreWithTool(
+      '{"bytes_written":19822,"resolved_path":"/workspace/user3/generated/report.html","files_modified":["/workspace/user3/generated/report.html"]}',
+      { cwd: "/workspace" },
+    );
+
+    expect(state.messages).toEqual([]);
+    expect(state.toolCalls["tool-history-1"].artifactIds).toEqual(["tool-history-1-file-0"]);
+    expect(fileArtifact(state, "tool-history-1-file-0")).toMatchObject({
+      name: "report.html",
+      mimeType: "text/html",
+      sourcePath: "/workspace/user3/generated/report.html",
+    });
+  });
+
+  it("places historical tool files in the reply that delivered them", () => {
+    const state = guiChatReducer(initialGuiChatState, {
+      type: "session.created",
+      response: {
+        info: { cwd: "/workspace" },
+        messages: [
+          { id: "user-1", role: "user", text: "生成报告" },
+          {
+            id: "tool-1",
+            name: "write_file",
+            role: "tool",
+            text: '{"resolved_path":"/workspace/report.html","files_modified":["/workspace/report.html"]}',
+            tool_call_id: "tool-1",
+          },
+          { id: "assistant-1", role: "assistant", text: "报告已生成" },
+          { id: "user-2", role: "user", text: "继续分析" },
+          { id: "assistant-2", role: "assistant", text: "分析完成" },
+        ],
+        session_id: "sid",
+      },
+    });
+
+    expect(state.messages[1].artifactIds).toEqual(["tool-1-file-0"]);
+    expect(state.messages[3].artifactIds).toEqual([]);
+    expect(fileArtifact(state, "tool-1-file-0")).toMatchObject({ messageId: "assistant-1" });
+  });
+
+  it("leaves an undelivered trailing tool file visible as a standalone artifact", () => {
+    const state = restoreWithTool(
+      '{"resolved_path":"/workspace/report.html","files_modified":["/workspace/report.html"]}',
+      { cwd: "/workspace" },
+    );
+
+    expect(state.messages).toEqual([]);
+    expect(fileArtifact(state, "tool-history-1-file-0").messageId).toBeUndefined();
+  });
+
+  it("keeps only the latest historical card for repeated writes to one file", () => {
+    const ownerWorkspace = "/opt/hermes/users/user3/workspaces/default";
+    const state = guiChatReducer(initialGuiChatState, {
+      type: "session.created",
+      response: {
+        info: { cwd: ownerWorkspace },
+        messages: [
+          {
+            id: "tool-write-1",
+            name: "write_file",
+            role: "tool",
+            text: `{"resolved_path":"${ownerWorkspace}/report.html","files_modified":["${ownerWorkspace}/report.html"]}`,
+            tool_call_id: "tool-write-1",
+          },
+          { id: "assistant-1", role: "assistant", text: "第一版" },
+          {
+            id: "tool-write-2",
+            name: "patch",
+            role: "tool",
+            text: '{"resolved_path":"report.html","files_modified":["report.html"]}',
+            tool_call_id: "tool-write-2",
+          },
+          { id: "assistant-2", role: "assistant", text: "最终版" },
+        ],
+        session_id: "sid",
+      },
+    });
+
+    expect(state.messages[0].artifactIds).toEqual([]);
+    expect(state.messages[1].artifactIds).toEqual(["tool-write-2-file-0"]);
+    expect(state.toolCalls["tool-write-1"].artifactIds).toEqual([]);
+    expect(state.toolCalls["tool-write-2"].artifactIds).toEqual(["tool-write-2-file-0"]);
+    expect(Object.keys(state.artifacts)).toEqual(["tool-write-2-file-0"]);
+  });
+
+  it("only restores saved HTML paths from historical tool output", () => {
+    const state = guiChatReducer(initialGuiChatState, {
+      type: "session.created",
+      response: {
+        messages: [
+          { role: "tool", text: "Full output saved to: /workspace/report.txt", tool_call_id: "text-tool" },
+          { role: "tool", text: "Inline /workspace/example.html\n```\n/workspace/fenced.html\n```\nhttps://example.com/remote.html", tool_call_id: "other-tool" },
+        ],
+        session_id: "sid",
+      },
+    });
+
+    expect(state.artifacts).toEqual({});
+    expect(state.messages).toEqual([]);
+  });
+
+  it("does not treat unlabeled inline code, code blocks, or remote links as generated files", () => {
+    const state = restoreWithMessage(
+      "普通代码 `/workspace/secret.html`\n```\n文件路径： `/tmp/secret.html`\n```\n[remote](https://example.com/report.pdf)",
+    );
+
+    expect(state.messages[0].artifactIds).toEqual([]);
+  });
+
+  it("turns a standalone restored image URL into an image artifact", () => {
+    const state = restoreWithMessage("生成完成：\nhttps://example.com/cat.png");
+
+    expect(state.messages).toHaveLength(1);
+    expect(state.messages[0].text).toBe("生成完成：");
+    expect(state.messages[0].artifactIds).toHaveLength(1);
+    const artifact = state.artifacts[state.messages[0].artifactIds[0]];
+    expect(artifact).toMatchObject({
+      messageId: "history-0",
+      mimeType: "image/png",
+      url: "https://example.com/cat.png",
+    });
+  });
+
+  it("turns markdown images into image artifacts and removes the markdown image text", () => {
+    const state = restoreWithMessage("结果如下：\n![cat](https://example.com/cat.webp)");
+
+    expect(state.messages[0].text).toBe("结果如下：");
+    const artifact = state.artifacts[state.messages[0].artifactIds[0]];
+    expect(artifact).toMatchObject({
+      mimeType: "image/webp",
+      title: "cat",
+      url: "https://example.com/cat.webp",
+    });
+  });
+
+  it("does not treat ordinary bare URLs as images", () => {
+    const state = restoreWithMessage("参考：https://example.com/docs");
+
+    expect(state.messages[0].text).toBe("参考：https://example.com/docs");
+    expect(state.messages[0].artifactIds).toEqual([]);
+    expect(state.artifacts).toEqual({});
+  });
+
+  it("does not treat ordinary markdown links as images", () => {
+    const state = restoreWithMessage("[docs](https://example.com/docs)");
+
+    expect(state.messages[0].artifactIds).toEqual([]);
+    expect(state.artifacts).toEqual({});
+  });
+
+  it("recognizes image URLs with query strings and hashes", () => {
+    const state = restoreWithMessage("https://cdn.example.com/a.jpg?token=abc#view");
+
+    expect(state.messages[0].artifactIds).toHaveLength(1);
+    const artifact = state.artifacts[state.messages[0].artifactIds[0]];
+    expect(artifact).toMatchObject({
+      mimeType: "image/jpeg",
+      url: "https://cdn.example.com/a.jpg?token=abc#view",
+    });
+  });
+
+  it("recognizes data image URLs and infers their mime type", () => {
+    const dataUrl = "data:image/png;base64,iVBORw0KGgo=";
+    const state = restoreWithMessage(dataUrl);
+
+    expect(state.messages[0].artifactIds).toHaveLength(1);
+    const artifact = state.artifacts[state.messages[0].artifactIds[0]];
+    expect(artifact).toMatchObject({
+      mimeType: "image/png",
+      url: dataUrl,
+    });
+  });
+
+  it("ignores image-looking URLs inside fenced code blocks", () => {
+    const state = restoreWithMessage("```txt\nhttps://example.com/cat.png\n```");
+
+    expect(state.messages[0].artifactIds).toEqual([]);
+    expect(state.artifacts).toEqual({});
+  });
+
+  it("keeps messages that contain only an image URL", () => {
+    const state = restoreWithMessage("https://example.com/cat.png");
+
+    expect(state.messages).toHaveLength(1);
+    expect(state.messages[0].text).toBe("");
+    expect(state.messages[0].artifactIds).toHaveLength(1);
+  });
+
+  it("extracts images from structured transcript content", () => {
+    const state = guiChatReducer(initialGuiChatState, {
+      type: "session.created",
+      response: {
+        messages: [
+          {
+            content: [
+              { text: "看这张图", type: "input_text" },
+              { image_url: { url: "https://example.com/a.png" }, type: "image_url" },
+            ],
+            role: "user",
+          },
+        ],
+        session_id: "sid",
+      },
+    });
+
+    expect(state.messages[0]).toMatchObject({
+      role: "user",
+      text: "看这张图",
+    });
+    expect(state.messages[0].artifactIds).toHaveLength(1);
+    const artifact = state.artifacts[state.messages[0].artifactIds[0]];
+    expect(artifact).toMatchObject({
+      messageId: "history-0",
+      mimeType: "image/png",
+      url: "https://example.com/a.png",
+    });
+  });
+
+  it("keeps structured image dimensions when a text reference appears first", () => {
+    const imagePath = "/workspace/generated.png";
+    const state = guiChatReducer(initialGuiChatState, {
+      type: "session.created",
+      response: {
+        info: { cwd: "/workspace" },
+        messages: [
+          {
+            content: [
+              {
+                type: "artifact.image",
+                url: imagePath,
+                width: 800,
+                height: 450,
+              },
+            ],
+            role: "assistant",
+            text: `Generated: ${imagePath}`,
+          },
+        ],
+        session_id: "sid",
+      },
+    });
+
+    expect(state.messages[0].artifactIds).toHaveLength(1);
+    expect(imageArtifact(state, state.messages[0].artifactIds[0])).toMatchObject({
+      height: 450,
+      width: 800,
+    });
+  });
+
+  it("drops incomplete or malformed image dimensions", () => {
+    const state = guiChatReducer(initialGuiChatState, {
+      type: "session.created",
+      response: {
+        messages: [
+          {
+            content: [
+              { type: "artifact.image", url: "https://example.com/a.png", width: 640 },
+              { type: "artifact.image", url: "https://example.com/b.png", width: -1, height: 20 },
+            ],
+            role: "assistant",
+          },
+        ],
+        session_id: "sid",
+      },
+    });
+
+    for (const artifact of Object.values(state.artifacts)) {
+      expect(artifact).not.toMatchObject({ width: expect.any(Number) });
+      expect(artifact).not.toMatchObject({ height: expect.any(Number) });
+    }
+  });
+
+  it("restores verified assistant file attachments without duplicating text references", () => {
+    const state = guiChatReducer(initialGuiChatState, {
+      type: "session.created",
+      response: {
+        info: { cwd: "/workspace" },
+        messages: [
+          {
+            attachments: [
+              {
+                kind: "file",
+                mime_type: "application/zip",
+                name: "tool.zip",
+                path: "/workspace/tool.zip",
+                size_bytes: 7,
+              },
+            ],
+            role: "assistant",
+            text: "生成文件：`/workspace/tool.zip`",
+          },
+        ],
+        session_id: "sid",
+      },
+    });
+
+    expect(state.messages[0].attachments).toHaveLength(1);
+    expect(state.messages[0].artifactIds).toEqual([]);
+    expect(state.artifacts).toEqual({});
+    expect(state.messages[0].attachments?.[0]).toMatchObject({
+      downloadUrl:
+        "/api/files/download?path=%2Fworkspace%2Ftool.zip&cwd=%2Fworkspace&filename=tool.zip",
+      kind: "file",
+      mimeType: "application/zip",
+      name: "tool.zip",
+      sourcePath: "/workspace/tool.zip",
+    });
+  });
+
+  it("restores image, PDF, and file attachment cards from transcript metadata", () => {
+    const state = guiChatReducer(initialGuiChatState, {
+      type: "session.created",
+      response: {
+        info: { cwd: "/workspace" },
+        messages: [
+          {
+            attachments: [
+              {
+                kind: "image",
+                mime_type: "image/png",
+                name: "shot.png",
+                path: "/tmp/shot.png",
+                size_bytes: 123,
+                source_paths: ["/tmp/shot.png"],
+                width: 640,
+                height: 360,
+              },
+              {
+                kind: "pdf",
+                mime_type: "application/pdf",
+                name: "report.pdf",
+                path: "/workspace/.hermes/desktop-attachments/report.pdf",
+                pages_attached: 2,
+                size_bytes: 456,
+                source_paths: ["/tmp/pdf-1.png", "/tmp/pdf-2.png"],
+              },
+              {
+                kind: "file",
+                mime_type: "text/plain",
+                name: "notes.txt",
+                path: "/workspace/notes.txt",
+                ref_text: "@file:notes.txt",
+                size_bytes: 789,
+              },
+            ],
+            role: "user",
+            text: "please inspect",
+          },
+        ],
+        session_id: "sid",
+      },
+    });
+
+    expect(state.messages[0].attachments).toEqual([
+      {
+        downloadUrl: "/api/files/download?path=%2Ftmp%2Fshot.png&cwd=%2Fworkspace&filename=shot.png",
+        height: 360,
+        id: "history-0-attachment-0",
+        kind: "image",
+        mimeType: "image/png",
+        name: "shot.png",
+        pagesAttached: undefined,
+        previewUrl: "/api/fs/read-data-url?path=%2Ftmp%2Fshot.png",
+        refText: undefined,
+        sizeBytes: 123,
+        sourcePath: "/tmp/shot.png",
+        width: 640,
+      },
+      {
+        downloadUrl: "/api/files/download?path=%2Fworkspace%2F.hermes%2Fdesktop-attachments%2Freport.pdf&cwd=%2Fworkspace&filename=report.pdf",
+        id: "history-0-attachment-1",
+        kind: "pdf",
+        mimeType: "application/pdf",
+        name: "report.pdf",
+        pagesAttached: 2,
+        previewUrl: undefined,
+        refText: undefined,
+        sizeBytes: 456,
+        sourcePath: "/workspace/.hermes/desktop-attachments/report.pdf",
+      },
+      {
+        downloadUrl: "/api/files/download?path=%2Fworkspace%2Fnotes.txt&cwd=%2Fworkspace&filename=notes.txt",
+        id: "history-0-attachment-2",
+        kind: "file",
+        mimeType: "text/plain",
+        name: "notes.txt",
+        pagesAttached: undefined,
+        previewUrl: undefined,
+        refText: "@file:notes.txt",
+        sizeBytes: 789,
+        sourcePath: "/workspace/notes.txt",
+      },
+    ]);
+  });
+
+  it("keeps an attachment-only historical user message", () => {
+    const state = guiChatReducer(initialGuiChatState, {
+      type: "session.created",
+      response: {
+        messages: [
+          {
+            attachments: [{ kind: "file", name: "notes.txt", size_bytes: 12 }],
+            role: "user",
+            text: "",
+          },
+        ],
+        session_id: "sid",
+      },
+    });
+
+    expect(state.messages).toHaveLength(1);
+    expect(state.messages[0].text).toBe("");
+    expect(state.messages[0].attachments).toHaveLength(1);
+  });
+
+  it("removes attachment prompt hints and avoids duplicate image artifacts", () => {
+    const state = guiChatReducer(initialGuiChatState, {
+      type: "session.created",
+      response: {
+        messages: [
+          {
+            attachments: [
+              {
+                kind: "image",
+                name: "shot.png",
+                path: "/tmp/shot.png",
+                size_bytes: 123,
+                source_paths: ["/tmp/shot.png"],
+              },
+              {
+                kind: "file",
+                name: "notes.txt",
+                ref_text: "@file:notes.txt",
+                size_bytes: 12,
+              },
+            ],
+            role: "user",
+            text: "inspect these\n[Image attached at: /tmp/shot.png]\n\n附件：\n@file:notes.txt\n/tmp/shot.png",
+          },
+        ],
+        session_id: "sid",
+      },
+    });
+
+    expect(state.messages[0].text).toBe("inspect these");
+    expect(state.messages[0].artifactIds).toEqual([]);
+    expect(state.artifacts).toEqual({});
+  });
+
+  it("does not duplicate native image attachments restored from content plus path hint", () => {
+    const state = guiChatReducer(initialGuiChatState, {
+      type: "session.created",
+      response: {
+        messages: [
+          {
+            content: [
+              { text: "这张图片里面有什么\n\n[Image attached at: /opt/hermes/shared/.hermes/images/upload.png]", type: "text" },
+              { image_url: { url: "data:image/png;base64,iVBORw0KGgo=" }, type: "image_url" },
+            ],
+            role: "user",
+          },
+        ],
+        session_id: "sid",
+      },
+    });
+
+    expect(state.messages[0].text).toBe("这张图片里面有什么");
+    expect(state.messages[0].artifactIds).toHaveLength(1);
+  });
+
+  it("recognizes file URLs as filesystem-backed image artifacts", () => {
+    const state = restoreWithMessage("file:///tmp/cat.png");
+
+    const artifact = state.artifacts[state.messages[0].artifactIds[0]];
+    expect(artifact).toMatchObject({
+      mimeType: "image/png",
+      url: "/api/fs/read-data-url?path=file%3A%2F%2F%2Ftmp%2Fcat.png",
+    });
+    expect(state.messages[0].text).toBe("");
+  });
+
+  it("recognizes POSIX absolute paths as filesystem-backed image artifacts", () => {
+    const state = restoreWithMessage("/tmp/cat.png");
+
+    const artifact = state.artifacts[state.messages[0].artifactIds[0]];
+    expect(artifact).toMatchObject({
+      mimeType: "image/png",
+      url: "/api/fs/read-data-url?path=%2Ftmp%2Fcat.png",
+    });
+    expect(state.messages[0].text).toBe("");
+  });
+
+  it("recognizes MEDIA image tags without treating the suffix as a Windows path", () => {
+    const path = "/opt/hermes/shared/.hermes/users/owner/generated/images/custom:codex_result.png";
+    const state = restoreWithMessage(`已生成小狗图片：\nMEDIA:${path}`);
+
+    expect(state.messages[0].text).toBe("已生成小狗图片：");
+    expect(state.messages[0].artifactIds).toHaveLength(1);
+    expect(imageArtifact(state, state.messages[0].artifactIds[0]).url).toBe(
+      `/api/fs/read-data-url?path=${encodeURIComponent(path)}`,
+    );
+    expect(
+      Object.values(state.artifacts).some(
+        (artifact) => artifact.kind !== "file" && artifact.url.includes("A%3A"),
+      ),
+    ).toBe(false);
+  });
+
+  it("recognizes MEDIA image tags with whitespace after the prefix", () => {
+    const path = "/tmp/dog.png";
+    const state = restoreWithMessage(`MEDIA: ${path}`);
+
+    expect(state.messages[0].text).toBe("");
+    expect(state.messages[0].artifactIds).toHaveLength(1);
+    expect(imageArtifact(state, state.messages[0].artifactIds[0]).url).toBe(
+      `/api/fs/read-data-url?path=${encodeURIComponent(path)}`,
+    );
+  });
+
+  it("renders a prefetched MEDIA image attachment as one image instead of a file plus image", () => {
+    const absolutePath = "/opt/hermes/shared/.hermes/users/owner/workspaces/default/generated/images/custom:codex_dog.png";
+    const relativePath = "generated/images/custom:codex_dog.png";
+    const selected = guiChatReducer(initialGuiChatState, {
+      type: "session.selected",
+      generation: 1,
+      sessionId: "sid",
+    });
+    const state = guiChatReducer(selected, {
+      type: "history.initial.succeeded",
+      generation: 1,
+      requestedSessionId: "sid",
+      response: {
+        history_page: { cursor: null, has_more: false, returned_count: 1 },
+        messages: [{
+          attachments: [{
+            kind: "file",
+            mime_type: "image/png",
+            name: "custom:codex_dog.png",
+            path: relativePath,
+            size_bytes: 1_921_464,
+          }],
+          role: "assistant",
+          text: `已生成小狗图片：\n\nMEDIA:${absolutePath}`,
+        }],
+        session_id: "sid",
+      },
+    });
+
+    expect(state.messages[0].text).toBe("已生成小狗图片：");
+    expect(state.messages[0].attachments).toBeUndefined();
+    expect(state.messages[0].artifactIds).toHaveLength(1);
+    expect(imageArtifact(state, state.messages[0].artifactIds[0]).url).toBe(
+      `/api/fs/read-data-url?path=${encodeURIComponent(absolutePath)}`,
+    );
+  });
+
+  it("recognizes local paths with spaces", () => {
+    const state = restoreWithMessage("/Users/me/Desktop/my cat.webp");
+
+    const artifact = state.artifacts[state.messages[0].artifactIds[0]];
+    expect(artifact).toMatchObject({
+      mimeType: "image/webp",
+      url: "/api/fs/read-data-url?path=%2FUsers%2Fme%2FDesktop%2Fmy%20cat.webp",
+    });
+  });
+
+  it("recognizes home and relative image paths", () => {
+    const cwd = "/Users/me/project";
+    const home = restoreWithMessage("~/Downloads/a.jpg", { cwd });
+    const relative = restoreWithMessage("./outputs/a.png", { cwd });
+    const parent = restoreWithMessage("../images/a.jpg", { cwd });
+    const nested = restoreWithMessage("outputs/a.webp", { cwd });
+
+    expect(imageArtifact(home, home.messages[0].artifactIds[0]).url).toBe(
+      "/api/fs/read-data-url?path=~%2FDownloads%2Fa.jpg",
+    );
+    expect(imageArtifact(relative, relative.messages[0].artifactIds[0]).url).toBe(
+      "/api/fs/read-data-url?path=.%2Foutputs%2Fa.png&cwd=%2FUsers%2Fme%2Fproject",
+    );
+    expect(imageArtifact(parent, parent.messages[0].artifactIds[0]).url).toBe(
+      "/api/fs/read-data-url?path=..%2Fimages%2Fa.jpg&cwd=%2FUsers%2Fme%2Fproject",
+    );
+    expect(imageArtifact(nested, nested.messages[0].artifactIds[0]).url).toBe(
+      "/api/fs/read-data-url?path=outputs%2Fa.webp&cwd=%2FUsers%2Fme%2Fproject",
+    );
+  });
+
+  it("keeps existing path semantics when no session cwd is available", () => {
+    const state = restoreWithMessage("./outputs/a.png");
+
+    expect(imageArtifact(state, state.messages[0].artifactIds[0]).url).toBe(
+      "/api/fs/read-data-url?path=.%2Foutputs%2Fa.png",
+    );
+  });
+
+  it("does not recognize a bare filename as an image path", () => {
+    const state = restoreWithMessage("cat.png");
+
+    expect(state.messages[0].artifactIds).toEqual([]);
+    expect(state.artifacts).toEqual({});
+  });
+
+  it("supports markdown image destinations with angle brackets and spaces", () => {
+    const state = restoreWithMessage("结果：\n![cat](</tmp/my cat.png>)");
+
+    expect(state.messages[0].text).toBe("结果：");
+    const artifact = state.artifacts[state.messages[0].artifactIds[0]];
+    expect(artifact).toMatchObject({
+      title: "cat",
+      url: "/api/fs/read-data-url?path=%2Ftmp%2Fmy%20cat.png",
+    });
+  });
+
+  it("supports markdown image destinations with titles", () => {
+    const state = restoreWithMessage('![cat](/tmp/my cat.png "title")');
+
+    expect(state.messages[0].text).toBe("");
+    const artifact = state.artifacts[state.messages[0].artifactIds[0]];
+    expect(artifact).toMatchObject({
+      title: "cat",
+      url: "/api/fs/read-data-url?path=%2Ftmp%2Fmy%20cat.png",
+    });
+  });
+
+  it("trims Chinese punctuation from image references", () => {
+    const remote = restoreWithMessage("https://example.com/cat.png。");
+    const local = restoreWithMessage("/tmp/cat.png）");
+
+    expect(imageArtifact(remote, remote.messages[0].artifactIds[0]).url).toBe(
+      "https://example.com/cat.png",
+    );
+    expect(imageArtifact(local, local.messages[0].artifactIds[0]).url).toBe(
+      "/api/fs/read-data-url?path=%2Ftmp%2Fcat.png",
+    );
+  });
+
+  it("normalizes sandbox absolute paths to filesystem-backed artifacts", () => {
+    const state = restoreWithMessage("sandbox:/mnt/data/cat.png");
+
+    const artifact = state.artifacts[state.messages[0].artifactIds[0]];
+    expect(artifact).toMatchObject({
+      url: "/api/fs/read-data-url?path=%2Fmnt%2Fdata%2Fcat.png",
+    });
+  });
+
+  it("uses cwd from session info events for generated image artifact paths", () => {
+    const withCwd = guiChatReducer(initialGuiChatState, {
+      event: { payload: { cwd: "/Users/me/project" }, type: "session.info" },
+      type: "event",
+    });
+    const state = guiChatReducer(withCwd, {
+      event: {
+        payload: { id: "artifact-1", url: "outputs/a.png" },
+        type: "artifact.image",
+      },
+      type: "event",
+    });
+
+    expect(state.cwd).toBe("/Users/me/project");
+    expect(imageArtifact(state, "artifact-1").url).toBe(
+      "/api/fs/read-data-url?path=outputs%2Fa.png&cwd=%2FUsers%2Fme%2Fproject",
+    );
+  });
+
+  it("attaches a pre-completion structured artifact to the current assistant message", () => {
+    const started = guiChatReducer(initialGuiChatState, {
+      event: { type: "message.start" },
+      type: "event",
+    });
+    const withArtifact = guiChatReducer(started, {
+      event: {
+        payload: {
+          id: "artifact-zip-1",
+          mime_type: "application/zip",
+          name: "tool.zip",
+          path: "/workspace/tool.zip",
+        },
+        type: "artifact.created",
+      },
+      type: "event",
+    });
+    const state = guiChatReducer(withArtifact, {
+      event: {
+        payload: { text: "生成文件：`/workspace/tool.zip`" },
+        type: "message.complete",
+      },
+      type: "event",
+    });
+
+    expect(state.messages[0].artifactIds).toEqual(["artifact-zip-1"]);
+    expect(Object.keys(state.artifacts)).toEqual(["artifact-zip-1"]);
+  });
+
+  it("creates downloadable file artifacts from structured artifact events", () => {
+    const withCwd = guiChatReducer(initialGuiChatState, {
+      event: { payload: { cwd: "/Users/me/project" }, type: "session.info" },
+      type: "event",
+    });
+    const withTool = guiChatReducer(withCwd, {
+      event: { payload: { id: "tool-1", name: "Write" }, type: "tool.start" },
+      type: "event",
+    });
+    const state = guiChatReducer(withTool, {
+      event: {
+        payload: {
+          id: "artifact-file-1",
+          mime_type: "text/html",
+          name: "report.html",
+          path: "outputs/report.html",
+          tool_call_id: "tool-1",
+        },
+        type: "artifact.created",
+      },
+      type: "event",
+    });
+
+    expect(state.artifacts["artifact-file-1"]).toEqual({
+      downloadUrl:
+        "/api/files/download?path=outputs%2Freport.html&cwd=%2FUsers%2Fme%2Fproject&filename=report.html",
+      id: "artifact-file-1",
+      kind: "file",
+      messageId: undefined,
+      mimeType: "text/html",
+      name: "report.html",
+      sourcePath: "outputs/report.html",
+      toolCallId: "tool-1",
+    });
+    expect(state.toolCalls["tool-1"].artifactIds).toEqual(["artifact-file-1"]);
+  });
+
+  it("keeps structured image artifacts on the image preview path", () => {
+    const state = guiChatReducer(initialGuiChatState, {
+      event: {
+        payload: {
+          id: "artifact-image-1",
+          mime_type: "image/png",
+          path: "/tmp/output.png",
+        },
+        type: "artifact.created",
+      },
+      type: "event",
+    });
+
+    expect(state.artifacts["artifact-image-1"]).toMatchObject({
+      mimeType: "image/png",
+      url: "/api/fs/read-data-url?path=%2Ftmp%2Foutput.png",
+    });
+    expect(state.artifacts["artifact-image-1"].kind).not.toBe("file");
+  });
+
+  it("maps generated image cache paths to the static image endpoint", () => {
+    const state = restoreWithMessage(
+      "/opt/hermes/shared/.hermes/cache/images/apiyi_gpt-image-2-medium_20260705_130933_211cd48c.png",
+    );
+
+    expect(imageArtifact(state, state.messages[0].artifactIds[0]).url).toBe(
+      "/api/generated-images/apiyi_gpt-image-2-medium_20260705_130933_211cd48c.png",
+    );
+  });
+
+  it("uses authenticated preview paths for selected-workspace images", () => {
+    const path = "generated/images/apiyi_generated.png";
+    const state = restoreWithMessage(`生成路径：\`${path}\``);
+    const artifact = imageArtifact(state, state.messages[0].artifactIds[0]);
+
+    expect(artifact).toMatchObject({
+      downloadUrl:
+        "/api/files/download?path=generated%2Fimages%2Fapiyi_generated.png&filename=apiyi_generated.png",
+      url:
+        "/api/fs/read-data-url?path=generated%2Fimages%2Fapiyi_generated.png",
+    });
+  });
+
+  it.each([
+    ["生成路径", "生成路径："],
+    ["已生成", "已生成："],
+  ])("restores legacy owner images from %s replies", (_label, prefix) => {
+    const path =
+      "/opt/hermes/shared/.hermes/users/ok1_owner/images/apiyi_generated.png";
+    const state = restoreWithMessage(`${prefix}\`${path}\``);
+    const artifact = imageArtifact(state, state.messages[0].artifactIds[0]);
+
+    expect(state.messages[0].artifactIds).toHaveLength(1);
+    expect(artifact).toMatchObject({
+      downloadUrl:
+        "/api/files/download?path=%2Fopt%2Fhermes%2Fshared%2F.hermes%2Fusers%2Fok1_owner%2Fimages%2Fapiyi_generated.png&filename=apiyi_generated.png",
+      url:
+        "/api/fs/read-data-url?path=%2Fopt%2Fhermes%2Fshared%2F.hermes%2Fusers%2Fok1_owner%2Fimages%2Fapiyi_generated.png",
+    });
+  });
+
+  it("does not treat non-image paths or unsafe schemes as images", () => {
+    for (const text of [
+      "/tmp/readme.txt",
+      "./docs/guide.md",
+      "mailto:test@example.com",
+      "javascript:alert(1)",
+      "```txt\n/tmp/cat.png\n```",
+    ]) {
+      const state = restoreWithMessage(text);
+      expect(state.messages[0].artifactIds).toEqual([]);
+      expect(state.artifacts).toEqual({});
+    }
+  });
+
+  it("retains pagination state after a failed page and clears the error on retry", () => {
+    const selected = guiChatReducer(initialGuiChatState, {
+      type: "session.selected",
+      generation: 2,
+      sessionId: "stored",
+    });
+    const current = guiChatReducer(selected, {
+      type: "history.initial.succeeded",
+      generation: 2,
+      requestedSessionId: "stored",
+      response: {
+        history_page: { cursor: "cursor-2", has_more: true, returned_count: 1 },
+        messages: [{ id: "db-s-2", role: "assistant", text: "current" }],
+        session_id: "stored",
+      },
+    });
+    const failed = guiChatReducer(
+      guiChatReducer(current, {
+        type: "history.prepend.started",
+        generation: 2,
+        sessionId: "stored",
+      }),
+      {
+        type: "history.prepend.failed",
+        generation: 2,
+        message: "Network unavailable",
+        sessionId: "stored",
+      },
+    );
+
+    expect(failed.historyCursor).toBe("cursor-2");
+    expect(failed.historyHasMore).toBe(true);
+    expect(failed.historyLoading).toBe(false);
+    expect(failed.historyError).toBe("Network unavailable");
+
+    const retrying = guiChatReducer(failed, {
+      type: "history.prepend.started",
+      generation: 2,
+      sessionId: "stored",
+    });
+    expect(retrying.historyCursor).toBe("cursor-2");
+    expect(retrying.historyHasMore).toBe(true);
+    expect(retrying.historyLoading).toBe(true);
+    expect(retrying.historyError).toBeUndefined();
+  });
+
+});

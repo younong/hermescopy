@@ -224,6 +224,12 @@ security boundaries, session state, file/network I/O, and gateway transport. For
 frontend changes, run the applicable workspace typecheck and build described in
 `AGENTS.md`.
 
+Web frontend tests (`web/`) must live in a `__tests__/` directory next to the
+code they test, for example `web/src/lib/__tests__/api.test.ts` for
+`web/src/lib/api.ts`. `npm test --workspace web` enforces this layout through
+`web/scripts/check-test-layout.mjs`; vitest does not pick up test files placed
+anywhere else.
+
 ### Browser fallback for environment failures
 
 When a prescribed validation command cannot run because of a local environment
