@@ -1645,6 +1645,220 @@ def test_websocket_teardown_binds_owner_runtime(owner_gateway, monkeypatch):
     assert observed == [(runtime, "ws_disconnect")]
 
 
+def test_user4_legacy_group_rotates_to_current_policy_and_replies(
+    owner_gateway, monkeypatch
+):
+    db, runtime, _workspace_root = owner_gateway
+    from hermes_cli.collaboration.models import CollaborationMemberProfile
+    from hermes_cli.collaboration.resolver import (
+        ResolvedCollaborationEmployee,
+        collaboration_member_policy,
+    )
+    from hermes_cli.collaboration.scheduler import CollaborationScheduler
+    from hermes_cli.collaboration.store import CollaborationStore
+    from hermes_cli.employee_policy import (
+        canonical_employee_snapshot,
+        normalize_employee_snapshot_for_resume,
+    )
+
+    employee_id = "emp_user4"
+    old_profile = CollaborationMemberProfile(
+        employee_id, 1, "fingerprint-emp_user4-r1"
+    )
+    store = CollaborationStore(db, owner_key="owner-a")
+    group = store.create_group("测试群聊", members=[old_profile])
+    membership = store.active_memberships(group.group_id)[0]
+    old_policy = collaboration_member_policy(
+        canonical_employee_snapshot(
+            {
+                "employee_id": employee_id,
+                "profile_revision": 1,
+                "source_profile_fingerprint": old_profile.profile_fingerprint,
+                "system_prompt": "Legacy user4 employee",
+                "model": {"provider": "openai", "model": "legacy-model"},
+                "workspace_relative_path": "employees/new-employee",
+                "knowledge_relative_paths": [],
+            }
+        )[0],
+        membership.membership_id,
+    )
+    runner = server.CollaborationAgentRunner(db, runtime)
+    runner.ensure_member_session(membership=membership, employee_policy=old_policy)
+    db._execute_write(
+        lambda conn: store.record_initial_member_session_generation(
+            conn,
+            membership=membership,
+            employee_policy=old_policy,
+        )
+    )
+    db.append_message(membership.stored_session_id, "user", "historical group prompt")
+    db.append_message(membership.stored_session_id, "assistant", "historical reply")
+    with db._lock:
+        old_session_before = tuple(
+            db._conn.execute(
+                "SELECT model, model_config, system_prompt FROM sessions WHERE id=?",
+                (membership.stored_session_id,),
+            ).fetchone()
+        )
+        old_messages_before = [
+            tuple(row)
+            for row in db._conn.execute(
+                "SELECT role, content, tool_calls, active FROM messages "
+                "WHERE session_id=? ORDER BY id",
+                (membership.stored_session_id,),
+            ).fetchall()
+        ]
+
+    current_policy = canonical_employee_snapshot(
+        {
+            "employee_id": employee_id,
+            "profile_revision": 2,
+            "source_profile_fingerprint": "fingerprint-emp_user4-r2",
+            "system_prompt": "Current user4 employee",
+            "model": {"provider": "openai", "model": "current-model"},
+            "workspace_relative_path": f"employees/{employee_id}",
+            "knowledge_relative_paths": [],
+        }
+    )[0]
+
+    class _Resolver:
+        def resolve_current(self, requested_employee_id):
+            assert requested_employee_id == employee_id
+            return ResolvedCollaborationEmployee(
+                member=CollaborationMemberProfile(
+                    employee_id, 2, "fingerprint-emp_user4-r2"
+                ),
+                employee_policy=current_policy,
+                may_participate=True,
+            )
+
+    built_policies = []
+
+    class _Agent:
+        def __init__(self, context):
+            self.collaboration_context = context
+
+        def run_conversation(self, *_args, **_kwargs):
+            return {"final_response": "mock user4 reply"}
+
+        def close(self):
+            return None
+
+        def interrupt(self):
+            return None
+
+    def _make_agent(*_args, **kwargs):
+        built_policies.append(kwargs["employee_policy"])
+        return _Agent(kwargs["collaboration_context"])
+
+    monkeypatch.setattr(server, "_make_agent", _make_agent)
+    emitted = []
+    scheduler = CollaborationScheduler(
+        db,
+        store=store,
+        resolver=_Resolver(),
+        runner=runner,
+        runtime=runtime,
+        emit=lambda event, payload: emitted.append((event, payload)),
+    )
+    try:
+        first = store.submit_owner_message(
+            group.group_id,
+            text="图片里面有啥",
+            mentioned_membership_ids=[membership.membership_id],
+        )
+        claimed = scheduler._claim_next()
+        assert claimed is not None
+        scheduler._execute_claimed(claimed)
+
+        second = store.submit_owner_message(
+            group.group_id,
+            text="再看一下",
+            mentioned_membership_ids=[membership.membership_id],
+        )
+        claimed_again = scheduler._claim_next()
+        assert claimed_again is not None
+        scheduler._execute_claimed(claimed_again)
+    finally:
+        scheduler.close()
+
+    with db._lock:
+        generations = db._conn.execute(
+            "SELECT generation, policy_json, hidden_session_id, stored_session_id "
+            "FROM collaboration_member_session_generations WHERE membership_id=? "
+            "ORDER BY generation",
+            (membership.membership_id,),
+        ).fetchall()
+        current_membership = db._conn.execute(
+            "SELECT current_session_generation FROM collaboration_memberships "
+            "WHERE membership_id=?",
+            (membership.membership_id,),
+        ).fetchone()
+        old_session_after = tuple(
+            db._conn.execute(
+                "SELECT model, model_config, system_prompt FROM sessions WHERE id=?",
+                (membership.stored_session_id,),
+            ).fetchone()
+        )
+        old_messages_after = [
+            tuple(row)
+            for row in db._conn.execute(
+                "SELECT role, content, tool_calls, active FROM messages "
+                "WHERE session_id=? ORDER BY id",
+                (membership.stored_session_id,),
+            ).fetchall()
+        ]
+        group_events = db._conn.execute(
+            "SELECT sequence, event_kind, body_json FROM collaboration_events "
+            "WHERE group_id=? ORDER BY sequence",
+            (group.group_id,),
+        ).fetchall()
+
+    assert first.turn is not None and second.turn is not None
+    assert scheduler.turn_status(first.turn.turn_id)["status"] == "completed"
+    assert scheduler.turn_status(second.turn.turn_id)["status"] == "completed"
+    assert old_session_after == old_session_before
+    assert old_messages_after == old_messages_before
+    assert [row["generation"] for row in generations] == [1, 2]
+    assert current_membership["current_session_generation"] == 2
+    assert claimed["stored_session_id"] != membership.stored_session_id
+    assert claimed_again["stored_session_id"] == claimed["stored_session_id"]
+    generation_two_policy = json.loads(generations[1]["policy_json"])
+    assert generation_two_policy["workspace_relative_path"] == f"employees/{employee_id}"
+    assert generation_two_policy["model"]["model"] == "current-model"
+    assert built_policies == [
+        normalize_employee_snapshot_for_resume(generation_two_policy)
+    ]
+    rotation_sequence = next(
+        row["sequence"]
+        for row in group_events
+        if row["event_kind"] == "membership.session.rotated"
+    )
+    reply_events = [
+        row for row in group_events if row["event_kind"] == "message.employee"
+    ]
+    assert len(reply_events) == 2
+    assert rotation_sequence < reply_events[0]["sequence"]
+    assert json.loads(reply_events[0]["body_json"])["text"] == "mock user4 reply"
+    assert [
+        payload["event_kind"]
+        for event, payload in emitted
+        if event == "collaboration.event.appended"
+    ][0] == "membership.session.rotated"
+    with pytest.raises(RuntimeError, match="snapshot is inconsistent"):
+        runner.run(
+            stored_session_id=membership.stored_session_id,
+            hidden_session_id="forbidden-policy-swap",
+            employee_policy=generation_two_policy,
+            prompt="unsafe reuse",
+            target_id="unsafe-target",
+            external_receipt_key="unsafe-receipt",
+            on_delta=lambda _text: None,
+            on_approval=lambda _data: None,
+        )
+    runner.close()
+
+
 def test_collaboration_runner_rebuilds_from_matching_persisted_policy(
     owner_gateway, monkeypatch
 ):
@@ -1660,6 +1874,7 @@ def test_collaboration_runner_rebuilds_from_matching_persisted_policy(
         profile_fingerprint="fingerprint-a",
         hidden_session_id="hidden-a",
         stored_session_id="stored-a",
+        current_session_generation=1,
         role="member",
         join_sequence=1,
         leave_sequence=None,
@@ -1760,6 +1975,7 @@ def test_collaboration_runner_resumes_policy_from_before_reasoning_levels(
         profile_fingerprint="profile-fingerprint-a",
         hidden_session_id="hidden-a",
         stored_session_id="stored-a",
+        current_session_generation=1,
         role="member",
         join_sequence=1,
         leave_sequence=None,
@@ -1892,6 +2108,7 @@ def test_collaboration_runner_refreshes_dynamic_context_but_pins_identity(
         profile_fingerprint="fingerprint-a",
         hidden_session_id="hidden-a",
         stored_session_id="stored-a",
+        current_session_generation=1,
         role="member",
         join_sequence=1,
         leave_sequence=None,

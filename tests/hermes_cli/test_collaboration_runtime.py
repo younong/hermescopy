@@ -97,8 +97,13 @@ class _ApprovalRunner:
         self.waiting = threading.Event()
         self.resume = threading.Event()
         self.interrupted: list[str] = []
+        self.calls: list[dict] = []
+
+    def provision_session_generation(self, _generation, _employee_policy) -> None:
+        return None
 
     def run(self, **kwargs):
+        self.calls.append(kwargs)
         self.started.set()
         kwargs["on_approval"](
             {
@@ -132,8 +137,21 @@ class _Runner:
     def bind_service(self, service) -> None:
         self.service = service
 
-    def ensure_coordinator_session(self, *, task_id: str, employee_policy: dict):
-        return f"coordinator-{task_id}", f"hidden-{task_id}"
+    def provision_session_generation(self, _generation, _employee_policy) -> None:
+        return None
+
+    def ensure_coordinator_session(
+        self,
+        *,
+        task_id: str,
+        membership_id: str,
+        session_generation: int,
+        employee_policy: dict,
+    ):
+        return (
+            f"coordinator-{task_id}-{membership_id}-{session_generation}",
+            f"hidden-{task_id}-{membership_id}-{session_generation}",
+        )
 
     def run(self, **kwargs):
         self.calls.append(kwargs)
@@ -1131,7 +1149,10 @@ def test_ai_task_round_uses_member_context_then_exact_creator_coordinator(db):
     assert runner.calls[0]["collaboration_context"].source_depth == 1
     assert runner.calls[1]["collaboration_context"].role == "coordinator"
     assert runner.calls[1]["collaboration_context"].creator_employee_id == "creator"
-    assert runner.calls[1]["stored_session_id"] == f"coordinator-{created['task_id']}"
+    creator_membership = store.active_memberships(created["group_id"])[0]
+    assert runner.calls[1]["stored_session_id"] == (
+        f"coordinator-{created['task_id']}-{creator_membership.membership_id}-2"
+    )
 
 
 def test_finish_summary_with_textual_mentions_does_not_schedule_origin_targets(db):
@@ -1537,7 +1558,7 @@ def test_archive_cancels_work_expires_approval_and_blocks_stale_completion(db):
 
     archived, live_sessions = store.archive_group(group.group_id)
     assert archived.status == "archived"
-    assert live_sessions == (membership.hidden_session_id,)
+    assert live_sessions == (claimed["hidden_session_id"],)
     with db._lock:
         target_statuses = {
             row["turn_id"]: row["status"]
@@ -1564,7 +1585,7 @@ def test_archive_cancels_work_expires_approval_and_blocks_stale_completion(db):
     receipt_key = f"collaboration:{claimed['execution_id']}"
     db.begin_external_turn(
         turn_key=receipt_key,
-        stored_session_id=membership.stored_session_id,
+        stored_session_id=claimed["stored_session_id"],
         worker_id="worker-a",
         worker_generation=2,
     )
@@ -1811,7 +1832,7 @@ def test_interrupted_coalesced_follower_interrupts_the_shared_member_session(db)
     interrupted = scheduler.interrupt(second.turn.targets[0].target_id)
 
     assert interrupted["status"] == "cancelled"
-    assert runner.interrupted == [membership.hidden_session_id]
+    assert runner.interrupted == [claimed["hidden_session_id"]]
     assert scheduler.turn_status(first.turn.turn_id)["status"] == "running"
     scheduler.close()
 
@@ -2094,16 +2115,18 @@ def test_waiting_approval_pauses_active_budget_and_resumes_exact_callback(db):
         active_budget_seconds=1,
         poll_seconds=0.02,
     )
-    register_gateway_notify(membership.stored_session_id, lambda _data: None)
+    active_stored_session_id = None
     try:
         scheduler.start()
         assert runner.waiting.wait(timeout=2)
+        active_stored_session_id = runner.calls[0]["stored_session_id"]
+        register_gateway_notify(active_stored_session_id, lambda _data: None)
         with db._lock:
             approval = db._conn.execute(
                 "SELECT approval_id, tool_call_id FROM collaboration_approvals"
             ).fetchone()
             entry = _ApprovalEntry({"tool_call_id": approval["tool_call_id"]})
-            _gateway_queues.setdefault(membership.stored_session_id, []).append(entry)
+            _gateway_queues.setdefault(active_stored_session_id, []).append(entry)
             before = db._conn.execute(
                 "SELECT active_seconds FROM collaboration_turn_targets"
             ).fetchone()[0]
@@ -2135,7 +2158,8 @@ def test_waiting_approval_pauses_active_budget_and_resumes_exact_callback(db):
     finally:
         runner.resume.set()
         scheduler.close()
-        unregister_gateway_notify(membership.stored_session_id)
+        if active_stored_session_id is not None:
+            unregister_gateway_notify(active_stored_session_id)
 
 
 def test_scheduler_marks_prior_worker_and_pending_approval_ambiguous(db):

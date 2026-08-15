@@ -33,7 +33,7 @@ class CollaborationRuntime:
             resolver=resolver,
             emit=emit,
             ensure_member_session=runner.ensure_member_session,
-            provision_member_session=getattr(runner, "provision_member_session", None),
+            provision_session_generation=runner.provision_session_generation,
             filesystem_context=runtime.filesystem_context,
             deliver_web_origin=deliver_web_origin,
             worker_id=runtime.worker_id,

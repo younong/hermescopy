@@ -16,6 +16,7 @@ from .models import (
     CollaborationGroup,
     CollaborationMemberProfile,
     CollaborationMembership,
+    CollaborationMemberSessionGeneration,
     CollaborationTarget,
     CollaborationTurn,
     SubmittedOwnerMessage,
@@ -243,10 +244,13 @@ class CollaborationStore:
                 live_sessions = tuple(
                     str(row["hidden_session_id"])
                     for row in conn.execute(
-                        "SELECT DISTINCT m.hidden_session_id "
-                        "FROM collaboration_turn_targets tt "
+                        "SELECT DISTINCT COALESCE(sg.hidden_session_id, m.hidden_session_id) "
+                        "AS hidden_session_id FROM collaboration_turn_targets tt "
                         "JOIN collaboration_turns t ON t.turn_id=tt.turn_id "
                         "JOIN collaboration_memberships m ON m.membership_id=tt.membership_id "
+                        "LEFT JOIN collaboration_member_session_generations sg "
+                        "ON sg.membership_id=tt.membership_id "
+                        "AND sg.generation=tt.session_generation "
                         "WHERE t.group_id=? AND tt.status IN ('running','waiting_approval')",
                         (group_id,),
                     ).fetchall()
@@ -810,8 +814,9 @@ class CollaborationStore:
                     """
                     INSERT INTO collaboration_turn_targets
                       (target_id, execution_id, turn_id, employee_id, membership_id,
-                       join_sequence, snapshot_sequence, status, created_at, updated_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?)
+                       session_generation, join_sequence, snapshot_sequence, status,
+                       created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?)
                     """,
                     (
                         target_id,
@@ -819,6 +824,7 @@ class CollaborationStore:
                         turn_id,
                         employee_id,
                         membership["membership_id"],
+                        membership["current_session_generation"],
                         membership["join_sequence"],
                         event.sequence,
                         now,
@@ -841,6 +847,7 @@ class CollaborationStore:
                         turn_id=turn_id,
                         employee_id=employee_id,
                         membership_id=str(membership["membership_id"]),
+                        session_generation=int(membership["current_session_generation"]),
                         join_sequence=int(membership["join_sequence"]),
                         snapshot_sequence=event.sequence,
                         status="queued",
@@ -925,7 +932,8 @@ class CollaborationStore:
                 return None
             first_targets = conn.execute(
                 "SELECT tt.target_id, tt.employee_id, tt.membership_id, "
-                "tt.join_sequence, m.leave_sequence "
+                "tt.join_sequence, m.current_session_generation AS session_generation, "
+                "m.leave_sequence "
                 "FROM collaboration_discussion_rounds r "
                 "JOIN collaboration_turn_targets tt ON tt.turn_id=r.turn_id "
                 "JOIN collaboration_memberships m ON m.membership_id=tt.membership_id "
@@ -975,14 +983,16 @@ class CollaborationStore:
                 conn.execute(
                     "INSERT INTO collaboration_turn_targets "
                     "(target_id, execution_id, turn_id, employee_id, membership_id, "
-                    "join_sequence, snapshot_sequence, status, created_at, updated_at) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?)",
+                    "session_generation, join_sequence, snapshot_sequence, status, "
+                    "created_at, updated_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?)",
                     (
                         target_id,
                         f"cex_{uuid.uuid4().hex}",
                         turn_id,
                         first["employee_id"],
                         first["membership_id"],
+                        first["session_generation"],
                         first["join_sequence"],
                         event.sequence,
                         now,
@@ -1828,14 +1838,16 @@ class CollaborationStore:
                 conn.execute(
                     "INSERT INTO collaboration_turn_targets "
                     "(target_id, execution_id, turn_id, employee_id, membership_id, "
-                    "join_sequence, snapshot_sequence, status, created_at, updated_at) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?)",
+                    "session_generation, join_sequence, snapshot_sequence, status, "
+                    "created_at, updated_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?)",
                     (
                         target_id,
                         execution_id,
                         turn_id,
                         employee_id,
                         membership["membership_id"],
+                        membership["current_session_generation"],
                         membership["join_sequence"],
                         event.sequence,
                         now,
@@ -1862,6 +1874,7 @@ class CollaborationStore:
                         turn_id=turn_id,
                         employee_id=employee_id,
                         membership_id=str(membership["membership_id"]),
+                        session_generation=int(membership["current_session_generation"]),
                         join_sequence=int(membership["join_sequence"]),
                         snapshot_sequence=event.sequence,
                         status="queued",
@@ -2043,6 +2056,7 @@ class CollaborationStore:
             turn_id=str(row["turn_id"]),
             employee_id=str(row["employee_id"]),
             membership_id=str(row["membership_id"]),
+            session_generation=int(row["session_generation"]),
             join_sequence=int(row["join_sequence"]),
             snapshot_sequence=int(row["snapshot_sequence"]),
             status=str(row["status"]),
@@ -2196,6 +2210,161 @@ class CollaborationStore:
             ).fetchone()
         )
 
+    def record_initial_member_session_generation(
+        self,
+        conn,
+        *,
+        membership: CollaborationMembership,
+        employee_policy: Mapping[str, Any],
+    ) -> None:
+        """Persist immutable generation 1 beside its already-provisioned session."""
+        policy = dict(employee_policy)
+        fingerprint = _identifier(
+            policy.get("snapshot_fingerprint"), "employee policy fingerprint"
+        )
+        row = conn.execute(
+            "SELECT event_id FROM collaboration_events WHERE group_id=? AND sequence=?",
+            (membership.group_id, membership.join_sequence),
+        ).fetchone()
+        if row is None:
+            raise RuntimeError("collaboration membership event is unavailable")
+        conn.execute(
+            "INSERT INTO collaboration_member_session_generations "
+            "(membership_id, generation, profile_revision, profile_fingerprint, "
+            "policy_fingerprint, policy_json, hidden_session_id, stored_session_id, "
+            "activated_event_id, activated_sequence, created_at) "
+            "VALUES (?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                membership.membership_id,
+                membership.profile_revision,
+                membership.profile_fingerprint,
+                fingerprint,
+                _json_object(policy),
+                membership.hidden_session_id,
+                membership.stored_session_id,
+                row["event_id"],
+                membership.join_sequence,
+                membership.created_at,
+            ),
+        )
+
+    def ensure_current_member_session_generation(
+        self,
+        conn,
+        *,
+        membership_id: str,
+        member: CollaborationMemberProfile,
+        employee_policy: Mapping[str, Any],
+        provision_session,
+        now: float,
+    ) -> tuple[CollaborationMemberSessionGeneration, CollaborationEvent | None]:
+        """Rotate future execution to one fresh immutable session when policy changes."""
+        membership = conn.execute(
+            "SELECT * FROM collaboration_memberships WHERE membership_id=?",
+            (membership_id,),
+        ).fetchone()
+        if membership is None or membership["leave_sequence"] is not None:
+            raise RuntimeError("collaboration membership is no longer eligible")
+        policy = dict(employee_policy)
+        fingerprint = _identifier(
+            policy.get("snapshot_fingerprint"), "employee policy fingerprint"
+        )
+        policy_json = _json_object(policy)
+        current = conn.execute(
+            "SELECT * FROM collaboration_member_session_generations "
+            "WHERE membership_id=? AND generation=?",
+            (membership_id, membership["current_session_generation"]),
+        ).fetchone()
+        if (
+            current is not None
+            and str(current["policy_fingerprint"]) == fingerprint
+            and str(current["policy_json"]) == policy_json
+        ):
+            return self._session_generation(dict(current)), None
+
+        generation = int(membership["current_session_generation"]) + 1
+        hidden_session_id = f"collab_member_{uuid.uuid4().hex}"
+        stored_session_id = f"collab_stored_{uuid.uuid4().hex}"
+        event = self._event(
+            self._append_event(
+                conn,
+                group_id=str(membership["group_id"]),
+                event_kind="membership.session.rotated",
+                actor_kind="system",
+                body={
+                    "membership_id": membership_id,
+                    "employee_id": member.employee_id,
+                    "reason": (
+                        "effective_policy_changed"
+                        if current is not None
+                        else "legacy_generation_unavailable"
+                    ),
+                    "from_generation": int(membership["current_session_generation"]),
+                    "to_generation": generation,
+                    "from_profile_revision": (
+                        int(current["profile_revision"]) if current is not None else None
+                    ),
+                    "to_profile_revision": member.profile_revision,
+                    "from_profile_fingerprint": (
+                        str(current["profile_fingerprint"]) if current is not None else None
+                    ),
+                    "to_profile_fingerprint": member.profile_fingerprint,
+                    "from_policy_fingerprint": (
+                        str(current["policy_fingerprint"]) if current is not None else None
+                    ),
+                    "to_policy_fingerprint": fingerprint,
+                },
+                now=now,
+            )
+        )
+        generation_row = CollaborationMemberSessionGeneration(
+            membership_id=membership_id,
+            generation=generation,
+            profile_revision=member.profile_revision,
+            profile_fingerprint=member.profile_fingerprint,
+            policy_fingerprint=fingerprint,
+            employee_policy=policy,
+            hidden_session_id=hidden_session_id,
+            stored_session_id=stored_session_id,
+            activated_event_id=event.event_id,
+            activated_sequence=event.sequence,
+            created_at=now,
+        )
+        provision_session(generation_row, policy)
+        conn.execute(
+            "INSERT INTO collaboration_member_session_generations "
+            "(membership_id, generation, profile_revision, profile_fingerprint, "
+            "policy_fingerprint, policy_json, hidden_session_id, stored_session_id, "
+            "activated_event_id, activated_sequence, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                membership_id,
+                generation,
+                member.profile_revision,
+                member.profile_fingerprint,
+                fingerprint,
+                policy_json,
+                hidden_session_id,
+                stored_session_id,
+                event.event_id,
+                event.sequence,
+                now,
+            ),
+        )
+        changed = conn.execute(
+            "UPDATE collaboration_memberships SET current_session_generation=? "
+            "WHERE membership_id=? AND current_session_generation=?",
+            (generation, membership_id, membership["current_session_generation"]),
+        ).rowcount
+        if changed != 1:
+            raise RuntimeError("collaboration session generation changed concurrently")
+        conn.execute(
+            "UPDATE collaboration_turn_targets SET session_generation=?, updated_at=? "
+            "WHERE membership_id=? AND status='queued'",
+            (generation, now, membership_id),
+        )
+        return generation_row, event
+
     @staticmethod
     def _trusted_profile(member: CollaborationMemberProfile) -> CollaborationMemberProfile:
         if not isinstance(member, CollaborationMemberProfile):
@@ -2245,11 +2414,30 @@ class CollaborationStore:
             profile_fingerprint=str(row["profile_fingerprint"]),
             hidden_session_id=str(row["hidden_session_id"]),
             stored_session_id=str(row["stored_session_id"]),
+            current_session_generation=int(row["current_session_generation"]),
             role=str(row["role"]),
             join_sequence=int(row["join_sequence"]),
             leave_sequence=int(row["leave_sequence"]) if row["leave_sequence"] is not None else None,
             created_at=float(row["created_at"]),
             left_at=float(row["left_at"]) if row["left_at"] is not None else None,
+        )
+
+    @staticmethod
+    def _session_generation(
+        row: Mapping[str, Any],
+    ) -> CollaborationMemberSessionGeneration:
+        return CollaborationMemberSessionGeneration(
+            membership_id=str(row["membership_id"]),
+            generation=int(row["generation"]),
+            profile_revision=int(row["profile_revision"]),
+            profile_fingerprint=str(row["profile_fingerprint"]),
+            policy_fingerprint=str(row["policy_fingerprint"]),
+            employee_policy=json.loads(str(row["policy_json"])),
+            hidden_session_id=str(row["hidden_session_id"]),
+            stored_session_id=str(row["stored_session_id"]),
+            activated_event_id=str(row["activated_event_id"]),
+            activated_sequence=int(row["activated_sequence"]),
+            created_at=float(row["created_at"]),
         )
 
     @staticmethod

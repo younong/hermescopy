@@ -38,11 +38,27 @@ class CollaborationMembership:
     profile_fingerprint: str
     hidden_session_id: str
     stored_session_id: str
+    current_session_generation: int
     role: str
     join_sequence: int
     leave_sequence: int | None
     created_at: float
     left_at: float | None
+
+
+@dataclass(frozen=True)
+class CollaborationMemberSessionGeneration:
+    membership_id: str
+    generation: int
+    profile_revision: int
+    profile_fingerprint: str
+    policy_fingerprint: str
+    employee_policy: dict[str, Any]
+    hidden_session_id: str
+    stored_session_id: str
+    activated_event_id: str
+    activated_sequence: int
+    created_at: float
 
 
 @dataclass(frozen=True)
@@ -65,6 +81,7 @@ class CollaborationTarget:
     turn_id: str
     employee_id: str
     membership_id: str
+    session_generation: int
     join_sequence: int
     snapshot_sequence: int
     status: str
