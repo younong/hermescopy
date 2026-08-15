@@ -1,5 +1,5 @@
-import { memo, useCallback, useEffect, useMemo, useState } from "react";
-import { AlertCircle, Link2, Plus, Search, Settings } from "lucide-react";
+import { memo, useCallback, useEffect, useState } from "react";
+import { AlertCircle, ChevronLeft, ChevronRight, Link2, Plus, Search, Settings } from "lucide-react";
 import { Button } from "@nous-research/ui/ui/components/button";
 import { Input } from "@nous-research/ui/ui/components/input";
 import { Label } from "@nous-research/ui/ui/components/label";
@@ -88,19 +88,17 @@ const EMPTY_BINDING: BindingDraft = {
   verificationToken: "",
 };
 
-export type EmployeeContactsLoadStatus = "loading" | "ready" | "error";
+type EmployeeContactsLoadStatus = "loading" | "ready" | "error";
 
 export interface EmployeeContactsPaneProps {
-  employees: Employee[];
-  loadStatus: EmployeeContactsLoadStatus;
   selectedEmployeeId: string | null;
   onEmployeeSelect(employeeId: string): void;
   onRefresh(): void | Promise<void>;
 }
 
+const EMPLOYEE_PAGE_SIZE = 20;
+
 export const EmployeeContactsPane = memo(function EmployeeContactsPane({
-  employees,
-  loadStatus,
   selectedEmployeeId,
   onEmployeeSelect,
   onRefresh,
@@ -110,7 +108,13 @@ export const EmployeeContactsPane = memo(function EmployeeContactsPane({
   const text = copy.employees;
   const common = t.common;
   const [catalog, setCatalog] = useState<EmployeeCatalog | null>(null);
+  const [employees, setEmployees] = useState<Employee[]>([]);
+  const [loadStatus, setLoadStatus] = useState<EmployeeContactsLoadStatus>("loading");
+  const [total, setTotal] = useState(0);
+  const [page, setPage] = useState(1);
+  const [statusFilter, setStatusFilter] = useState<EmployeeLifecycleStatus | "">("");
   const [query, setQuery] = useState("");
+  const [appliedQuery, setAppliedQuery] = useState("");
   const [editor, setEditor] = useState<EmployeeEditor | null>(null);
   const [managedEmployeeId, setManagedEmployeeId] = useState<string | null>(null);
   const [bindingEditor, setBindingEditor] = useState<BindingEditor | null>(null);
@@ -134,10 +138,49 @@ export const EmployeeContactsPane = memo(function EmployeeContactsPane({
     return () => URL.revokeObjectURL(url);
   }, [avatarFile]);
 
+  useEffect(() => {
+    const next = query.trim();
+    if (next === appliedQuery) return undefined;
+    const handle = window.setTimeout(() => {
+      setAppliedQuery(next);
+      setPage(1);
+    }, 300);
+    return () => window.clearTimeout(handle);
+  }, [appliedQuery, query]);
+
+  const loadEmployees = useCallback(async () => {
+    setLoadStatus("loading");
+    try {
+      const response = await api.getEmployees({
+        page,
+        pageSize: EMPLOYEE_PAGE_SIZE,
+        query: appliedQuery || undefined,
+        status: statusFilter || undefined,
+      });
+      setEmployees(response.employees);
+      setTotal(response.total);
+      setLoadStatus("ready");
+    } catch {
+      setEmployees([]);
+      setTotal(0);
+      setLoadStatus("error");
+    }
+  }, [appliedQuery, page, statusFilter]);
+
+  useEffect(() => {
+    void loadEmployees();
+  }, [loadEmployees]);
+
+  useEffect(() => {
+    const pages = Math.max(1, Math.ceil(total / EMPLOYEE_PAGE_SIZE));
+    if (page > pages) setPage(pages);
+  }, [page, total]);
+
   const refreshEmployees = useCallback(async () => {
     setCollaborationDrafts({});
+    await loadEmployees();
     await onRefresh();
-  }, [onRefresh]);
+  }, [loadEmployees, onRefresh]);
 
   const ensureCatalog = useCallback(async () => {
     if (catalog) return catalog;
@@ -150,18 +193,6 @@ export const EmployeeContactsPane = memo(function EmployeeContactsPane({
       return null;
     }
   }, [catalog, showToast, text.loadFailed]);
-
-  const visibleEmployees = useMemo(() => {
-    const normalizedQuery = query.trim().toLocaleLowerCase();
-    if (!normalizedQuery) return employees;
-    return employees.filter((employee) =>
-      [employeeName(employee, text), employeeRole(employee, text)]
-        .filter(Boolean)
-        .join("\n")
-        .toLocaleLowerCase()
-        .includes(normalizedQuery),
-    );
-  }, [employees, query, text]);
 
   const resetAvatar = (preview: string | null = null) => {
     setAvatarFile(null);
@@ -357,8 +388,8 @@ export const EmployeeContactsPane = memo(function EmployeeContactsPane({
         </Button>
       </header>
 
-      <div className="px-3 py-2.5">
-        <label className="flex h-9 items-center gap-2 rounded-lg border border-black/[0.08] bg-white px-3 text-[#85888e] focus-within:border-black/20">
+      <div className="flex items-center gap-2 px-3 py-2.5">
+        <label className="flex h-9 min-w-0 flex-1 items-center gap-2 rounded-lg border border-black/[0.08] bg-white px-3 text-[#85888e] focus-within:border-black/20">
           <Search aria-hidden className="h-3.5 w-3.5 shrink-0" />
           <input
             aria-label={common.search}
@@ -368,6 +399,19 @@ export const EmployeeContactsPane = memo(function EmployeeContactsPane({
             value={query}
           />
         </label>
+        <select
+          aria-label={text.status}
+          className="h-9 shrink-0 rounded-lg border border-black/[0.08] bg-white px-2 text-[12px] text-[#2c2f35] outline-none transition focus:border-black/20"
+          onChange={(event) => {
+            setStatusFilter(event.target.value as EmployeeLifecycleStatus | "");
+            setPage(1);
+          }}
+          value={statusFilter}
+        >
+          <option value="">{text.statusAll}</option>
+          <option value="active">{text.lifecycle.active}</option>
+          <option value="suspended">{text.lifecycle.suspended}</option>
+        </select>
       </div>
 
       <div className="min-h-0 flex-1 overflow-y-auto px-2 pb-3">
@@ -379,13 +423,13 @@ export const EmployeeContactsPane = memo(function EmployeeContactsPane({
           <div className="flex flex-col items-center gap-3 px-4 py-10 text-center text-xs" role="alert">
             <AlertCircle className="h-5 w-5 text-[#a8322d]" />
             <span className="text-[#777c84]">{text.loadFailed.replace("{error}", "").replace(/[:：]\s*$/, "")}</span>
-            <Button onClick={() => void onRefresh()} outlined size="sm">{common.retry}</Button>
+            <Button onClick={() => void loadEmployees()} outlined size="sm">{common.retry}</Button>
           </div>
-        ) : employees.length === 0 ? null : visibleEmployees.length === 0 ? (
+        ) : employees.length === 0 ? (appliedQuery || statusFilter ? (
           <div className="px-4 py-10 text-center text-xs text-[#85888e]">{common.noResults}</div>
-        ) : (
+        ) : null) : (
           <ul aria-label={text.listLabel} className="flex flex-col gap-1" role="list">
-            {visibleEmployees.map((employee) => (
+            {employees.map((employee) => (
               <EmployeeContactRow
                 employee={employee}
                 key={employee.employee_id}
@@ -398,6 +442,34 @@ export const EmployeeContactsPane = memo(function EmployeeContactsPane({
           </ul>
         )}
       </div>
+
+      {loadStatus === "ready" && total > EMPLOYEE_PAGE_SIZE ? (
+        <footer className="flex items-center justify-between gap-2 border-t border-black/[0.06] px-3 py-2 text-[11px] text-[#85888e]">
+          <span>{text.pageInfo.replace("{page}", String(page)).replace("{pages}", String(Math.max(1, Math.ceil(total / EMPLOYEE_PAGE_SIZE))))}</span>
+          <div className="flex items-center gap-1">
+            <Button
+              aria-label={text.previousPage}
+              className="h-7 w-7 rounded-md"
+              disabled={page <= 1}
+              ghost
+              onClick={() => setPage((current) => Math.max(1, current - 1))}
+              size="icon"
+            >
+              <ChevronLeft aria-hidden className="h-3.5 w-3.5" />
+            </Button>
+            <Button
+              aria-label={text.nextPage}
+              className="h-7 w-7 rounded-md"
+              disabled={page >= Math.ceil(total / EMPLOYEE_PAGE_SIZE)}
+              ghost
+              onClick={() => setPage((current) => current + 1)}
+              size="icon"
+            >
+              <ChevronRight aria-hidden className="h-3.5 w-3.5" />
+            </Button>
+          </div>
+        </footer>
+      ) : null}
 
       {managedEmployee ? (
         <GuiChatWorkspaceDialog

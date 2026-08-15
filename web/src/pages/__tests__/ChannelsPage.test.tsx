@@ -44,7 +44,7 @@ afterEach(async () => {
 describe("ChannelsPage", () => {
   it("shows managed channel status and links employee management to the Chat GUI", async () => {
     const getMessagingPlatforms = vi.spyOn(api, "getMessagingPlatforms");
-    vi.spyOn(api, "getEmployees").mockResolvedValue({ employees: [] });
+    vi.spyOn(api, "getEmployees").mockResolvedValue({ employees: [], page: 1, page_size: 200, total: 0 });
 
     await renderChannelsPage();
 
@@ -63,7 +63,7 @@ describe("ChannelsPage", () => {
       employee("employee-a", "active", "running"),
       employee("employee-b", "suspended", "stopped"),
     ];
-    vi.spyOn(api, "getEmployees").mockResolvedValue({ employees });
+    vi.spyOn(api, "getEmployees").mockResolvedValue({ employees, page: 1, page_size: 200, total: employees.length });
 
     await renderChannelsPage();
 
@@ -72,7 +72,7 @@ describe("ChannelsPage", () => {
     expect(document.querySelector('button[aria-label="Enable Feishu / Lark"]')).toBeNull();
   });
   it("renders the managed employee support surface in Chinese", async () => {
-    vi.spyOn(api, "getEmployees").mockResolvedValue({ employees: [] });
+    vi.spyOn(api, "getEmployees").mockResolvedValue({ employees: [], page: 1, page_size: 200, total: 0 });
 
     await renderChannelsPage("zh");
 
