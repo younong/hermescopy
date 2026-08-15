@@ -456,6 +456,10 @@ export interface GuiChatTranslations {
     none: string;
     emptyHint: string;
     status: string;
+    statusAll: string;
+    previousPage: string;
+    nextPage: string;
+    pageInfo: string;
     channel: string;
     actions: string;
     listLabel: string;

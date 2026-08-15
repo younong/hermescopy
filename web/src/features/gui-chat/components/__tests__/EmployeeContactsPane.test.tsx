@@ -4,11 +4,8 @@ import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { I18nProvider, type Locale } from "@/i18n";
-import { api, type Employee, type EmployeeCatalog } from "@/lib/api";
-import {
-  EmployeeContactsPane,
-  type EmployeeContactsLoadStatus,
-} from "../EmployeeContactsPane";
+import { api, type Employee, type EmployeeCatalog, type EmployeeListResult } from "@/lib/api";
+import { EmployeeContactsPane } from "../EmployeeContactsPane";
 
 vi.mock("@/lib/api", async (importOriginal) => ({
   ...await importOriginal<typeof import("@/lib/api")>(),
@@ -38,9 +35,20 @@ const catalog: EmployeeCatalog = {
 
 let root: Root | null = null;
 
+function listResult(
+  employees: Employee[],
+  overrides: Partial<Omit<EmployeeListResult, "employees">> = {},
+): EmployeeListResult {
+  return {
+    employees,
+    page: 1,
+    page_size: 10,
+    total: employees.length,
+    ...overrides,
+  };
+}
+
 interface RenderPaneOptions {
-  employees?: Employee[];
-  loadStatus?: EmployeeContactsLoadStatus;
   locale?: Locale;
   onEmployeeSelect?: (employeeId: string) => void;
   onRefresh?: () => void | Promise<void>;
@@ -48,8 +56,6 @@ interface RenderPaneOptions {
 }
 
 async function renderPane({
-  employees = [],
-  loadStatus = "ready",
   locale = "en",
   onEmployeeSelect = vi.fn(),
   onRefresh = vi.fn(),
@@ -63,8 +69,6 @@ async function renderPane({
     root?.render(
       <I18nProvider>
         <EmployeeContactsPane
-          employees={employees}
-          loadStatus={loadStatus}
           onEmployeeSelect={onEmployeeSelect}
           onRefresh={onRefresh}
           selectedEmployeeId={selectedEmployeeId}
@@ -72,6 +76,13 @@ async function renderPane({
       </I18nProvider>,
     );
     await Promise.resolve();
+    await Promise.resolve();
+  });
+}
+
+async function flushSearchDebounce() {
+  await act(async () => {
+    await new Promise((resolve) => setTimeout(resolve, 400));
     await Promise.resolve();
   });
 }
@@ -106,6 +117,7 @@ beforeEach(() => {
   (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT: boolean })
     .IS_REACT_ACT_ENVIRONMENT = true;
   vi.spyOn(api, "getEmployeeCatalog").mockResolvedValue(catalog);
+  vi.spyOn(api, "getEmployees").mockResolvedValue(listResult([]));
   document.body.innerHTML = "";
 });
 
@@ -117,20 +129,25 @@ afterEach(async () => {
 });
 
 describe("EmployeeContactsPane", () => {
-  it("renders controlled contacts in Chinese without fetching employees", async () => {
-    const getEmployees = vi.spyOn(api, "getEmployees");
+  it("fetches non-deleted contacts and renders them in Chinese", async () => {
+    const getEmployees = vi.spyOn(api, "getEmployees").mockResolvedValue(listResult([employee()]));
 
-    await renderPane({ employees: [employee()], locale: "zh", selectedEmployeeId: "employee-a" });
+    await renderPane({ locale: "zh", selectedEmployeeId: "employee-a" });
 
+    expect(getEmployees).toHaveBeenCalledWith({
+      page: 1,
+      pageSize: 10,
+      query: undefined,
+      status: undefined,
+    });
     expect(document.querySelector('[role="list"][aria-label="员工列表"]')).not.toBeNull();
     expect(document.body.textContent).toContain("通讯录");
     expect(document.body.textContent).toContain("选择联系人开始对话");
     expect(document.body.textContent).toContain("Analyst");
     expect(document.querySelector('[aria-current="true"]')?.textContent).toContain("Researcher");
-    expect(getEmployees).not.toHaveBeenCalled();
   });
 
-  it("selects and searches available contacts while keeping unavailable rows disabled", async () => {
+  it("selects contacts, keeps unavailable rows disabled, and searches via the API", async () => {
     const onEmployeeSelect = vi.fn();
     const unavailable = employee({
       employee_id: "employee-b",
@@ -138,10 +155,12 @@ describe("EmployeeContactsPane", () => {
       name: "Writer",
       role: "Editor",
     });
-    await renderPane({ employees: [employee(), unavailable], onEmployeeSelect });
+    const getEmployees = vi.spyOn(api, "getEmployees")
+      .mockResolvedValue(listResult([employee(), unavailable]));
+    await renderPane({ onEmployeeSelect });
 
-    const list = document.querySelector('[role="list"][aria-label="Employee list"]');
-    const rows = Array.from(list?.querySelectorAll<HTMLButtonElement>('li > button:not([aria-label])') ?? []);
+    const list = () => document.querySelector('[role="list"][aria-label="Employee list"]');
+    const rows = Array.from(list()?.querySelectorAll<HTMLButtonElement>('li > button:not([aria-label])') ?? []);
     expect(rows).toHaveLength(2);
     expect(rows[1]?.getAttribute("aria-disabled")).toBe("true");
     expect(rows[1]?.textContent).toContain("Suspended");
@@ -149,16 +168,61 @@ describe("EmployeeContactsPane", () => {
     await act(async () => rows[0]?.click());
     expect(onEmployeeSelect).toHaveBeenCalledWith("employee-a");
 
+    getEmployees.mockImplementation(async (options) =>
+      options?.query === "writer" ? listResult([unavailable]) : listResult([]));
     changeValue(document.querySelector('input[aria-label="Search..."]'), "writer");
-    expect(list?.querySelectorAll('[role="listitem"]')).toHaveLength(1);
-    expect(list?.textContent).toContain("Writer");
+    await flushSearchDebounce();
+    expect(getEmployees).toHaveBeenLastCalledWith(expect.objectContaining({
+      page: 1,
+      query: "writer",
+    }));
+    expect(list()?.querySelectorAll('[role="listitem"]')).toHaveLength(1);
+    expect(list()?.textContent).toContain("Writer");
+
     changeValue(document.querySelector('input[aria-label="Search..."]'), "missing");
+    await flushSearchDebounce();
     expect(document.body.textContent).toContain("No results");
+  });
+
+  it("filters by lifecycle status and paginates via the API", async () => {
+    const getEmployees = vi.spyOn(api, "getEmployees").mockImplementation(async (options) => {
+      if (options?.status === "active") return listResult([employee()]);
+      return listResult(
+        Array.from({ length: 10 }, (_, index) => employee({
+          employee_id: `employee-${index}`,
+          name: `Researcher ${index}`,
+        })),
+        { total: 25 },
+      );
+    });
+    await renderPane();
+
+    expect(document.body.textContent).toContain("Page 1 of 3");
+    await act(async () => buttonNamed("Next page")?.click());
+    expect(getEmployees).toHaveBeenLastCalledWith(expect.objectContaining({ page: 2 }));
+    expect(buttonNamed("Previous page")?.disabled).toBe(false);
+
+    const select = document.querySelector<HTMLSelectElement>('select[aria-label="Status"]');
+    act(() => {
+      const setter = Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype, "value")?.set;
+      setter?.call(select, "active");
+      select?.dispatchEvent(new Event("change", { bubbles: true }));
+    });
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(getEmployees).toHaveBeenLastCalledWith(expect.objectContaining({
+      page: 1,
+      status: "active",
+    }));
+    expect(document.body.textContent).not.toContain("Page 1 of 2");
   });
 
   it("opens settings without selecting the contact", async () => {
     const onEmployeeSelect = vi.fn();
-    await renderPane({ employees: [employee()], onEmployeeSelect });
+    vi.spyOn(api, "getEmployees").mockResolvedValue(listResult([employee()]));
+    await renderPane({ onEmployeeSelect });
 
     await act(async () => buttonNamed("Manage employee: Researcher")?.click());
 
@@ -178,7 +242,8 @@ describe("EmployeeContactsPane", () => {
     const lifecycleUpdate = vi.spyOn(api, "updateEmployeeLifecycle");
     const collaborationUpdate = vi.spyOn(api, "updateEmployeeCollaborationPolicy");
 
-    await renderPane({ employees: [builtin] });
+    vi.spyOn(api, "getEmployees").mockResolvedValue(listResult([builtin]));
+    await renderPane();
 
     expect(document.body.textContent).toContain("AI Assistant");
     expect(document.body.textContent).toContain("Built-in");
@@ -196,25 +261,49 @@ describe("EmployeeContactsPane", () => {
     expect(collaborationUpdate).not.toHaveBeenCalled();
   });
 
-  it("renders loading, error retry, quiet empty, and no-match states", async () => {
-    const onRefresh = vi.fn();
-    await renderPane({ loadStatus: "error", onRefresh });
-    expect(document.querySelector('[role="alert"]')?.textContent).toContain("Could not load employees");
-    await act(async () => buttonNamed("Retry")?.click());
-    expect(onRefresh).toHaveBeenCalledOnce();
-
-    await act(async () => root?.unmount());
-    root = null;
-    document.body.innerHTML = "";
-    await renderPane({ loadStatus: "loading" });
-    expect(document.querySelector('[role="status"]')?.textContent).toContain("Loading");
-
-    await act(async () => root?.unmount());
-    root = null;
-    document.body.innerHTML = "";
+  it("renders loading, error retry, and quiet empty states", async () => {
+    const getEmployees = vi.spyOn(api, "getEmployees")
+      .mockRejectedValueOnce(new Error("boom"))
+      .mockResolvedValue(listResult([]));
     await renderPane();
+    expect(document.querySelector('[role="alert"]')?.textContent).toContain("Could not load employees");
+    await act(async () => {
+      buttonNamed("Retry")?.click();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(getEmployees).toHaveBeenCalledTimes(2);
     expect(document.body.textContent).not.toContain("No employees yet");
     expect(document.body.textContent).not.toContain("Add employees without connecting");
+
+    let resolveList: ((result: EmployeeListResult) => void) | null = null;
+    getEmployees.mockImplementation(
+      () => new Promise<EmployeeListResult>((resolve) => { resolveList = resolve; }),
+    );
+    await act(async () => root?.unmount());
+    root = null;
+    document.body.innerHTML = "";
+    const container = document.createElement("div");
+    document.body.appendChild(container);
+    root = createRoot(container);
+    await act(async () => {
+      root?.render(
+        <I18nProvider>
+          <EmployeeContactsPane
+            onEmployeeSelect={vi.fn()}
+            onRefresh={vi.fn()}
+            selectedEmployeeId={null}
+          />
+        </I18nProvider>,
+      );
+    });
+    expect(document.querySelector('[role="status"]')?.textContent).toContain("Loading");
+    await act(async () => {
+      resolveList?.(listResult([]));
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(document.querySelector('[role="status"]')).toBeNull();
   });
 
   it("creates an employee and asks the parent to refresh without Feishu credentials", async () => {
@@ -300,7 +389,8 @@ describe("EmployeeContactsPane", () => {
     const createEmployee = vi.spyOn(api, "createEmployee").mockResolvedValue(employee());
     const updateProfile = vi.spyOn(api, "updateEmployeeProfile").mockResolvedValue(employee());
 
-    await renderPane({ employees: [employee()], onRefresh: vi.fn() });
+    vi.spyOn(api, "getEmployees").mockResolvedValue(listResult([employee()]));
+    await renderPane({ onRefresh: vi.fn() });
     await act(async () => buttonNamed("Add employee")?.click());
 
     const createDialog = () => Array.from(document.querySelectorAll('[role="dialog"]'))
@@ -362,7 +452,8 @@ describe("EmployeeContactsPane", () => {
       channels: { feishu: binding() },
     });
 
-    await renderPane({ employees: [current], onRefresh });
+    vi.spyOn(api, "getEmployees").mockResolvedValue(listResult([current]));
+    await renderPane({ onRefresh });
     const buttons = () => Array.from(document.querySelectorAll<HTMLButtonElement>("button"));
     await act(async () => buttonNamed("Manage employee: Researcher")?.click());
     expect(Array.from(document.querySelectorAll('[role="dialog"]')).find((dialog) => dialog.textContent?.includes("Manage the employee profile"))?.textContent)
@@ -423,7 +514,8 @@ describe("EmployeeContactsPane", () => {
     const bindingLifecycle = vi.spyOn(api, "updateEmployeeFeishuBindingLifecycle").mockResolvedValue(current);
     const updateBinding = vi.spyOn(api, "updateEmployeeFeishuBinding").mockResolvedValue(current);
 
-    await renderPane({ employees: [current], onRefresh });
+    vi.spyOn(api, "getEmployees").mockResolvedValue(listResult([current]));
+    await renderPane({ onRefresh });
     expect(document.querySelector<HTMLImageElement>('[role="listitem"] img')?.getAttribute("src"))
       .toBe("/hermes/api/employees/employee-a/avatar?v=123");
 
