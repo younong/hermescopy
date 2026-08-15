@@ -183,7 +183,7 @@ export const EmployeeContactsPane = memo(function EmployeeContactsPane({
     resetAvatar(employee.avatar_url);
     if (employee.profile) {
       const { workspace_relative_path: _workspace, ...profileDraft } = employee.profile;
-      setEmployeeDraft({ ...profileDraft, toolsets: allToolsets(nextCatalog) });
+      setEmployeeDraft(profileDraft);
     } else {
       setEmployeeDraft(emptyPolicy(nextCatalog));
     }
@@ -564,6 +564,7 @@ function PolicyEditor({
         ) : null}
       </div>
       <Field label={text.systemPrompt}><textarea className="min-h-28 rounded-md border border-[#dfe2e7] bg-white p-3 text-sm" value={policy.system_prompt} onChange={(event) => onChange({ ...policy, system_prompt: event.target.value })} /></Field>
+      <Field label={text.toolsets}><NameCheckboxPicker available={catalog?.toolsets ?? []} emptyLabel={text.noToolsets} id="employee-toolsets" onChange={(toolsets) => onChange({ ...policy, toolsets })} selected={policy.toolsets} /></Field>
       <Field label={text.skills}><NameCheckboxPicker available={catalog?.skills ?? []} emptyLabel={text.noSkills} id="employee-skills" onChange={(skills) => onChange({ ...policy, skills })} selected={policy.skills} /></Field>
       <Field label={text.maxIterations}><Input min={1} onChange={(event) => onChange({ ...policy, max_iterations: Number(event.target.value) || 1 })} type="number" value={policy.max_iterations} /></Field>
     </div>
