@@ -17,6 +17,7 @@ class AuthenticatedApiBucket(str, Enum):
     CONTROL_PLANE_AUTH = "control_plane_auth"
     OWNER_WORKER = "owner_worker"
     SESSION_READER = "session_reader"
+    PLUGIN_API = "plugin_api"
     LOCAL_ONLY_OR_UNAVAILABLE = "local_only_or_unavailable"
     TOKEN_AUTH_ONLY = "token_auth_only"
 
@@ -101,6 +102,15 @@ _SESSION_ITEM_SUFFIXES: frozenset[str] = frozenset({
 TOKEN_AUTH_ONLY_PATHS: frozenset[str] = frozenset({
     "/api/cron/fire",
 })
+# Plugin names whose API routers are safe to expose behind cookie auth.
+# The host's /api/plugins/<name>/... router is mounted directly, not proxied
+# through an Owner Worker (see _mount_plugin_api_routes), so the gate must
+# explicitly accept these paths or the safe-by-default middleware will 403
+# every browser request. Add a name here only after reviewing the plugin's
+# own auth/session handling.
+PLUGIN_API_ALLOWED_NAMES: frozenset[str] = frozenset({
+    "kanban",
+})
 
 
 @dataclass(frozen=True)
@@ -168,6 +178,14 @@ def _cron_owner_worker_route(path: str, method: str) -> bool:
     )
 
 
+def _plugin_api_route(path: str) -> bool:
+    parts = path.split("/")
+    # "", "api", "plugins", "<name>", ...
+    if len(parts) < 5 or parts[:3] != ["", "api", "plugins"]:
+        return False
+    return bool(parts[3]) and parts[3] in PLUGIN_API_ALLOWED_NAMES
+
+
 def classify_authenticated_api(
     path: str,
     *,
@@ -206,6 +224,8 @@ def classify_authenticated_api(
         _session_item_path(path) and method in {"PATCH", "DELETE"}
     ):
         return AuthenticatedApiDecision(AuthenticatedApiBucket.OWNER_WORKER, True, "owner-worker routed")
+    if _plugin_api_route(path):
+        return AuthenticatedApiDecision(AuthenticatedApiBucket.PLUGIN_API, True, "plugin-api route")
     if token_authenticated:
         return AuthenticatedApiDecision(AuthenticatedApiBucket.TOKEN_AUTH_ONLY, True, "token authenticated")
     return AuthenticatedApiDecision(
@@ -232,3 +252,8 @@ def authenticated_owner_worker_api_allowed(path: str, *, method: str = "GET") ->
 def authenticated_session_reader_api_allowed(path: str, *, method: str = "GET") -> bool:
     decision = classify_authenticated_api(path, method=method)
     return decision.allowed and decision.bucket == AuthenticatedApiBucket.SESSION_READER
+
+
+def authenticated_plugin_api_allowed(path: str, *, method: str = "GET") -> bool:
+    decision = classify_authenticated_api(path, method=method)
+    return decision.allowed and decision.bucket == AuthenticatedApiBucket.PLUGIN_API

@@ -424,6 +424,7 @@ app.add_middleware(
 from hermes_cli.dashboard_auth.api_availability import (
     authenticated_control_plane_api_allowed,
     authenticated_owner_worker_api_allowed,
+    authenticated_plugin_api_allowed,
     authenticated_session_reader_api_allowed,
 )
 from hermes_cli.dashboard_auth.public_paths import is_public_api_route
@@ -933,6 +934,7 @@ def _authenticated_owner_control_plane_gate_response(request: Request) -> Option
         and not getattr(request.state, "token_authenticated", False)
         and not authenticated_control_plane_api_allowed(path, method=method)
         and not authenticated_owner_worker_api_allowed(path, method=method)
+        and not authenticated_plugin_api_allowed(path, method=method)
         and not authenticated_session_reader_api_allowed(path, method=method)
     ):
         _log.warning(
