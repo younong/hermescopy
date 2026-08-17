@@ -403,6 +403,49 @@ class TestSignedClaims:
         with pytest.raises(TicketInvalid, match="ticket_audience_mismatch"):
             verify_ticket(ticket, audience=browser_ws_audience("/api/pub"))
 
+    def test_browser_ws_audience_accepts_allowlisted_plugin_route(self):
+        audience = browser_ws_audience("/api/plugins/kanban/events")
+        assert audience == "browser-ws:/api/plugins/kanban/events"
+        ticket = mint_ticket(
+            user_id="u1",
+            provider="stub",
+            tenant_id="tenant-1",
+            owner_key="ok1_owner",
+            audience=audience,
+        )
+        payload = verify_ticket(ticket, audience=audience)
+        assert payload["aud"] == audience
+
+    def test_browser_ws_audience_rejects_unknown_plugin_route(self):
+        with pytest.raises(ValueError, match="unsupported browser WebSocket audience"):
+            browser_ws_audience("/api/plugins/not-kanban/events")
+
+    def test_mint_ticket_accepts_allowlisted_plugin_audience(self):
+        # Minting must succeed for plugin audiences; the previous fail-closed
+        # behavior rejected every browser-ws:/api/plugins/* ticket with a 400
+        # because mint_ticket only knew the three hardcoded public audiences.
+        audience = "browser-ws:/api/plugins/kanban/events"
+        ticket = mint_ticket(
+            user_id="u1",
+            provider="stub",
+            tenant_id="tenant-1",
+            owner_key="ok1_owner",
+            audience=audience,
+        )
+        payload = verify_ticket(ticket, audience=audience)
+        assert payload["aud"] == audience
+
+    def test_mint_ticket_rejects_unknown_plugin_audience(self):
+        audience = "browser-ws:/api/plugins/not-kanban/events"
+        with pytest.raises(ValueError, match="unsupported browser WebSocket audience"):
+            mint_ticket(
+                user_id="u1",
+                provider="stub",
+                tenant_id="tenant-1",
+                owner_key="ok1_owner",
+                audience=audience,
+            )
+
 
 class TestSingleUse:
     def test_second_consume_raises(self):
