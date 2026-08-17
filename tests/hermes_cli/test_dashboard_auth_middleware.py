@@ -1064,3 +1064,29 @@ def test_unverifiable_token_with_reachable_providers_redirects(_gated_state):
     r = client.get("/api/auth/me")
     assert r.status_code == 401
     assert "unreachable" not in r.text.lower()
+
+
+# ---------------------------------------------------------------------------
+# Plugin-API bucket — cookie-auth frontend routes that bypass the gate
+# ---------------------------------------------------------------------------
+
+
+def test_gated_plugin_api_allowed_path_is_not_403_by_owner_gate(gated_app):
+    """Allowlisted plugin paths must not be rejected by the fail-closed
+    authenticated owner gate. The actual plugin router may not be mounted
+    in this fixture, so anything other than 403 from the gate is acceptable."""
+    _complete_stub_login(gated_app)
+    r = gated_app.get("/api/plugins/kanban/boards", follow_redirects=False)
+    assert r.status_code != 403, (
+        f"Expected the gate to allow /api/plugins/kanban/boards, got "
+        f"{r.status_code}: {r.text}"
+    )
+
+
+def test_gated_unknown_plugin_path_is_still_403_by_owner_gate(gated_app):
+    """Plugin names not in PLUGIN_API_ALLOWED_NAMES must still fall through
+    the gate's fail-closed semantics — only explicitly opened gates can
+    broaden cookie auth."""
+    _complete_stub_login(gated_app)
+    r = gated_app.get("/api/plugins/not-kanban/boards", follow_redirects=False)
+    assert r.status_code == 403
