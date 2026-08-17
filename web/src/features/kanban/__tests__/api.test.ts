@@ -16,7 +16,7 @@ vi.mock("@/lib/api", async (importOriginal) => {
   };
 });
 
-import { kanbanApi, parseKanbanEventEnvelope } from "./api";
+import { kanbanApi, parseKanbanEventEnvelope } from "../api";
 
 function requestCalls() {
   return mocks.fetchJSON.mock.calls.map(([url, init]) => ({

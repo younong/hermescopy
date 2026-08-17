@@ -3,9 +3,9 @@
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { KanbanApi } from "../api";
-import type { KanbanTaskDetailResponse } from "../types";
-import { KanbanTaskDrawer } from "./KanbanTaskDrawer";
+import type { KanbanApi } from "../../api";
+import type { KanbanTaskDetailResponse } from "../../types";
+import { KanbanTaskDrawer } from "../KanbanTaskDrawer";
 
 vi.mock("@/i18n", async (importOriginal) => {
   const actual = await importOriginal<typeof import("@/i18n")>();

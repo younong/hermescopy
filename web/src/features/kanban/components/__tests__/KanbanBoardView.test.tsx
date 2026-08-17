@@ -3,8 +3,8 @@
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { KanbanTask } from "../types";
-import { KanbanBoardView } from "./KanbanBoardView";
+import type { KanbanTask } from "../../types";
+import { KanbanBoardView } from "../KanbanBoardView";
 
 vi.mock("@/i18n", async (importOriginal) => {
   const actual = await importOriginal<typeof import("@/i18n")>();

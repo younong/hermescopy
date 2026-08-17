@@ -4,9 +4,9 @@ import { act, useEffect } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import type { KanbanApi } from "./api";
-import type { KanbanBoardResponse, KanbanTaskDetailResponse } from "./types";
-import { useKanbanBoard, type UseKanbanBoardOptions } from "./useKanbanBoard";
+import type { KanbanApi } from "../api";
+import type { KanbanBoardResponse, KanbanTaskDetailResponse } from "../types";
+import { useKanbanBoard, type UseKanbanBoardOptions } from "../useKanbanBoard";
 
 const emptyBoard = (eventId = 0): KanbanBoardResponse => ({
   columns: [],
