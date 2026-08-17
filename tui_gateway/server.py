@@ -3,6 +3,7 @@ import concurrent.futures
 import contextlib
 import contextvars
 import copy
+import functools
 import inspect
 import json
 import logging
@@ -39,6 +40,7 @@ from tools.environments.local import hermes_subprocess_env
 from agent.replay_cleanup import sanitize_replay_history
 from tui_gateway import git_probe
 from tui_gateway.transport import (
+    FanoutTransport,
     Transport,
     bind_transport,
     current_transport,
@@ -650,18 +652,86 @@ def _close_session_by_id(sid: str, *, end_reason: str = "gateway_close") -> bool
 
 
 
-def _ws_session_is_orphaned(session: dict | None) -> bool:
-    """True if a WS session has no live transport and no in-flight turn.
+def _dashboard_fanout(session: dict | None) -> FanoutTransport | None:
+    transport = session.get("transport") if session else None
+    return transport if isinstance(transport, FanoutTransport) else None
 
-    After ``handle_ws`` detaches a disconnected client it points the session at
-    ``_detached_ws_transport``. A session left on that transport (and not
-    mid-turn) is genuinely orphaned and safe to reap.
-    """
-    if not session or session.get("_finalized"):
+
+def _on_dashboard_fanout_detached(sid: str, fanout: FanoutTransport) -> None:
+    with _sessions_lock:
+        session = _sessions.get(sid)
+        if _dashboard_fanout(session) is not fanout or not fanout.is_detached:
+            return
+        close_on_disconnect = bool(session.get("close_on_disconnect"))
+    if close_on_disconnect:
+        _close_session_by_id(sid, end_reason="ws_disconnect")
+        return
+    try:
+        _schedule_ws_orphan_reap(sid)
+    except Exception:
+        pass
+
+
+def _configure_dashboard_fanout(sid: str, fanout: FanoutTransport) -> None:
+    fanout.set_on_detached(
+        functools.partial(_on_dashboard_fanout_detached, sid)
+    )
+
+
+def _ensure_dashboard_fanout(session: dict, sid: str) -> FanoutTransport:
+    existing = session.get("transport")
+    if isinstance(existing, FanoutTransport):
+        _configure_dashboard_fanout(sid, existing)
+        return existing
+    fanout = FanoutTransport()
+    _configure_dashboard_fanout(sid, fanout)
+    if existing is not None and not _transport_is_dead(existing):
+        fanout.attach(existing)
+    session["transport"] = fanout
+    return fanout
+
+
+def _detach_dashboard_transport_from_other_sessions(transport, sid: str) -> None:
+    """Keep one Dashboard socket subscribed to only its committed session."""
+    orphaned = []
+    with _sessions_lock:
+        for other_sid, other in _sessions.items():
+            if other_sid == sid or (fanout := _dashboard_fanout(other)) is None:
+                continue
+            if fanout.detach(transport) and fanout.is_detached:
+                orphaned.append(other_sid)
+    for other_sid in orphaned:
+        try:
+            _schedule_ws_orphan_reap(other_sid)
+        except Exception:
+            pass
+
+
+def _bind_dashboard_transport(session: dict, sid: str, transport) -> bool:
+    if session.get("_finalized"):
         return False
-    if session.get("running"):
+    fanout = _ensure_dashboard_fanout(session, sid)
+    _detach_dashboard_transport_from_other_sessions(transport, sid)
+    fanout.attach(transport)
+    session["last_active"] = time.time()
+    return True
+
+
+def _discard_detached_dashboard_candidate(sid: str, expected: dict) -> None:
+    with _sessions_lock:
+        current = _sessions.get(sid)
+        fanout = _dashboard_fanout(current)
+        if current is not expected or fanout is None or not fanout.is_detached:
+            return
+        _sessions.pop(sid, None)
+        _release_active_session_slot(current)
+
+
+def _ws_session_is_orphaned(session: dict | None) -> bool:
+    """True if a WS session has no live transport and no in-flight turn."""
+    if not session or session.get("_finalized") or session.get("running"):
         return False
-    return session.get("transport") is _detached_ws_transport
+    return _transport_is_dead(session.get("transport"))
 
 
 def _schedule_ws_orphan_reap(sid: str) -> None:
@@ -702,31 +772,28 @@ def _schedule_ws_orphan_reap(sid: str) -> None:
 def _close_sessions_for_transport(
     transport, *, end_reason: str = "ws_disconnect"
 ) -> tuple[int, int]:
-    """On transport disconnect, reap the sessions that opted into
-    close_on_disconnect immediately via the unified ``_close_session_by_id``
-    path, and re-point the rest to the detached drop transport until an
-    authenticated socket reattaches.
+    """Detach one peer and clean up sessions that lose their final subscriber.
 
-    Non-flagged detached sessions are handed to the grace-windowed WS-orphan
-    reaper (``_schedule_ws_orphan_reap``): a quick reconnect / session.resume
-    that re-binds a live transport cancels the reap, otherwise the orphan is
-    torn down through the same idempotent ``_teardown_session`` path. This is
-    the single WS-disconnect teardown entry point — there is no second
-    independent reap loop in ``handle_ws``.
-
-    Returns ``(reaped, detached)`` counts for disconnect-path observability."""
+    Dashboard fan-out sessions stay live while any other attached tab remains.
+    Legacy single-transport sessions retain the established detach/reap path.
+    """
     with _sessions_lock:
-        owned = [(sid, s) for sid, s in _sessions.items() if s.get("transport") is transport]
+        affected = []
+        for sid, session in _sessions.items():
+            fanout = _dashboard_fanout(session)
+            if fanout is not None:
+                if fanout.detach(transport) and fanout.is_detached:
+                    affected.append((sid, session))
+            elif session.get("transport") is transport:
+                session["transport"] = _detached_ws_transport
+                affected.append((sid, session))
     reaped = 0
     detached = 0
-    for sid, session in owned:
+    for sid, session in affected:
         if session.get("close_on_disconnect"):
             _close_session_by_id(sid, end_reason=end_reason)
             reaped += 1
         else:
-            # Point detached sessions at the drop sentinel so orphan detection
-            # can reap them without leaking frames to an ambient transport.
-            session["transport"] = _detached_ws_transport
             detached += 1
             try:
                 _schedule_ws_orphan_reap(sid)
@@ -756,8 +823,10 @@ _REAPER_SCAN_S = 300.0
 
 
 def _transport_is_dead(transport) -> bool:
-    # _detached_ws_transport is the post-WS-disconnect drop sentinel; a session
-    # parked on it has no live client.
+    # Fan-out hubs stay as the stable session sink; an empty hub is equivalent
+    # to the legacy post-disconnect drop sentinel.
+    if isinstance(transport, FanoutTransport):
+        return transport.is_detached
     if transport is _detached_ws_transport:
         return True
     return getattr(transport, "_closed", None) is True
@@ -6315,7 +6384,7 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
         generation = _claim_turn_locked(session, queued["text"])
         if generation is not None:
             session["queued_prompt"] = None
-            if queued.get("transport") is not None:
+            if queued.get("transport") is not None and _dashboard_fanout(session) is None:
                 session["transport"] = queued["transport"]
     if repin_policy is not None:
         _finish_web_direct_repin(sid, session, repin_policy, retired_agent)
@@ -7213,7 +7282,7 @@ def _session_create(rid, params: dict) -> dict:
         "tool_progress_mode": _load_tool_progress_mode(),
         "tool_started_at": {},
         "transport": (
-            _detached_ws_transport
+            FanoutTransport()
             if dashboard_transport is not None
             else _required_gateway_transport()
         ),
@@ -7221,6 +7290,9 @@ def _session_create(rid, params: dict) -> dict:
     if employee_binding is not None:
         _stamp_web_direct_binding(session_record, employee_binding)
     live = _claim_or_reuse_live(sid, key, session_record, lease)
+    if live is None:
+        if fanout := _dashboard_fanout(session_record):
+            _configure_dashboard_fanout(sid, fanout)
     if employee_binding is not None and live is not None:
         live_sid, live_session = live
         _stamp_web_direct_binding(live_session, employee_binding)
@@ -7317,25 +7389,18 @@ def _session_create(rid, params: dict) -> dict:
         def _bind_created_transport() -> bool:
             with _sessions_lock:
                 current = _sessions.get(sid)
-                if current is None or current.get("_finalized"):
-                    return False
-                current["transport"] = dashboard_transport
-                current["last_active"] = time.time()
-                return True
+                return bool(
+                    current is not None
+                    and _dashboard_fanout(current) is not None
+                    and _bind_dashboard_transport(current, sid, dashboard_transport)
+                )
 
         if not dashboard_transport.commit_dashboard_attach(
             dashboard_generation,
             sid,
             on_commit=_bind_created_transport,
         ):
-            with _sessions_lock:
-                current = _sessions.get(sid)
-                if current is not None and current.get("transport") is _detached_ws_transport:
-                    _sessions.pop(sid, None)
-                    lease = current.get("active_session_lease")
-                    if lease is not None:
-                        lease.release()
-                        current["active_session_lease"] = None
+            _discard_detached_dashboard_candidate(sid, _sessions.get(sid))
             return _err(rid, 4091, "session attach superseded")
         response["result"]["switch_generation"] = dashboard_generation
 
@@ -7698,11 +7763,10 @@ def _commit_session_attach(
     def _bind_transport() -> bool:
         with _session_resume_lock:
             current = _sessions.get(sid)
-            if current is not session or current.get("_finalized"):
-                return False
-            current["transport"] = transport
-            current["last_active"] = time.time()
-            return True
+            return bool(
+                current is session
+                and _bind_dashboard_transport(current, sid, transport)
+            )
 
     attach_live = bool(result.pop("_attach_live", False))
     attach_candidate = bool(result.pop("_attach_candidate", False))
@@ -7714,14 +7778,8 @@ def _commit_session_attach(
         # A superseded cold attach may have allocated a deferred runtime. Reap
         # only the candidate that is still detached; never close a live runtime
         # another caller has already rebound or reused.
-        if attach_candidate and session.get("transport") is _detached_ws_transport:
-            with _sessions_lock:
-                if _sessions.get(sid) is session:
-                    _sessions.pop(sid, None)
-                    lease = session.get("active_session_lease")
-                    if lease is not None:
-                        lease.release()
-                        session["active_session_lease"] = None
+        if attach_candidate:
+            _discard_detached_dashboard_candidate(sid, session)
         return _err(rid, 4091, "session attach superseded")
     if attach_candidate:
         _schedule_agent_build(sid)
@@ -8102,11 +8160,11 @@ def _session_resume(rid, params: dict) -> dict:
             resume_runtime_overrides=overrides or None,
         )
         if dashboard_attach:
-            # Register the candidate as detached from the outset. Setting this
-            # after registration leaves a race where a newer attach can commit
-            # the same runtime, only for the older worker to overwrite it back to
-            # detached.
-            record["transport"] = _detached_ws_transport
+            # Register an empty stable hub from the outset. A newer attach may
+            # subscribe the same runtime before this worker reaches commit, so
+            # the candidate transport must never be overwritten afterward.
+            record["transport"] = FanoutTransport()
+            _configure_dashboard_fanout(sid, record["transport"])
         if (live := _claim_or_reuse_live(sid, target, record, lease)) is not None:
             return _ok(rid, _reuse_live_payload(*live))
 
@@ -10991,9 +11049,9 @@ def _(rid, params: dict) -> dict:
                 or preflight.get("warning")
                 or "This model requires confirmation before use",
             )
-    # Re-bind to the authenticated transport for this request so streaming
-    # events leave through the active socket after a disconnect and reattach.
-    if (t := current_transport()) is not None:
+    # Legacy clients still bind their one session sink from the submitting
+    # request. Dashboard sessions keep a stable fan-out hub across tab submits.
+    if (t := current_transport()) is not None and _dashboard_fanout(session) is None:
         session["transport"] = t
     if not _web_direct_binding_is_current(session):
         return _err(rid, 4093, "employee conversation was reset — reopen the contact")
