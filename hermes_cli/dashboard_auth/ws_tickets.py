@@ -26,6 +26,7 @@ from hermes_cli.dashboard_auth.authority import (
     ReplayContinuity,
     control_plane_home,
 )
+from hermes_cli.dashboard_auth.api_availability import PLUGIN_API_ALLOWED_NAMES
 
 TTL_SECONDS = 30
 _TOKEN_VERSION = "bwt1"
@@ -37,6 +38,11 @@ _PUBLIC_AUDIENCES: frozenset[str] = frozenset({
     "browser-ws:/api/pub",
     "browser-ws:/api/events",
 })
+# Plugin WebSocket audiences are accepted by prefix matching
+# ``browser-ws:/api/plugins/<name>/...`` for any name in
+# ``PLUGIN_API_ALLOWED_NAMES``. Mirrors the HTTP allowlist in
+# ``api_availability.PLUGIN_API_ALLOWED_NAMES`` so cookie auth and WS
+# ticket auth extend together when a new plugin is added.
 
 _lock = threading.Lock()
 _keyring_lock = threading.RLock()
@@ -49,12 +55,28 @@ class TicketInvalid(Exception):
     """Ticket is malformed, unauthentic, expired, or unsuitable for its route."""
 
 
+def _is_plugin_audience(audience: str) -> bool:
+    if not audience.startswith("browser-ws:"):
+        return False
+    path = audience[len("browser-ws:"):].split("?", 1)[0]
+    parts = path.split("/")
+    # "", "api", "plugins", "<name>", ...
+    return (
+        len(parts) >= 5
+        and parts[:3] == ["", "api", "plugins"]
+        and bool(parts[3])
+        and parts[3] in PLUGIN_API_ALLOWED_NAMES
+    )
+
+
 def browser_ws_audience(path: str) -> str:
     """Return the exact public browser WS audience for ``path`` or fail closed."""
     audience = f"browser-ws:{str(path or '').split('?', 1)[0]}"
-    if audience not in _PUBLIC_AUDIENCES:
-        raise ValueError("unsupported browser WebSocket audience")
-    return audience
+    if audience in _PUBLIC_AUDIENCES:
+        return audience
+    if _is_plugin_audience(audience):
+        return audience
+    raise ValueError("unsupported browser WebSocket audience")
 
 
 def _b64url(data: bytes) -> str:
@@ -369,7 +391,7 @@ def mint_ticket(
     now: int | None = None,
 ) -> str:
     """Mint a signed, audience-bound browser capability from verified identity."""
-    if audience not in _PUBLIC_AUDIENCES:
+    if audience not in _PUBLIC_AUDIENCES and not _is_plugin_audience(audience):
         raise ValueError("unsupported browser WebSocket audience")
     current = int(time.time()) if now is None else int(now)
     canonical_tenant_id = str(tenant_id or f"personal:{provider}")
@@ -453,7 +475,7 @@ def verify_ticket(
     if payload.get("v") != _TOKEN_VERSION or payload.get("typ") != "browser-ws":
         raise TicketInvalid("ticket_version_invalid")
     claimed_audience = str(payload.get("aud") or "")
-    if claimed_audience not in _PUBLIC_AUDIENCES:
+    if claimed_audience not in _PUBLIC_AUDIENCES and not _is_plugin_audience(claimed_audience):
         raise TicketInvalid("ticket_audience_invalid")
     if audience is not None and not hmac.compare_digest(claimed_audience, audience):
         raise TicketInvalid("ticket_audience_mismatch")

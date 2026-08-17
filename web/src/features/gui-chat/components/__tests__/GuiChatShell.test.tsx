@@ -173,6 +173,10 @@ vi.mock("@/features/files/components/GuiChatFilesPane", () => ({
   GuiChatFilesPane: () => <section data-files-pane>Files pane</section>,
 }));
 
+vi.mock("@/features/kanban/components/GuiChatKanbanPane", () => ({
+  GuiChatKanbanPane: () => <section data-kanban-pane>Kanban pane</section>,
+}));
+
 vi.mock("../GuiChatSkillsPane", () => ({
   GuiChatSkillsPane: () => <section data-skills-pane>Skills pane</section>,
 }));
@@ -366,6 +370,8 @@ describe("GuiChatShell", () => {
     expect(sidebar?.querySelector('[aria-label="Employees"]')).toBeNull();
     expect(sidebar?.querySelector('[aria-label="Start employee chat"]')).toBeNull();
     expect(sidebar?.querySelector('[aria-label="Message composition statistics"]')?.textContent).toContain("Message statistics");
+    expect(Array.from(sidebar?.querySelectorAll("button") ?? [])
+      .some((button) => button.textContent?.includes("Board"))).toBe(true);
     const languageSwitcher = sidebar?.querySelector<HTMLButtonElement>('[aria-label="Switch language"]');
     expect(languageSwitcher?.textContent).toContain("简体中文");
     expect(languageSwitcher?.className).toContain("gui-chat-language-trigger");
@@ -971,6 +977,86 @@ describe("GuiChatShell", () => {
     expect(document.querySelector("[data-skills-pane]")).toBeNull();
     expect(document.querySelector("[data-composer-send]")).not.toBeNull();
     expect(connection.createOrAttach).toHaveBeenCalledTimes(2);
+  });
+
+  it("opens the Kanban board from the workspace navigation", async () => {
+    const connection = createConnection();
+    mocks.getAuthMe.mockResolvedValue(authIdentity());
+    mocks.connectGuiChat.mockReturnValue(connection);
+
+    await renderShell(
+      <>
+        <LocationProbe />
+        <GuiChatShell />
+      </>,
+    );
+    const sidebar = document.querySelector('aside[aria-label="Chat workspace"]');
+    const kanbanButton = Array.from(sidebar?.querySelectorAll<HTMLButtonElement>("button") ?? [])
+      .find((button) => button.textContent?.trim() === "Board");
+
+    expect(kanbanButton?.querySelector(".lucide-square-kanban")).not.toBeNull();
+    await act(async () => {
+      kanbanButton?.click();
+      await Promise.resolve();
+    });
+
+    expect(document.querySelector("[data-location]")?.textContent).toBe("/chat/kanban");
+    expect(document.querySelector("[data-kanban-pane]")).not.toBeNull();
+    expect(document.querySelector("[data-composer-send]")).toBeNull();
+    expect(kanbanButton?.getAttribute("aria-current")).toBe("page");
+    expect(document.querySelector("main header h1")?.textContent).toBe("Board");
+    expect(connection.createOrAttach).toHaveBeenCalledTimes(1);
+  });
+
+  it("opens a direct Kanban workspace route", async () => {
+    const connection = createConnection();
+    mocks.getAuthMe.mockResolvedValue(authIdentity());
+    mocks.connectGuiChat.mockReturnValue(connection);
+
+    await renderShellAt("/chat/kanban");
+
+    expect(document.querySelector("[data-kanban-pane]")).not.toBeNull();
+    expect(document.querySelector("main header h1")?.textContent).toBe("Board");
+    expect(Array.from(document.querySelectorAll<HTMLButtonElement>('button[aria-current="page"]'))
+      .some((button) => button.textContent?.trim() === "Board")).toBe(true);
+  });
+
+  it("opens Kanban from the mobile drawer and closes the drawer", async () => {
+    window.matchMedia = vi.fn().mockImplementation((query: string) => ({
+      addEventListener: vi.fn(),
+      matches: query === "(max-width: 1023px)",
+      media: query,
+      removeEventListener: vi.fn(),
+    }));
+    const connection = createConnection();
+    mocks.getAuthMe.mockResolvedValue(authIdentity());
+    mocks.connectGuiChat.mockReturnValue(connection);
+
+    await renderShell(
+      <>
+        <LocationProbe />
+        <GuiChatShell />
+      </>,
+    );
+    const drawerButton = document.querySelector<HTMLButtonElement>('[aria-label="Open sessions"]');
+    await act(async () => {
+      drawerButton?.click();
+      await Promise.resolve();
+    });
+    expect(drawerButton?.getAttribute("aria-expanded")).toBe("true");
+
+    const mobileSidebar = document.querySelector("aside.gui-chat-mobile-sidebar");
+    const kanbanButton = Array.from(mobileSidebar?.querySelectorAll<HTMLButtonElement>("button") ?? [])
+      .find((button) => button.textContent?.trim() === "Board");
+    await act(async () => {
+      kanbanButton?.click();
+      await Promise.resolve();
+    });
+
+    expect(document.querySelector("[data-location]")?.textContent).toBe("/chat/kanban");
+    expect(document.querySelector("[data-kanban-pane]")).not.toBeNull();
+    expect(drawerButton?.getAttribute("aria-expanded")).toBe("false");
+    expect(mobileSidebar?.className).toContain("-translate-x-full");
   });
 
   it("opens scheduled tasks without reconnecting the chat", async () => {

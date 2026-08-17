@@ -17,6 +17,7 @@ import {
   Search,
   QrCode,
   Settings2,
+  SquareKanban,
   UsersRound,
   SlidersHorizontal,
   Sparkles,
@@ -36,6 +37,7 @@ import type { CollaborationGroup } from "@/features/collaboration/types";
 import { ConnectWeChatModal } from "@/features/ilink/ConnectWeChatModal";
 import { PageHeaderContext } from "@/contexts/page-header-context";
 import { GuiChatFilesPane } from "@/features/files/components/GuiChatFilesPane";
+import { GuiChatKanbanPane } from "@/features/kanban/components/GuiChatKanbanPane";
 import { guiChatTranslations, useI18n } from "@/i18n";
 import SessionsPage from "@/pages/SessionsPage";
 import {
@@ -109,12 +111,13 @@ export function GuiChatShell() {
   const employeeId = employeeRouteId ?? legacyEmployeeId;
   const statisticsOpen = workspacePath === "/chat/statistics";
   const filesOpen = workspacePath === "/chat/files";
+  const kanbanOpen = workspacePath === "/chat/kanban";
   const skillsOpen = workspacePath === "/chat/skills";
   const scheduledTasksOpen = workspacePath === "/chat/scheduled-tasks";
   const contactsOpen = workspacePath === "/chat/contacts" || employeeId !== null;
   const selectedEmployeeId = employeeId;
   const modelsOpen = workspacePath === "/chat/models";
-  const workspacePaneOpen = statisticsOpen || filesOpen || skillsOpen || scheduledTasksOpen || contactsOpen || modelsOpen;
+  const workspacePaneOpen = statisticsOpen || filesOpen || kanbanOpen || skillsOpen || scheduledTasksOpen || contactsOpen || modelsOpen;
   const [state, dispatch] = useReducer(guiChatReducer, initialGuiChatState);
   const connectionRef = useRef<GuiChatConnection | null>(null);
   const historyAbortRef = useRef<AbortController | null>(null);
@@ -1073,6 +1076,18 @@ export function GuiChatShell() {
           <span>{copy.shell.files}</span>
         </button>
         <button
+          aria-current={kanbanOpen ? "page" : undefined}
+          className="gui-chat-nav-item"
+          onClick={() => {
+            closeMobilePanel();
+            navigate("/chat/kanban");
+          }}
+          type="button"
+        >
+          <SquareKanban />
+          <span>{t.kanban.board}</span>
+        </button>
+        <button
           aria-current={skillsOpen ? "page" : undefined}
           className="gui-chat-nav-item"
           onClick={() => {
@@ -1338,6 +1353,8 @@ export function GuiChatShell() {
                 ? copy.shell.messageStatistics
                 : filesOpen
                   ? copy.shell.files
+                  : kanbanOpen
+                    ? t.kanban.board
                 : skillsOpen
                   ? copy.shell.skills
                   : scheduledTasksOpen
@@ -1402,6 +1419,8 @@ export function GuiChatShell() {
           </PageHeaderContext.Provider>
         ) : filesOpen ? (
           <GuiChatFilesPane />
+        ) : kanbanOpen ? (
+          <GuiChatKanbanPane />
         ) : skillsOpen ? (
           <GuiChatSkillsPane />
         ) : scheduledTasksOpen ? (

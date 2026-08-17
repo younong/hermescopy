@@ -125,6 +125,7 @@ describe("AuthenticatedApp", () => {
 
   it.each([
     "/chat/files",
+    "/chat/kanban",
     "/chat/scheduled-tasks",
     "/chat/statistics",
   ])(
