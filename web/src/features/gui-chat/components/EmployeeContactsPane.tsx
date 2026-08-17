@@ -11,11 +11,15 @@ import { NameCheckboxPicker } from "@/components/NameCheckboxPicker";
 import { guiChatTranslations, useI18n } from "@/i18n";
 import {
   api,
+  employeeDisplayName,
+  employeeDisplayRole,
+  type BuiltinAssistantEmployee,
   type Employee,
   type EmployeeCatalog,
   type EmployeeCollaborationPolicy,
   type EmployeeLifecycleStatus,
   type EmployeePolicyDraft,
+  type ManagedEmployee,
   type ReasoningLevel,
   withHermesAssetAuth,
 } from "@/lib/api";
@@ -23,8 +27,13 @@ import { REASONING_LEVEL_LABELS } from "@/lib/reasoning-level";
 import { cn } from "@/lib/utils";
 import { GuiChatWorkspaceDialog } from "./GuiChatWorkspaceDialog";
 
-type EmployeeEditor = { mode: "create" } | { mode: "profile"; employee: Employee };
-type BindingEditor = { mode: "create" | "credentials"; employee: Employee };
+type EmployeeEditor = { mode: "create" } | { mode: "profile"; employee: ManagedEmployee };
+type BindingEditor = { mode: "create" | "credentials"; employee: ManagedEmployee };
+
+interface BuiltinPersonalizationDraft {
+  nickname: string;
+  personalPreference: string;
+}
 
 interface BindingDraft {
   appId: string;
@@ -48,15 +57,11 @@ function bindingRuntimeLabel(runtimeState: string, text: EmployeeText) {
 }
 
 function employeeName(employee: Employee, text: EmployeeText) {
-  return employee.employee_kind === "builtin_assistant"
-    ? text.aiAssistant
-    : employee.profile?.name || text.unnamed;
+  return employeeDisplayName(employee, text.aiAssistant, text.unnamed);
 }
 
 function employeeRole(employee: Employee, text: EmployeeText) {
-  return employee.employee_kind === "builtin_assistant"
-    ? text.builtinDescription
-    : employee.profile?.role || text.aiEmployee;
+  return employeeDisplayRole(employee, text.builtinDescription, text.aiEmployee);
 }
 
 function allToolsets(catalog: EmployeeCatalog | null) {
@@ -120,6 +125,10 @@ export const EmployeeContactsPane = memo(function EmployeeContactsPane({
   const [bindingEditor, setBindingEditor] = useState<BindingEditor | null>(null);
   const [employeeDraft, setEmployeeDraft] = useState<EmployeePolicyDraft>(() => emptyPolicy(null));
   const [bindingDraft, setBindingDraft] = useState<BindingDraft>(EMPTY_BINDING);
+  const [builtinDraft, setBuiltinDraft] = useState<BuiltinPersonalizationDraft>({
+    nickname: "",
+    personalPreference: "",
+  });
   const [avatarFile, setAvatarFile] = useState<File | null>(null);
   const [avatarPreview, setAvatarPreview] = useState<string | null>(null);
   const [avatarRemoved, setAvatarRemoved] = useState(false);
@@ -208,20 +217,25 @@ export const EmployeeContactsPane = memo(function EmployeeContactsPane({
     setEditor({ mode: "create" });
   };
 
-  const openProfile = async (employee: Employee) => {
+  const openProfile = async (employee: ManagedEmployee) => {
     const nextCatalog = await ensureCatalog();
     if (!nextCatalog) return;
     resetAvatar(employee.avatar_url);
-    if (employee.profile) {
-      const { workspace_relative_path: _workspace, ...profileDraft } = employee.profile;
-      setEmployeeDraft(profileDraft);
-    } else {
-      setEmployeeDraft(emptyPolicy(nextCatalog));
-    }
+    const { workspace_relative_path: _workspace, ...profileDraft } = employee.profile;
+    setEmployeeDraft(profileDraft);
     setEditor({ employee, mode: "profile" });
   };
 
-  const openBinding = (employee: Employee) => {
+  const openBuiltinManagement = (employee: BuiltinAssistantEmployee) => {
+    resetAvatar(employee.avatar_url);
+    setBuiltinDraft({
+      nickname: employee.builtin_assistant_personalization.nickname,
+      personalPreference: employee.builtin_assistant_personalization.personal_preference,
+    });
+    setManagedEmployeeId(employee.employee_id);
+  };
+
+  const openBinding = (employee: ManagedEmployee) => {
     const binding = employee.channels.feishu;
     setBindingDraft({ ...EMPTY_BINDING, appId: binding?.app_id ?? "" });
     setBindingEditor({ employee, mode: binding ? "credentials" : "create" });
@@ -239,7 +253,7 @@ export const EmployeeContactsPane = memo(function EmployeeContactsPane({
       const saved = editor.mode === "create"
         ? await api.createEmployee({ activate: true, profile: policy })
         : await api.updateEmployeeProfile(editor.employee.employee_id, {
-            expected_revision: editor.employee.profile_revision ?? 0,
+            expected_revision: editor.employee.profile_revision,
             profile: policy,
           });
       if (avatarFile) {
@@ -257,6 +271,39 @@ export const EmployeeContactsPane = memo(function EmployeeContactsPane({
     } catch (error) {
       showToast(text.saveFailed.replace("{error}", String(error)), "error");
     } finally {
+      setBusy(null);
+    }
+  };
+
+  const saveBuiltinPersonalization = async (employee: BuiltinAssistantEmployee) => {
+    if (!builtinDraft.nickname.trim()) {
+      showToast(text.nicknameRequired, "error");
+      return;
+    }
+    setBusy("builtin:save");
+    let personalizationSaved = false;
+    try {
+      await api.updateBuiltinAssistantPersonalization(employee.employee_id, {
+        expected_revision: employee.profile_revision,
+        nickname: builtinDraft.nickname.trim(),
+        personal_preference: builtinDraft.personalPreference.trim(),
+      });
+      personalizationSaved = true;
+      if (avatarFile) {
+        await api.uploadEmployeeAvatar(employee.employee_id, avatarFile);
+      } else if (avatarRemoved && employee.avatar_url) {
+        await api.deleteEmployeeAvatar(employee.employee_id);
+      }
+      showToast(text.personalizationSaved, "success");
+      closeManagement();
+    } catch (error) {
+      showToast(
+        (personalizationSaved ? text.avatarSaveFailed : text.personalizationSaveFailed)
+          .replace("{error}", String(error)),
+        "error",
+      );
+    } finally {
+      await refreshEmployees().catch(() => undefined);
       setBusy(null);
     }
   };
@@ -433,7 +480,9 @@ export const EmployeeContactsPane = memo(function EmployeeContactsPane({
               <EmployeeContactRow
                 employee={employee}
                 key={employee.employee_id}
-                onManage={() => setManagedEmployeeId(employee.employee_id)}
+                onManage={() => employee.employee_kind === "builtin_assistant"
+                  ? openBuiltinManagement(employee)
+                  : setManagedEmployeeId(employee.employee_id)}
                 onSelect={() => onEmployeeSelect(employee.employee_id)}
                 selected={employee.employee_id === selectedEmployeeId}
                 text={text}
@@ -474,28 +523,50 @@ export const EmployeeContactsPane = memo(function EmployeeContactsPane({
       {managedEmployee ? (
         <GuiChatWorkspaceDialog
           busy={busy !== null}
-          description={managedEmployee.protected ? text.builtinDescription : text.manageDescription}
+          description={managedEmployee.employee_kind === "builtin_assistant"
+            ? text.builtinPersonalizationHelp
+            : text.manageDescription}
           onClose={closeManagement}
           title={employeeName(managedEmployee, text)}
           wide
         >
           <div className="max-h-[72vh] overflow-y-auto">
-            <EmployeeManagementDetails
-              busy={busy}
-              collaborationPolicy={collaborationDrafts[managedEmployee.employee_id] ?? managedEmployee.collaboration_policy}
-              employee={managedEmployee}
-              onBinding={() => openBinding(managedEmployee)}
-              onBindingAction={(action) => void runBindingAction(managedEmployee, action)}
-              onCollaborationChange={(policy) => setCollaborationDrafts((current) => ({
-                ...current,
-                [managedEmployee.employee_id]: policy,
-              }))}
-              onCollaborationSave={() => void saveCollaboration(managedEmployee)}
-              onEmployeeAction={(action) => void runEmployeeAction(managedEmployee, action)}
-              onProfile={() => void openProfile(managedEmployee)}
-              savingLabel={common.saving}
-              text={text}
-            />
+            {managedEmployee.employee_kind === "builtin_assistant" ? (
+              <BuiltinPersonalizationEditor
+                avatarPreview={avatarPreview}
+                draft={builtinDraft}
+                employee={managedEmployee}
+                onAvatarChange={(file) => { setAvatarFile(file); setAvatarRemoved(false); }}
+                onAvatarRemove={() => { setAvatarFile(null); setAvatarPreview(null); setAvatarRemoved(true); }}
+                onChange={setBuiltinDraft}
+                text={text}
+              />
+            ) : (
+              <EmployeeManagementDetails
+                busy={busy}
+                collaborationPolicy={collaborationDrafts[managedEmployee.employee_id] ?? managedEmployee.collaboration_policy}
+                employee={managedEmployee}
+                onBinding={() => openBinding(managedEmployee)}
+                onBindingAction={(action) => void runBindingAction(managedEmployee, action)}
+                onCollaborationChange={(policy) => setCollaborationDrafts((current) => ({
+                  ...current,
+                  [managedEmployee.employee_id]: policy,
+                }))}
+                onCollaborationSave={() => void saveCollaboration(managedEmployee)}
+                onEmployeeAction={(action) => void runEmployeeAction(managedEmployee, action)}
+                onProfile={() => void openProfile(managedEmployee)}
+                savingLabel={common.saving}
+                text={text}
+              />
+            )}
+            {managedEmployee.employee_kind === "builtin_assistant" ? (
+              <div className="mt-5 flex justify-end gap-2">
+                <Button ghost onClick={closeManagement} size="sm">{common.cancel}</Button>
+                <Button disabled={busy === "builtin:save"} onClick={() => void saveBuiltinPersonalization(managedEmployee)} size="sm">
+                  {busy === "builtin:save" ? common.saving : text.savePersonalization}
+                </Button>
+              </div>
+            ) : null}
           </div>
         </GuiChatWorkspaceDialog>
       ) : null}
@@ -558,6 +629,93 @@ function Field({ children, label }: { children: React.ReactNode; label: string }
   return <div className="grid gap-1.5"><Label>{label}</Label>{children}</div>;
 }
 
+function AvatarPicker({
+  avatarPreview,
+  displayName,
+  onAvatarChange,
+  onAvatarRemove,
+  text,
+}: {
+  avatarPreview: string | null;
+  displayName: string;
+  onAvatarChange(file: File): void;
+  onAvatarRemove(): void;
+  text: EmployeeText;
+}) {
+  return (
+    <Field label={text.avatar}>
+      <div className="flex items-center gap-3">
+        <EmployeeAvatar avatarUrl={avatarPreview} displayName={displayName} large />
+        <div className="flex gap-2">
+          <label className="inline-flex h-8 cursor-pointer items-center rounded-md border border-[#dfe2e7] px-3 text-xs hover:bg-[#f6f7f9]">
+            <input
+              accept="image/jpeg,image/png,image/webp"
+              className="hidden"
+              onChange={(event) => {
+                const file = event.currentTarget.files?.[0];
+                if (file) onAvatarChange(file);
+                event.currentTarget.value = "";
+              }}
+              type="file"
+            />
+            {text.chooseImage}
+          </label>
+          {avatarPreview ? <Button ghost onClick={onAvatarRemove} size="sm">{text.removeImage}</Button> : null}
+        </div>
+      </div>
+    </Field>
+  );
+}
+
+function BuiltinPersonalizationEditor({
+  avatarPreview,
+  draft,
+  employee,
+  onAvatarChange,
+  onAvatarRemove,
+  onChange,
+  text,
+}: {
+  avatarPreview: string | null;
+  draft: BuiltinPersonalizationDraft;
+  employee: BuiltinAssistantEmployee;
+  onAvatarChange(file: File): void;
+  onAvatarRemove(): void;
+  onChange(draft: BuiltinPersonalizationDraft): void;
+  text: EmployeeText;
+}) {
+  return (
+    <div className="grid gap-4">
+      <AvatarPicker
+        avatarPreview={avatarPreview}
+        displayName={draft.nickname.trim() || employeeName(employee, text)}
+        onAvatarChange={onAvatarChange}
+        onAvatarRemove={onAvatarRemove}
+        text={text}
+      />
+      <Field label={text.nickname}>
+        <Input
+          maxLength={80}
+          onChange={(event) => onChange({ ...draft, nickname: event.target.value })}
+          placeholder={text.nicknamePlaceholder}
+          value={draft.nickname}
+        />
+      </Field>
+      <Field label={text.personalPreference}>
+        <textarea
+          className="min-h-32 rounded-md border border-[#dfe2e7] bg-white p-3 text-sm"
+          maxLength={20_000}
+          onChange={(event) => onChange({ ...draft, personalPreference: event.target.value })}
+          placeholder={text.personalPreferencePlaceholder}
+          value={draft.personalPreference}
+        />
+        <p className="text-[11px] leading-5 text-[#969aa1]">{text.personalPreferenceHelp}</p>
+      </Field>
+      <p className="border-l-2 border-[#e8eaed] pl-3 text-xs leading-5 text-[#777c84]">{text.builtinManaged}</p>
+    </div>
+  );
+}
+
 function PolicyEditor({
   avatarPreview,
   catalog,
@@ -581,15 +739,13 @@ function PolicyEditor({
   const availableReasoningLevels = selectedModel?.reasoning_levels ?? [];
   return (
     <div className="gui-chat-employee-policy-editor grid gap-4">
-      <Field label={text.avatar}>
-        <div className="flex items-center gap-3">
-          <EmployeeAvatar employee={{ avatar_url: avatarPreview, profile: policy }} large />
-          <div className="flex gap-2">
-            <label className="inline-flex h-8 cursor-pointer items-center rounded-md border border-[#dfe2e7] px-3 text-xs hover:bg-[#f6f7f9]"><input accept="image/jpeg,image/png,image/webp" className="hidden" onChange={(event) => { const file = event.currentTarget.files?.[0]; if (file) onAvatarChange(file); event.currentTarget.value = ""; }} type="file" />{text.chooseImage}</label>
-            {avatarPreview ? <Button ghost onClick={onAvatarRemove} size="sm">{text.removeImage}</Button> : null}
-          </div>
-        </div>
-      </Field>
+      <AvatarPicker
+        avatarPreview={avatarPreview}
+        displayName={policy.name?.trim() || text.unnamed}
+        onAvatarChange={onAvatarChange}
+        onAvatarRemove={onAvatarRemove}
+        text={text}
+      />
       <div className="grid gap-3 sm:grid-cols-2">
         <Field label={text.name}><Input value={policy.name ?? ""} onChange={(event) => onChange({ ...policy, name: event.target.value })} /></Field>
         <Field label={text.role}><Input value={policy.role ?? ""} onChange={(event) => onChange({ ...policy, role: event.target.value })} /></Field>
@@ -673,7 +829,7 @@ function EmployeeContactRow({
         }}
         type="button"
       >
-        <EmployeeAvatar employee={employee} />
+        <EmployeeAvatar avatarUrl={employee.avatar_url} displayName={name} />
         <span className="min-w-0 flex-1">
           <span className="flex items-center gap-1.5">
             <span className="block min-w-0 truncate text-[14px] font-medium leading-5">{name}</span>
@@ -716,7 +872,7 @@ function EmployeeManagementDetails({
 }: {
   busy: string | null;
   collaborationPolicy: EmployeeCollaborationPolicy;
-  employee: Employee;
+  employee: ManagedEmployee;
   onBinding(): void;
   onBindingAction(action: "test" | EmployeeLifecycleStatus): void;
   onCollaborationChange(policy: EmployeeCollaborationPolicy): void;
@@ -733,25 +889,21 @@ function EmployeeManagementDetails({
     <div>
       <div className="flex flex-wrap items-start justify-between gap-3">
         <div className="flex min-w-0 items-center gap-3">
-          <EmployeeAvatar employee={employee} />
+          <EmployeeAvatar avatarUrl={employee.avatar_url} displayName={employeeName(employee, text)} />
           <div className="min-w-0">
             <div className="flex flex-wrap items-center gap-2"><h3 className="truncate text-sm font-semibold">{employeeName(employee, text)}</h3>{employee.protected ? <span className="rounded-full bg-[#eef2ff] px-2 py-0.5 text-[10px] font-medium text-[#4d5f9e]">{text.builtin}</span> : null}<StatusPill status={employee.lifecycle_status} text={text} /></div>
             <p className="truncate text-[11px] text-[#969aa1]">{employeeRole(employee, text)}{employee.profile_revision !== null ? ` · ${text.profileRevision.replace("{revision}", String(employee.profile_revision))}` : null}</p>
           </div>
         </div>
-        {!employee.protected ? (
-          <div className="flex flex-wrap gap-1.5">
-            <Button disabled={disabled || employee.lifecycle_status === "revoked"} ghost onClick={onProfile} size="sm">{text.editProfile}</Button>
-            <Button disabled={disabled || employee.lifecycle_status !== "active"} ghost onClick={() => onEmployeeAction("rollover")} size="sm">{text.refreshSessions}</Button>
-            {employee.lifecycle_status === "active" ? <Button disabled={disabled} ghost onClick={() => onEmployeeAction("suspended")} size="sm">{text.suspend}</Button> : employee.lifecycle_status === "suspended" ? <Button disabled={disabled} ghost onClick={() => onEmployeeAction("active")} size="sm">{text.resume}</Button> : null}
-            <Button disabled={disabled || employee.lifecycle_status === "revoked"} ghost onClick={() => onEmployeeAction("revoked")} size="sm">{text.revoke}</Button>
-          </div>
-        ) : null}
+        <div className="flex flex-wrap gap-1.5">
+          <Button disabled={disabled || employee.lifecycle_status === "revoked"} ghost onClick={onProfile} size="sm">{text.editProfile}</Button>
+          <Button disabled={disabled || employee.lifecycle_status !== "active"} ghost onClick={() => onEmployeeAction("rollover")} size="sm">{text.refreshSessions}</Button>
+          {employee.lifecycle_status === "active" ? <Button disabled={disabled} ghost onClick={() => onEmployeeAction("suspended")} size="sm">{text.suspend}</Button> : employee.lifecycle_status === "suspended" ? <Button disabled={disabled} ghost onClick={() => onEmployeeAction("active")} size="sm">{text.resume}</Button> : null}
+          <Button disabled={disabled || employee.lifecycle_status === "revoked"} ghost onClick={() => onEmployeeAction("revoked")} size="sm">{text.revoke}</Button>
+        </div>
       </div>
 
-      {!employee.protected ? (
-        <>
-          <div className="mt-4 grid gap-3 border-l-2 border-[#e8eaed] pl-3 sm:grid-cols-2">
+      <div className="mt-4 grid gap-3 border-l-2 border-[#e8eaed] pl-3 sm:grid-cols-2">
             <label className="flex items-center justify-between gap-3 text-xs"><span><span className="block font-medium">{text.allowCollaboration}</span><span className="text-[#969aa1]">{text.allowCollaborationHint}</span></span><Switch checked={collaborationPolicy.may_participate} className="gui-chat-skill-switch" onCheckedChange={(checked) => onCollaborationChange({ ...collaborationPolicy, may_participate: checked })} /></label>
             <label className="flex items-center justify-between gap-3 text-xs"><span><span className="block font-medium">{text.allowCreateGroups}</span><span className="text-[#969aa1]">{text.allowCreateGroupsHint}</span></span><Switch checked={collaborationPolicy.may_create_groups} className="gui-chat-skill-switch" onCheckedChange={(checked) => onCollaborationChange({ ...collaborationPolicy, may_create_groups: checked })} /></label>
             <Field label={text.inviteQuota}><Input aria-label={text.inviteQuotaFor.replace("{name}", employeeName(employee, text))} disabled={unlimited} min={0} onChange={(event) => onCollaborationChange({ ...collaborationPolicy, invite_quota: Math.max(0, Number(event.target.value) || 0) })} type="number" value={collaborationPolicy.invite_quota ?? ""} /></Field>
@@ -764,22 +916,25 @@ function EmployeeManagementDetails({
               {binding ? <><Button disabled={disabled || binding.lifecycle_status === "revoked"} ghost onClick={() => onBindingAction("test")} size="sm">{text.testConnection}</Button><Button disabled={disabled || binding.lifecycle_status === "revoked"} ghost onClick={onBinding} size="sm">{text.updateCredentials}</Button>{binding.lifecycle_status === "active" ? <Button disabled={disabled} ghost onClick={() => onBindingAction("suspended")} size="sm">{text.suspendBinding}</Button> : binding.lifecycle_status === "suspended" ? <Button disabled={disabled} ghost onClick={() => onBindingAction("active")} size="sm">{text.resumeBinding}</Button> : null}<Button disabled={disabled || binding.lifecycle_status === "revoked"} ghost onClick={() => onBindingAction("revoked")} size="sm">{text.revokeBinding}</Button></> : <Button disabled={employee.lifecycle_status === "revoked"} ghost onClick={onBinding} size="sm">{text.connect}</Button>}
             </div>
           </div>
-        </>
-      ) : (
-        <p className="mt-4 border-l-2 border-[#e8eaed] pl-3 text-xs leading-5 text-[#777c84]">{text.builtinManaged}</p>
-      )}
     </div>
   );
 }
 
-function EmployeeAvatar({ employee, large = false }: { employee: { avatar_url: string | null; employee_kind?: Employee["employee_kind"]; profile: EmployeePolicyDraft | null }; large?: boolean }) {
+function EmployeeAvatar({
+  avatarUrl,
+  displayName,
+  large = false,
+}: {
+  avatarUrl: string | null;
+  displayName: string;
+  large?: boolean;
+}) {
   const [failed, setFailed] = useState(false);
-  useEffect(() => setFailed(false), [employee.avatar_url]);
-  const label = employee.employee_kind === "builtin_assistant" ? "AI" : employee.profile?.name || "E";
+  useEffect(() => setFailed(false), [avatarUrl]);
   const classes = large ? "h-14 w-14" : "h-10 w-10";
-  return employee.avatar_url && !failed
-    ? <img alt="" className={cn("shrink-0 rounded-full border border-[#e1e3e7] object-cover", classes)} onError={() => setFailed(true)} src={withHermesAssetAuth(employee.avatar_url)} />
-    : <span aria-hidden className={cn("flex shrink-0 items-center justify-center rounded-full border border-[#e1e3e7] bg-[#f3f4f6] text-sm font-semibold", classes)}>{label.trim().slice(0, 2).toUpperCase() || "E"}</span>;
+  return avatarUrl && !failed
+    ? <img alt="" className={cn("shrink-0 rounded-full border border-[#e1e3e7] object-cover", classes)} onError={() => setFailed(true)} src={withHermesAssetAuth(avatarUrl)} />
+    : <span aria-hidden className={cn("flex shrink-0 items-center justify-center rounded-full border border-[#e1e3e7] bg-[#f3f4f6] text-sm font-semibold", classes)}>{displayName.trim().slice(0, 2).toUpperCase() || "E"}</span>;
 }
 
 function StatusPill({ status, text }: { status: EmployeeLifecycleStatus; text: EmployeeText }) {

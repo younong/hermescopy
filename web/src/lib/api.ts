@@ -815,6 +815,22 @@ export const api = {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
     }),
+  updateBuiltinAssistantPersonalization: (
+    employeeId: string,
+    body: {
+      expected_revision: number;
+      nickname: string;
+      personal_preference: string;
+    },
+  ) =>
+    fetchJSON<BuiltinAssistantEmployee>(
+      `/api/employees/${encodeURIComponent(employeeId)}/builtin-assistant-personalization`,
+      {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      },
+    ),
   updateEmployeeCollaborationPolicy: (
     employeeId: string,
     body: EmployeeCollaborationPolicy,
@@ -1143,6 +1159,19 @@ export const api = {
       body: JSON.stringify({ event, command }),
     }),
   getSystemStats: () => fetchJSON<SystemStats>("/api/system/stats"),
+  getBuiltinAssistantPolicy: () =>
+    fetchJSON<BuiltinAssistantPolicyResponse>(
+      "/api/system/builtin-assistant-policy",
+    ),
+  updateBuiltinAssistantPolicy: (body: UpdateBuiltinAssistantPolicyRequest) =>
+    fetchJSON<BuiltinAssistantPolicyResponse>(
+      "/api/system/builtin-assistant-policy",
+      {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      },
+    ),
 
   // ── Admin: Curator ──────────────────────────────────────────────────
   getCurator: () => fetchJSON<CuratorStatus>("/api/curator"),
@@ -1535,7 +1564,6 @@ export interface MessagingPlatformTestResult {
 }
 
 export type EmployeeLifecycleStatus = "active" | "suspended" | "revoked";
-export type EmployeeKind = "managed" | "builtin_assistant";
 
 export interface EmployeePolicyDraft {
   schema_version: 1;
@@ -1571,18 +1599,64 @@ export interface EmployeeChannelBinding {
   runtime_state: string;
 }
 
-export interface Employee {
+interface EmployeeBase {
   employee_id: string;
-  employee_kind: EmployeeKind;
   protected: boolean;
   chat_eligible: boolean;
   avatar_url: string | null;
   lifecycle_status: EmployeeLifecycleStatus;
-  profile_revision: number | null;
-  profile_fingerprint: string | null;
-  profile: EmployeePolicy | null;
+  profile_revision: number;
+  profile_fingerprint: string;
   collaboration_policy: EmployeeCollaborationPolicy;
   channels: Record<string, EmployeeChannelBinding | undefined>;
+}
+
+export interface ManagedEmployee extends EmployeeBase {
+  employee_kind: "managed";
+  profile: EmployeePolicy;
+  builtin_assistant_personalization?: never;
+}
+
+export interface BuiltinAssistantPersonalization {
+  nickname: string;
+  personal_preference: string;
+}
+
+export interface BuiltinAssistantEmployee extends EmployeeBase {
+  employee_kind: "builtin_assistant";
+  profile: null;
+  builtin_assistant_personalization: BuiltinAssistantPersonalization;
+}
+
+export type Employee = ManagedEmployee | BuiltinAssistantEmployee;
+
+export function employeeDisplayName(
+  employee: Employee,
+  builtinFallback: string,
+  unnamedFallback: string,
+): string {
+  if (employee.employee_kind === "builtin_assistant") {
+    return employee.builtin_assistant_personalization.nickname.trim() || builtinFallback;
+  }
+  return employee.profile.name?.trim() || unnamedFallback;
+}
+
+export function employeeDisplayRole(
+  employee: Employee,
+  builtinRole: string,
+  managedFallback: string,
+): string;
+export function employeeDisplayRole(
+  employee: Employee,
+  builtinRole: string,
+): string | undefined;
+export function employeeDisplayRole(
+  employee: Employee,
+  builtinRole: string,
+  managedFallback?: string,
+): string | undefined {
+  if (employee.employee_kind === "builtin_assistant") return builtinRole;
+  return employee.profile.role?.trim() || managedFallback;
 }
 
 export interface EmployeeCatalog {
@@ -2356,6 +2430,24 @@ export interface ModelRegistration {
 }
 
 export type ReasoningLevel = "high" | "xhigh" | "max";
+
+export interface BuiltinAssistantPolicy {
+  model_registration_id: string;
+  reasoning_effort: ReasoningLevel;
+  revision: number;
+  updated_at: number;
+}
+
+export interface BuiltinAssistantPolicyResponse {
+  policy: BuiltinAssistantPolicy | null;
+  admin_chat_registrations: ModelRegistration[];
+}
+
+export interface UpdateBuiltinAssistantPolicyRequest {
+  model_registration_id: string;
+  reasoning_effort: ReasoningLevel;
+  expected_revision: number;
+}
 
 export interface ModelRegistrationRequest {
   name: string;

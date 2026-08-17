@@ -4,7 +4,7 @@ import { Spinner } from "@nous-research/ui/ui/components/spinner";
 import { X } from "lucide-react";
 import { useMemo, useState } from "react";
 import { guiChatTranslations, useI18n } from "@/i18n";
-import type { Employee } from "@/lib/api";
+import { employeeDisplayName, employeeDisplayRole, type Employee } from "@/lib/api";
 
 interface CreateGroupDialogProps {
   employees: Employee[];
@@ -22,7 +22,6 @@ export function CreateGroupDialog({ employees, onClose, onCreate }: CreateGroupD
   const eligible = useMemo(
     () => employees.filter((employee) =>
       employee.lifecycle_status === "active" &&
-      employee.profile !== null &&
       employee.collaboration_policy.may_participate
     ),
     [employees],
@@ -69,8 +68,8 @@ export function CreateGroupDialog({ employees, onClose, onCreate }: CreateGroupD
                   type="checkbox"
                 />
                 <span className="min-w-0">
-                  <span className="block truncate text-sm font-medium text-[#303238]">{employee.profile?.name || copy.unnamedEmployee}</span>
-                  <span className="block truncate text-[11px] text-[#969aa1]">{employee.profile?.role || copy.aiEmployee}</span>
+                  <span className="block truncate text-sm font-medium text-[#303238]">{employeeDisplayName(employee, copy.builtinAssistant, copy.unnamedEmployee)}</span>
+                  <span className="block truncate text-[11px] text-[#969aa1]">{employeeDisplayRole(employee, copy.builtinDescription, copy.aiEmployee)}</span>
                 </span>
               </label>
             );

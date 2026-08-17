@@ -231,31 +231,60 @@ describe("EmployeeContactsPane", () => {
       .not.toBeNull();
   });
 
-  it("renders the built-in assistant without management actions", async () => {
-    const builtin = employee({
+  it("personalizes the built-in assistant without exposing managed controls", async () => {
+    const builtin = builtinEmployee({
       employee_id: "emp_builtin",
-      employee_kind: "builtin_assistant",
-      protected: true,
-      profile: null,
+      nickname: "Nova",
+      personalPreference: "Keep answers short.",
     });
+    const saved = builtinEmployee({
+      nickname: "Atlas",
+      personalPreference: "Prefer examples.",
+      profile_revision: 8,
+    });
+    const updatePersonalization = vi.spyOn(api, "updateBuiltinAssistantPersonalization")
+      .mockResolvedValue(saved);
     const profileUpdate = vi.spyOn(api, "updateEmployeeProfile");
     const lifecycleUpdate = vi.spyOn(api, "updateEmployeeLifecycle");
     const collaborationUpdate = vi.spyOn(api, "updateEmployeeCollaborationPolicy");
+    const onRefresh = vi.fn();
 
     vi.spyOn(api, "getEmployees").mockResolvedValue(listResult([builtin]));
-    await renderPane();
+    await renderPane({ onRefresh });
 
-    expect(document.body.textContent).toContain("AI Assistant");
+    expect(document.body.textContent).toContain("Nova");
     expect(document.body.textContent).toContain("Built-in");
     expect(Array.from(document.querySelectorAll('[role="listitem"] span[aria-hidden]'))
-      .some((avatar) => avatar.textContent === "AI")).toBe(true);
-    await act(async () => buttonNamed("Manage employee: AI Assistant")?.click());
+      .some((avatar) => avatar.textContent === "NO")).toBe(true);
+    await act(async () => buttonNamed("Manage employee: Nova")?.click());
 
     const dialog = document.querySelector('[role="dialog"]');
-    expect(dialog?.textContent).toContain("managed by Hermes");
-    for (const label of ["Edit profile", "Refresh sessions", "Suspend", "Revoke", "Save permissions", "Connect"]) {
-      expect(Array.from(dialog?.querySelectorAll("button") ?? []).some((button) => button.textContent === label)).toBe(false);
+    expect(dialog?.textContent).toContain("Nickname");
+    expect(dialog?.textContent).toContain("Personal preference");
+    const nickname = dialog?.querySelector<HTMLInputElement>('input[maxlength="80"]') ?? null;
+    const preference = dialog?.querySelector<HTMLTextAreaElement>("textarea") ?? null;
+    expect(nickname?.value).toBe("Nova");
+    expect(preference?.value).toBe("Keep answers short.");
+    for (const label of ["Model", "Reasoning level", "System prompt", "Skills", "Edit profile", "Refresh sessions", "Suspend", "Revoke", "Save permissions", "Connect"]) {
+      expect(dialog?.textContent).not.toContain(label);
     }
+
+    changeValue(nickname, "Atlas");
+    changeValue(preference, "Prefer examples.");
+    await act(async () => {
+      Array.from(dialog?.querySelectorAll<HTMLButtonElement>("button") ?? [])
+        .find((button) => button.textContent === "Save personalization")
+        ?.click();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(updatePersonalization).toHaveBeenCalledWith("emp_builtin", {
+      expected_revision: 7,
+      nickname: "Atlas",
+      personal_preference: "Prefer examples.",
+    });
+    expect(onRefresh).toHaveBeenCalledOnce();
     expect(profileUpdate).not.toHaveBeenCalled();
     expect(lifecycleUpdate).not.toHaveBeenCalled();
     expect(collaborationUpdate).not.toHaveBeenCalled();
@@ -560,14 +589,12 @@ function employee(overrides: {
   avatar_url?: string | null;
   channels?: Employee["channels"];
   employee_id?: string;
-  employee_kind?: Employee["employee_kind"];
   lifecycle_status?: Employee["lifecycle_status"];
   name?: string;
-  profile?: Employee["profile"];
   protected?: boolean;
   role?: string;
-} = {}): Employee {
-  const profile: Employee["profile"] = "profile" in overrides ? overrides.profile ?? null : {
+} = {}): Extract<Employee, { employee_kind: "managed" }> {
+  const profile = {
     knowledge_relative_paths: [],
     max_iterations: 20,
     max_tokens: null,
@@ -586,7 +613,7 @@ function employee(overrides: {
     avatar_url: overrides.avatar_url ?? null,
     channels: overrides.channels ?? {},
     chat_eligible: (overrides.lifecycle_status ?? "active") === "active",
-    employee_kind: overrides.employee_kind ?? "managed",
+    employee_kind: "managed",
     protected: overrides.protected ?? false,
     collaboration_policy: {
       invite_quota: 5,
@@ -596,7 +623,40 @@ function employee(overrides: {
     employee_id: overrides.employee_id ?? "employee-a",
     lifecycle_status: overrides.lifecycle_status ?? "active",
     profile,
-    profile_fingerprint: profile ? "sha256:test" : null,
-    profile_revision: profile ? 1 : null,
+    profile_fingerprint: "sha256:test",
+    profile_revision: 1,
+  };
+}
+
+function builtinEmployee(overrides: Partial<Extract<Employee, { employee_kind: "builtin_assistant" }>> & {
+  nickname?: string;
+  personalPreference?: string;
+} = {}): Extract<Employee, { employee_kind: "builtin_assistant" }> {
+  const {
+    nickname = "AI Assistant",
+    personalPreference = "",
+    ...employeeOverrides
+  } = overrides;
+  return {
+    avatar_url: null,
+    builtin_assistant_personalization: {
+      nickname,
+      personal_preference: personalPreference,
+    },
+    channels: {},
+    chat_eligible: true,
+    collaboration_policy: {
+      invite_quota: null,
+      may_create_groups: true,
+      may_participate: true,
+    },
+    employee_id: "emp_builtin",
+    employee_kind: "builtin_assistant",
+    lifecycle_status: "active",
+    profile: null,
+    profile_fingerprint: "sha256:builtin",
+    profile_revision: 7,
+    protected: true,
+    ...employeeOverrides,
   };
 }

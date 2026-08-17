@@ -410,11 +410,9 @@ describe("GuiChatShell", () => {
     mocks.getAuthMe.mockResolvedValue(authIdentity());
     mocks.connectGuiChat.mockReturnValue(connection);
     mocks.getEmployees.mockResolvedValue({
-      employees: [employee({
+      employees: [builtinEmployee({
         employee_id: "employee-a",
-        employee_kind: "builtin_assistant",
-        name: null,
-        protected: true,
+        nickname: "Nova",
       })],
     });
 
@@ -429,7 +427,7 @@ describe("GuiChatShell", () => {
 
     await act(async () => {
       Array.from(document.querySelectorAll<HTMLButtonElement>("button"))
-        .find((button) => button.textContent?.includes("AI Assistant") && !button.hasAttribute("aria-label"))
+        .find((button) => button.textContent?.includes("Nova") && !button.hasAttribute("aria-label"))
         ?.click();
       await Promise.resolve();
       await Promise.resolve();
@@ -1623,32 +1621,17 @@ interface AuthIdentity {
 
 function employee(overrides: {
   employee_id?: string;
-  employee_kind?: Employee["employee_kind"];
   lifecycle_status?: Employee["lifecycle_status"];
-  name?: string | null;
+  name?: string;
   protected?: boolean;
-} = {}): Employee {
+} = {}): Extract<Employee, { employee_kind: "managed" }> {
   const employeeId = overrides.employee_id ?? "employee-a";
   const lifecycleStatus = overrides.lifecycle_status ?? "active";
-  const profile = overrides.name === null ? null : {
-    knowledge_relative_paths: [],
-    max_iterations: 20,
-    max_tokens: null,
-    mcp_servers: [],
-    model_registration_id: "chat-a",
-    name: overrides.name ?? "Researcher",
-    role: "Analyst",
-    schema_version: 1 as const,
-    skills: [],
-    system_prompt: "Server policy",
-    toolsets: [],
-    workspace_relative_path: `employees/${employeeId}`,
-  };
   return {
     avatar_url: null,
     channels: {},
     chat_eligible: lifecycleStatus === "active",
-    employee_kind: overrides.employee_kind ?? "managed",
+    employee_kind: "managed",
     protected: overrides.protected ?? false,
     collaboration_policy: {
       invite_quota: 5,
@@ -1657,9 +1640,47 @@ function employee(overrides: {
     },
     employee_id: employeeId,
     lifecycle_status: lifecycleStatus,
-    profile,
-    profile_fingerprint: profile ? "sha256:pinned" : null,
-    profile_revision: profile ? 3 : null,
+    profile: {
+      knowledge_relative_paths: [],
+      max_iterations: 20,
+      max_tokens: null,
+      mcp_servers: [],
+      model_registration_id: "chat-a",
+      name: overrides.name ?? "Researcher",
+      role: "Analyst",
+      schema_version: 1,
+      skills: [],
+      system_prompt: "Server policy",
+      toolsets: [],
+      workspace_relative_path: `employees/${employeeId}`,
+    },
+    profile_fingerprint: "sha256:pinned",
+    profile_revision: 3,
+  };
+}
+
+function builtinEmployee(overrides: Partial<Extract<Employee, { employee_kind: "builtin_assistant" }>> & {
+  nickname?: string;
+} = {}): Extract<Employee, { employee_kind: "builtin_assistant" }> {
+  const { nickname = "AI Assistant", ...employeeOverrides } = overrides;
+  return {
+    avatar_url: null,
+    builtin_assistant_personalization: { nickname, personal_preference: "" },
+    channels: {},
+    chat_eligible: true,
+    collaboration_policy: {
+      invite_quota: null,
+      may_create_groups: true,
+      may_participate: true,
+    },
+    employee_id: "employee-a",
+    employee_kind: "builtin_assistant",
+    lifecycle_status: "active",
+    profile: null,
+    profile_fingerprint: "sha256:builtin",
+    profile_revision: 3,
+    protected: true,
+    ...employeeOverrides,
   };
 }
 

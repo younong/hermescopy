@@ -24,7 +24,7 @@ from typing import Any, Deque, Dict, Literal, Tuple
 
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 
 from hermes_cli.dashboard_auth import (
     get_provider,
@@ -495,6 +495,14 @@ class _LocalUserPasswordChangeBody(BaseModel):
     new_password: str
 
 
+class _BuiltinAssistantPolicyBody(BaseModel):
+    model_registration_id: str
+    reasoning_effort: str
+    expected_revision: int
+
+    model_config = ConfigDict(extra="forbid")
+
+
 def _local_account_summary(account: LocalAccount) -> dict[str, object]:
     """Serialize only durable account metadata; passwords never leave storage."""
     return {
@@ -836,6 +844,78 @@ async def api_auth_me(request: Request):
             ),
         })
     return response
+
+
+# ---------------------------------------------------------------------------
+# Auth-required: durable local Basic administrator system policy
+# ---------------------------------------------------------------------------
+
+
+def _channel_identity_store(request: Request):
+    runtime = getattr(request.app.state, "channel_connector_runtime", None)
+    store = getattr(runtime, "store", None)
+    if store is None:
+        raise HTTPException(status_code=503, detail="connector_runtime_unavailable")
+    return store
+
+
+def _builtin_assistant_policy_payload(request: Request) -> dict[str, Any]:
+    from hermes_cli.channel_identity import (
+        BuiltinAssistantPolicyUnavailable,
+        resolve_builtin_assistant_policy,
+    )
+    from hermes_cli.model_registrations import admin_chat_registrations_payload
+
+    store = _channel_identity_store(request)
+    try:
+        policy = resolve_builtin_assistant_policy(store)
+        current = {
+            "model_registration_id": policy.model_registration_id,
+            "reasoning_effort": policy.reasoning_effort,
+            "revision": policy.revision,
+            "updated_at": policy.updated_at,
+        }
+    except BuiltinAssistantPolicyUnavailable:
+        current = None
+    return {
+        "policy": current,
+        "admin_chat_registrations": admin_chat_registrations_payload(),
+    }
+
+
+@router.get("/api/system/builtin-assistant-policy")
+async def api_builtin_assistant_policy(request: Request):
+    _admin_local_account_for_request(request)
+    return _builtin_assistant_policy_payload(request)
+
+
+@router.put("/api/system/builtin-assistant-policy")
+async def api_update_builtin_assistant_policy(
+    request: Request, body: _BuiltinAssistantPolicyBody
+):
+    _provider, _local_store, admin = _admin_local_account_for_request(request)
+    from hermes_cli.channel_identity import (
+        BuiltinAssistantPolicyRevisionConflict,
+        update_builtin_assistant_policy,
+    )
+    from hermes_cli.model_registrations import ModelRegistrationError
+
+    try:
+        update_builtin_assistant_policy(
+            _channel_identity_store(request),
+            model_registration_id=body.model_registration_id,
+            reasoning_effort=body.reasoning_effort,
+            expected_revision=body.expected_revision,
+            updated_by_account_id=admin.account_id,
+        )
+    except BuiltinAssistantPolicyRevisionConflict as exc:
+        raise HTTPException(
+            status_code=409,
+            detail="builtin_assistant_policy_revision_conflict",
+        ) from exc
+    except (ValueError, ModelRegistrationError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return _builtin_assistant_policy_payload(request)
 
 
 # ---------------------------------------------------------------------------

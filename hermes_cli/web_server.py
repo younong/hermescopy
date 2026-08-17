@@ -1311,6 +1311,14 @@ class EmployeeProfileUpdate(BaseModel):
     profile: Dict[str, Any]
 
 
+class BuiltinAssistantPersonalizationUpdate(BaseModel):
+    expected_revision: int
+    nickname: str
+    personal_preference: str = ""
+
+    model_config = ConfigDict(extra="forbid")
+
+
 class EmployeeCollaborationPolicyUpdate(BaseModel):
     may_participate: bool
     may_create_groups: bool
@@ -5487,16 +5495,33 @@ def _employee_avatar_url(store, employee_id: str) -> str | None:
 
 
 def _employee_payload(runtime, store, owner, employee) -> dict[str, Any]:
-    from hermes_cli.channel_identity import resolve_employee_profile
+    from hermes_cli.channel_identity import (
+        builtin_assistant_personalization_payload,
+        resolve_builtin_assistant_personalization,
+        resolve_employee_profile,
+    )
 
-    profile = None
-    if employee.profile_revision is not None:
-        profile = resolve_employee_profile(
+    if employee.employee_kind == "builtin_assistant":
+        profile = resolve_builtin_assistant_personalization(
             store,
             owner=owner,
             employee_id=employee.employee_id,
-            revision=employee.profile_revision,
         )
+        public_profile = None
+        personalization = builtin_assistant_personalization_payload(profile)
+    else:
+        profile = (
+            resolve_employee_profile(
+                store,
+                owner=owner,
+                employee_id=employee.employee_id,
+                revision=employee.profile_revision,
+            )
+            if employee.profile_revision is not None
+            else None
+        )
+        public_profile = profile.profile if profile is not None else None
+        personalization = None
     avatar_url = _employee_avatar_url(store, employee.employee_id)
     channels: dict[str, Any] = {}
     binding = employee.feishu_binding
@@ -5524,7 +5549,12 @@ def _employee_payload(runtime, store, owner, employee) -> dict[str, Any]:
         "lifecycle_status": employee.lifecycle_status,
         "profile_revision": profile.revision if profile is not None else None,
         "profile_fingerprint": profile.fingerprint if profile is not None else None,
-        "profile": profile.profile if profile is not None else None,
+        "profile": public_profile,
+        **(
+            {"builtin_assistant_personalization": personalization}
+            if personalization is not None
+            else {}
+        ),
         "collaboration_policy": {
             "may_participate": employee.collaboration_policy.may_participate,
             "may_create_groups": employee.collaboration_policy.may_create_groups,
@@ -5691,8 +5721,7 @@ async def get_employee_avatar(request: Request, employee_id: str):
 @app.put("/api/employees/{employee_id}/avatar")
 async def update_employee_avatar(request: Request, employee_id: str):
     _runtime, store, owner = _employee_authority_context(request)
-    employee = _employee_or_404(store, owner, employee_id)
-    _reject_builtin_employee_http(employee)
+    _employee_or_404(store, owner, employee_id)
     from hermes_cli.channel_identity.employee_avatars import (
         MAX_AVATAR_UPLOAD_BYTES,
         EmployeeAvatarInvalid,
@@ -5721,11 +5750,41 @@ async def update_employee_avatar(request: Request, employee_id: str):
 @app.delete("/api/employees/{employee_id}/avatar")
 async def delete_employee_avatar_route(request: Request, employee_id: str):
     _runtime, store, owner = _employee_authority_context(request)
-    employee = _employee_or_404(store, owner, employee_id)
-    _reject_builtin_employee_http(employee)
+    _employee_or_404(store, owner, employee_id)
     from hermes_cli.channel_identity.employee_avatars import delete_employee_avatar
 
     return {"ok": True, "deleted": delete_employee_avatar(store, employee_id)}
+
+
+@app.put("/api/employees/{employee_id}/builtin-assistant-personalization")
+async def update_builtin_assistant_personalization_route(
+    request: Request,
+    employee_id: str,
+    body: BuiltinAssistantPersonalizationUpdate,
+):
+    runtime, store, owner = _employee_authority_context(request)
+    employee = _employee_or_404(store, owner, employee_id)
+    if employee.employee_kind != "builtin_assistant":
+        raise HTTPException(status_code=404, detail="Employee not found")
+    from hermes_cli.channel_identity import (
+        EmployeeProfileRevisionConflict,
+        update_builtin_assistant_personalization,
+    )
+
+    try:
+        update_builtin_assistant_personalization(
+            store,
+            owner=owner,
+            employee_id=employee_id,
+            nickname=body.nickname,
+            personal_preference=body.personal_preference,
+            expected_revision=body.expected_revision,
+        )
+        return _employee_payload(runtime, store, owner, employee)
+    except EmployeeProfileRevisionConflict as exc:
+        raise HTTPException(status_code=409, detail="employee_profile_revision_conflict") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @app.put("/api/employees/{employee_id}/profile")
