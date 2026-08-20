@@ -139,6 +139,16 @@ class DeploymentInferenceRelayError(RuntimeError):
     """The worker-to-control-plane inference relay rejected a request."""
 
 
+class DeploymentInferenceRelayMethodNotAllowed(DeploymentInferenceRelayError):
+    """The relay received a request whose method the path doesn't accept.
+
+    Translated to HTTP 405 (with ``Allow: POST``) by the HTTP layer so
+    callers — including model-metadata probes such as
+    ``get_model_context_length`` — can distinguish "this endpoint only
+    accepts POST" from the catch-all 502 "relay unavailable".
+    """
+
+
 def _send_frame(conn: socket.socket, value: dict[str, Any]) -> None:
     encoded = json.dumps(value, separators=(",", ":")).encode("utf-8")
     if len(encoded) > _MAX_FRAME_BYTES:
@@ -862,6 +872,16 @@ class OwnerInferenceRelay:
             path = urlparse(handler.path).path
             length = int(handler.headers.get("Content-Length", "0"))
             if handler.command == "GET" and path != deployment_routes_path():
+                # OpenAI-compatible model discovery endpoints. The relay is
+                # not an OpenAI-compatible model API, so /v1/models must
+                # respond with 405 (Allow: POST) rather than the generic
+                # 502 "relay unavailable" — otherwise metadata probes such
+                # as agent.model_metadata.fetch_endpoint_model_metadata
+                # misread the response as a transient outage.
+                if path in {"/v1/models", "/models"}:
+                    raise DeploymentInferenceRelayMethodNotAllowed(
+                        "relay does not serve model discovery"
+                    )
                 raise DeploymentInferenceRelayError("relay request is not allowed")
             if length < 0 or length > _MAX_FRAME_BYTES:
                 raise DeploymentInferenceRelayError("relay request is too large")
@@ -934,6 +954,21 @@ class OwnerInferenceRelay:
                 except (DeploymentInferenceRelayError, OSError):
                     pass
                 raise
+        except DeploymentInferenceRelayMethodNotAllowed:
+            if headers_sent:
+                # HTTP status and headers are already on the wire. Sending
+                # a second response would corrupt the provider stream;
+                # close it instead.
+                handler.close_connection = True
+                return
+            try:
+                handler.send_response(405)
+                handler.send_header("Allow", "POST")
+                handler.send_header("Content-Length", "0")
+                handler.send_header("Connection", "close")
+                handler.end_headers()
+            except (BrokenPipeError, ConnectionError, OSError):
+                handler.close_connection = True
         except Exception as exc:
             logger.warning(
                 "owner inference relay response failed phase=%s error_type=%s",
