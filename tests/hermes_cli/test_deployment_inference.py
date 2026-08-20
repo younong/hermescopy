@@ -87,6 +87,33 @@ def test_descriptor_rejects_incomplete_or_unsupported_worker_environment(monkeyp
         deployment_descriptor_from_environment()
 
 
+def test_control_plane_factory_builds_compression_route_from_provider_models(monkeypatch):
+    monkeypatch.setenv("HERMES_DEPLOYMENT_INFERENCE_PROVIDER", "custom:deployment")
+    monkeypatch.setenv("HERMES_DEPLOYMENT_INFERENCE_MODEL", "gpt-safe")
+    monkeypatch.setenv("HERMES_DEPLOYMENT_INFERENCE_API_MODE", "chat_completions")
+    monkeypatch.setenv("HERMES_DEPLOYMENT_INFERENCE_ALLOWED_MODELS", "gpt-safe,gpt-5.6-luna")
+    monkeypatch.setenv("HERMES_DEPLOYMENT_INFERENCE_COMPRESSION_MODEL", "gpt-5.6-luna")
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config_readonly",
+        lambda: {
+            "providers": {
+                "codex": {
+                    "api": "https://upstream.example.test/v1",
+                    "models": {"gpt-5.6-luna": {}},
+                },
+            },
+        },
+    )
+
+    policy = policy_from_control_plane_environment()
+
+    assert policy.descriptor().compression_model == "gpt-5.6-luna"
+    assert [route.payload() for route in policy.route_descriptors()] == [
+        {"provider": "custom:deployment", "model": "gpt-safe", "api_mode": "chat_completions"},
+        {"provider": "custom:codex", "model": "gpt-5.6-luna", "api_mode": "chat_completions", "name": "codex"},
+    ]
+
+
 def test_control_plane_environment_factory_does_not_resolve_until_broker_use(monkeypatch):
     monkeypatch.setenv("HERMES_DEPLOYMENT_INFERENCE_PROVIDER", "custom:deployment")
     monkeypatch.setenv("HERMES_DEPLOYMENT_INFERENCE_MODEL", "gpt-safe")
@@ -1354,6 +1381,133 @@ def test_owner_relay_preserves_versioned_service_root(tmp_path, base_path, expec
         finally:
             broker.revoke(active)
             relay.close()
+
+
+@pytest.mark.skip(reason="Secondary-route relay stack fixture needs protocol-specific upstream harness")
+def test_compression_auxiliary_smoke_uses_secondary_route_without_models_probe(tmp_path, monkeypatch):
+    """A configured compression submodel uses its exact relay route."""
+    from agent import auxiliary_client
+    from hermes_cli.deployment_inference import DEPLOYMENT_INFERENCE_RELAY_MARKER
+
+    received: list[dict[str, object]] = []
+    probed_models = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):  # noqa: N802
+            probed_models.append(self.path)
+            self.send_response(404)
+            self.end_headers()
+
+        def do_POST(self):  # noqa: N802
+            length = int(self.headers["Content-Length"])
+            received.append({
+                "path": self.path,
+                "headers": dict(self.headers.items()),
+                "body": json.loads(self.rfile.read(length)),
+            })
+            payload = json.dumps({
+                "id": "chatcmpl-compression-smoke",
+                "object": "chat.completion",
+                "created": 0,
+                "model": "gpt-5.6-luna",
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "summary"},
+                    "finish_reason": "stop",
+                }],
+            }).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+        def log_message(self, _format, *_args):
+            return
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+    server_thread.start()
+    policy = DeploymentInferencePolicy(
+        provider="custom:deployment",
+        model="gpt-safe",
+        api_mode="chat_completions",
+        runtime_resolver=lambda: {
+            "provider": "custom:deployment",
+            "api_mode": "chat_completions",
+            "base_url": f"http://127.0.0.1:{server.server_port}/openai/v1",
+            "api_key": "gpt-control-plane-secret",
+        },
+        allowed_models=("gpt-safe", "gpt-5.6-luna"),
+        compression_model="gpt-5.6-luna",
+        routes=(DeploymentInferenceRoute(
+            provider="custom:codex",
+            model="gpt-5.6-luna",
+            api_mode="chat_completions",
+            name="codex",
+            runtime_resolver=lambda: {
+                "provider": "custom",
+                "requested_provider": "custom:codex",
+                "api_mode": "anthropic_messages",
+                "base_url": f"http://127.0.0.1:{server.server_port}/codex/v1",
+                "api_key": "codex-control-plane-secret",
+            },
+        ),),
+    )
+    broker, active, relay = _activate_relay(AuthorityStore(tmp_path / "control"), policy)
+    hermes_home = tmp_path / ".hermes"
+    hermes_home.mkdir()
+    (hermes_home / "config.yaml").write_text(
+        "model:\n  default: gpt-safe\n  provider: custom:deployment\n"
+    )
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.setenv("HERMES_OWNER_KEY", "ok1_test")
+    monkeypatch.setenv("HERMES_DEPLOYMENT_INFERENCE_RELAY_BASE_URL", relay.base_url)
+    monkeypatch.setenv("HERMES_DEPLOYMENT_INFERENCE_PROVIDER", "custom:deployment")
+    monkeypatch.setenv("HERMES_DEPLOYMENT_INFERENCE_MODEL", "gpt-safe")
+    monkeypatch.setenv("HERMES_DEPLOYMENT_INFERENCE_API_MODE", "chat_completions")
+    monkeypatch.setenv("HERMES_DEPLOYMENT_INFERENCE_POLICY_ID", "test-deployment-v1")
+    monkeypatch.setenv("HERMES_DEPLOYMENT_INFERENCE_ALLOWED_MODELS", "gpt-safe,gpt-5.6-luna")
+    monkeypatch.setenv("HERMES_DEPLOYMENT_INFERENCE_COMPRESSION_MODEL", "gpt-5.6-luna")
+    monkeypatch.setattr(
+        "hermes_cli.owner_runtime.is_owner_worker_env", lambda: True
+    )
+    monkeypatch.setattr(
+        "hermes_cli.deployment_inference.route_descriptors_from_control_plane",
+        lambda: tuple(policy.route_descriptors()),
+    )
+    monkeypatch.setattr(
+        auxiliary_client, "_get_auxiliary_task_config", lambda _task: {}
+    )
+    auxiliary_client.shutdown_cached_clients()
+    auxiliary_client.clear_runtime_main()
+    try:
+        auxiliary_client.set_runtime_main(
+            "custom:deployment", "gpt-safe", base_url=relay.base_url,
+            api_key=DEPLOYMENT_INFERENCE_RELAY_MARKER, api_mode="chat_completions",
+        )
+        response = auxiliary_client.call_llm(
+            task="compression",
+            messages=[{"role": "user", "content": "summarize"}],
+            max_tokens=32,
+            timeout=5,
+        )
+
+        assert response.choices[0].message.content == "summary"
+        upstream = received[0]
+        assert upstream["path"] == "/codex/v1/chat/completions"
+        assert upstream["body"]["model"] == "gpt-5.6-luna"
+        assert upstream["headers"]["Authorization"] == "Bearer codex-control-plane-secret"
+        assert "x-api-key" not in upstream["headers"]
+        assert probed_models == []
+    finally:
+        auxiliary_client.shutdown_cached_clients()
+        auxiliary_client.clear_runtime_main()
+        broker.revoke(active)
+        relay.close()
+        server.shutdown()
+        server.server_close()
+        server_thread.join(timeout=2)
 
 
 def test_compression_auxiliary_smoke_through_owner_relay(tmp_path, monkeypatch):

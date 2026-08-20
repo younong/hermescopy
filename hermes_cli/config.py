@@ -4015,6 +4015,11 @@ def _normalize_custom_provider_entry(
     if not isinstance(entry, dict):
         return None
 
+    # Work on a shallow copy: route-index construction may receive the
+    # read-only config cache, and normalization must not write aliases back
+    # into that cached object.
+    entry = dict(entry)
+
     # Accept camelCase aliases commonly used in hand-written configs.
     _CAMEL_ALIASES: Dict[str, str] = {
         "apiKey": "api_key",
@@ -4118,14 +4123,18 @@ def _normalize_custom_provider_entry(
 
     models = entry.get("models")
     if isinstance(models, dict) and models:
-        normalized["models"] = models
+        normalized["models"] = {
+            str(model).strip(): metadata
+            for model, metadata in models.items()
+            if str(model).strip()
+        }
     elif isinstance(models, list) and models:
         # Hand-edited configs (and older Hermes versions) write ``models`` as
         # a plain list of model ids. Preserve them by converting to the dict
         # shape downstream code expects; otherwise normalize silently drops
         # the list and /model shows the provider with (0) models.
         normalized["models"] = {
-            str(m): {} for m in models if isinstance(m, str) and m.strip()
+            m.strip(): {} for m in models if isinstance(m, str) and m.strip()
         }
 
     context_length = entry.get("context_length")

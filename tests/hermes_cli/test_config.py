@@ -1093,6 +1093,26 @@ class TestCustomProviderCompatibility:
         # Legacy entry wins (read first)
         assert compatible[0]["api_key"] == "legacy-key"
 
+    def test_compatible_provider_normalization_does_not_mutate_input(self):
+        config = {
+            "providers": {
+                "legacy-shaped": {
+                    "api": "https://api.example.test/v1",
+                    "apiKeyEnv": "EXAMPLE_API_KEY",
+                    "defaultModel": "gpt-main",
+                    "models": [" gpt-5.6-luna "],
+                },
+            },
+        }
+        original = yaml.safe_dump(config)
+
+        compatible = get_compatible_custom_providers(config)
+
+        assert yaml.safe_dump(config) == original
+        assert compatible[0]["key_env"] == "EXAMPLE_API_KEY"
+        assert compatible[0]["model"] == "gpt-main"
+        assert compatible[0]["models"] == {"gpt-5.6-luna": {}}
+
     def test_dedup_preserves_entries_with_different_models(self, tmp_path):
         """Entries with same name+URL but different models must not be collapsed."""
         config_path = tmp_path / "config.yaml"
