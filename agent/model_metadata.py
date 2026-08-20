@@ -1959,11 +1959,24 @@ def _deployment_relay_context_length(
             is_deployment_inference_relay,
             route_descriptors_from_control_plane,
         )
+    except ImportError:
+        # hermes_cli not installed / not on the import path — caller is not
+        # a deployment-inference relay, so fall through to generic resolution.
+        return False, None
 
-        if not is_deployment_inference_relay(api_key):
-            return False, None
+    if not is_deployment_inference_relay(api_key):
+        return False, None
+
+    try:
         routes = route_descriptors_from_control_plane()
-    except Exception:
+    except Exception as exc:
+        # Relay credential, but control plane is unreachable / misconfigured.
+        # Still skip /models probing (relay would 405 it), but surface the
+        # failure so operators can debug the missing route descriptors.
+        logger.warning(
+            "Failed to load deployment inference routes for relay: %s",
+            exc,
+        )
         return True, None
 
     selected_model = _strip_provider_prefix(str(model or "").strip())
@@ -2166,6 +2179,20 @@ def get_model_context_length(
             return get_bedrock_context_length(model)
         except ImportError:
             pass  # boto3 not installed — fall through to generic resolution
+
+    # 1c. Deployment inference relay — trust control-plane route metadata.
+    # The relay rejects /v1/models with 405 (it's not an OpenAI-compatible
+    # model API), so probing it as a generic custom endpoint only wastes a
+    # round-trip and pollutes logs.  When the api_key matches a relay
+    # credential, return either the route-declared context_length or a
+    # safe upper-bound fallback so the rest of the pipeline skips probing.
+    relay_match, relay_ctx = _deployment_relay_context_length(
+        model, provider=provider, api_key=api_key,
+    )
+    if relay_match:
+        if isinstance(relay_ctx, int) and relay_ctx > 0:
+            return relay_ctx
+        return 400_000
 
     if provider == "novita" or (base_url and base_url_host_matches(base_url, "api.novita.ai")):
         ctx = _resolve_endpoint_context_length(model, base_url or "https://api.novita.ai/openai/v1", api_key=api_key)
