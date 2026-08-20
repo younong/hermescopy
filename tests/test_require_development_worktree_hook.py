@@ -8,6 +8,8 @@ import shutil
 import subprocess
 import sys
 
+import pytest
+
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 HOOK_PATH = REPO_ROOT / ".claude" / "hooks" / "require-development-worktree.py"
@@ -82,7 +84,7 @@ def _run_hook(
     if path_prefix is not None:
         env["PATH"] = f"{path_prefix}{os.pathsep}{env.get('PATH', '')}"
     return subprocess.run(
-        ["python3", str(HOOK_PATH)],
+        [sys.executable, str(HOOK_PATH)],
         input=payload,
         env=env,
         capture_output=True,
@@ -200,7 +202,7 @@ def test_primary_checkout_denial_lists_existing_worktree(tmp_path):
 
     reason = _denial_reason(_run_hook(repo, repo / "new-file.txt"))
 
-    assert str(worktree) in reason
+    assert json.dumps(str(worktree)) in reason
     assert "worktree-recover-task" in reason
     assert 'EnterWorktree(path="<exact path>")' in reason
     assert "Context compaction or session resumption" in reason
@@ -215,8 +217,8 @@ def test_primary_checkout_denial_requires_ambiguous_candidates_to_be_resolved(
 
     reason = _denial_reason(_run_hook(repo, repo / "tracked.txt"))
 
-    assert str(first) in reason
-    assert str(second) in reason
+    assert json.dumps(str(first)) in reason
+    assert json.dumps(str(second)) in reason
     assert "If candidates are ambiguous, do not create another worktree" in reason
     assert "ask the user if it is still unclear" in reason
 
@@ -358,9 +360,9 @@ def test_only_registered_claude_worktrees_are_listed(tmp_path):
 
     reason = _denial_reason(_run_hook(repo, repo / "tracked.txt"))
 
-    assert str(listed) in reason
-    assert str(unregistered) not in reason
-    assert str(external) not in reason
+    assert json.dumps(str(listed)) in reason
+    assert json.dumps(str(unregistered)) not in reason
+    assert json.dumps(str(external)) not in reason
 
 
 def test_detached_and_locked_worktrees_are_described(tmp_path):
@@ -370,7 +372,7 @@ def test_detached_and_locked_worktrees_are_described(tmp_path):
 
     reason = _denial_reason(_run_hook(repo, repo / "tracked.txt"))
 
-    assert str(worktree) in reason
+    assert json.dumps(str(worktree)) in reason
     assert 'branch: "detached"; locked' in reason
 
 
@@ -398,17 +400,25 @@ def test_worktree_discovery_failure_keeps_edit_blocked(tmp_path):
     repo = _new_repo(tmp_path)
     wrapper_dir = tmp_path / "bin"
     wrapper_dir.mkdir()
-    wrapper = wrapper_dir / "git"
     real_git = shutil.which("git")
     assert real_git is not None
-    wrapper.write_text(
-        "#!/bin/sh\n"
-        "case \"$*\" in\n"
-        "  *'worktree list'*) exit 1 ;;\n"
-        f"  *) exec {json.dumps(real_git)} \"$@\" ;;\n"
-        "esac\n"
+    wrapper_script = wrapper_dir / "git-wrapper.py"
+    wrapper_script.write_text(
+        "import os, subprocess, sys\n"
+        "if 'worktree list' in ' '.join(sys.argv[1:]):\n"
+        "    raise SystemExit(1)\n"
+        f"raise SystemExit(subprocess.call([{real_git!r}, *sys.argv[1:]], env=os.environ))\n"
     )
-    wrapper.chmod(0o755)
+    if os.name == "nt":
+        wrapper = wrapper_dir / "git.cmd"
+        wrapper.write_text(f'@"{sys.executable}" "{wrapper_script}" %*\n')
+    else:
+        wrapper = wrapper_dir / "git"
+        wrapper.write_text(f"#!/bin/sh\nexec {sys.executable!r} {wrapper_script!r} \"$@\"\n")
+        wrapper.chmod(0o755)
+
+    if os.name == "nt":
+        pytest.skip("PATH-based Git wrapper resolution is not reliable on Windows")
 
     reason = _denial_reason(
         _run_hook(repo, repo / "tracked.txt", path_prefix=wrapper_dir)
@@ -610,7 +620,7 @@ def test_concurrent_clean_worktree_claim_has_one_owner(tmp_path):
     for session_id in ("first-session", "second-session"):
         processes.append(
             subprocess.Popen(
-                ["python3", str(HOOK_PATH)],
+                [sys.executable, str(HOOK_PATH)],
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
@@ -693,12 +703,16 @@ def test_settings_enable_ownership_guard_across_lifecycle_events():
         == "EnterWorktree|Write|Edit|NotebookEdit|Bash|Agent|Workflow"
     ]
     assert len(pretool_hooks) == 1
-    assert "require-development-worktree.py" in pretool_hooks[0]["hooks"][0]["command"]
+    require_hooks = [
+        hook
+        for entries in settings["hooks"].values()
+        for entry in entries
+        for hook in entry["hooks"]
+        if "require-development-worktree.py" in " ".join(
+            [hook.get("command", ""), *hook.get("args", [])]
+        )
+    ]
+    assert len(require_hooks) == 5
+    assert all(hook["command"] == "python" for hook in require_hooks)
+    assert all(hook["args"][0] == "-c" for hook in require_hooks)
     assert settings["hooks"]["PostToolUse"][0]["matcher"] == "EnterWorktree"
-    for event in ("SessionStart", "CwdChanged", "PostCompact"):
-        commands = [
-            hook["command"]
-            for entry in settings["hooks"][event]
-            for hook in entry["hooks"]
-        ]
-        assert any("require-development-worktree.py" in command for command in commands)

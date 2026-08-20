@@ -3,9 +3,12 @@
 
 from dataclasses import dataclass
 from contextlib import contextmanager
-import fcntl
 import json
 import os
+if os.name == "nt":
+    import msvcrt
+else:
+    import fcntl
 from pathlib import Path
 import subprocess
 import sys
@@ -121,14 +124,38 @@ def parse_worktrees(output: str) -> list[dict[str, str | bool]]:
 @contextmanager
 def owner_lock(paths: RepositoryPaths) -> Iterator[None]:
     paths.git_dir.mkdir(parents=True, exist_ok=True)
+    lock_file = None
+    locked = False
     try:
-        with paths.owner_lock_path.open("a+") as lock_file:
+        lock_file = paths.owner_lock_path.open("a+b")
+        if os.name == "nt":
+            # msvcrt.locking locks the byte at the current file position. Keep
+            # the lock byte in the separate lock file, away from the owner JSON.
+            lock_file.seek(0, os.SEEK_END)
+            if lock_file.tell() == 0:
+                lock_file.write(b"\0")
+                lock_file.flush()
+            lock_file.seek(0)
+            msvcrt.locking(lock_file.fileno(), msvcrt.LK_LOCK, 1)
+        else:
             fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
-            yield
+        locked = True
+        yield
     except OSError as exc:
         raise GuardError(
             f"could not lock worktree ownership record: {paths.owner_lock_path}: {exc}"
         ) from exc
+    finally:
+        if lock_file is not None:
+            try:
+                if locked:
+                    if os.name == "nt":
+                        lock_file.seek(0)
+                        msvcrt.locking(lock_file.fileno(), msvcrt.LK_UNLCK, 1)
+                    else:
+                        fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+            finally:
+                lock_file.close()
 
 
 def read_owner(path: Path) -> dict[str, Any] | None:
