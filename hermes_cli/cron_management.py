@@ -232,6 +232,7 @@ def create_job(
     *,
     profile: str | None = None,
     allowed_workdir_root: Path | None = None,
+    max_jobs: int | None = None,
 ) -> dict[str, Any]:
     store = _store(home)
     normalized = _normalize_updates(
@@ -260,6 +261,7 @@ def create_job(
             workdir=normalized.get("workdir"),
             no_agent=bool(normalized.get("no_agent")),
             employee_id=normalized.get("employee_id"),
+            max_jobs=max_jobs,
         )
         _notify_provider()
     return _annotate_job(job, profile=profile, home=store.owner_home)

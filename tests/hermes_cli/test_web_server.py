@@ -5249,6 +5249,34 @@ def test_authenticated_member_plugin_api_is_denied(monkeypatch):
     assert response.status_code == 403
 
 
+def test_authenticated_member_scheduled_tasks_use_owner_worker(monkeypatch):
+    from types import SimpleNamespace
+    from hermes_cli.dashboard_auth.base import Session
+    from hermes_cli import web_server
+
+    session = Session(
+        user_id="member-1",
+        email="member@example.com",
+        display_name="Member",
+        org_id="org-1",
+        provider="basic",
+        expires_at=9999999999,
+        access_token="access",
+        refresh_token="refresh",
+    )
+    request = SimpleNamespace(
+        url=SimpleNamespace(path="/api/plugins/scheduled-tasks/jobs"),
+        method="POST",
+        state=SimpleNamespace(session=session),
+        headers={},
+        app=SimpleNamespace(state=SimpleNamespace(auth_required=True)),
+    )
+    monkeypatch.setattr(web_server, "_local_dashboard_account_role", lambda _request: "member")
+    monkeypatch.setattr(web_server, "authenticated_owner_worker_api_allowed", lambda path, method: True)
+
+    assert web_server._authenticated_owner_control_plane_gate_response(request) is None
+
+
 class TestAuthenticatedOwnerWorkerSessionProxy:
     @pytest.fixture(autouse=True)
     def _setup(self, monkeypatch, _isolate_hermes_home, tmp_path):

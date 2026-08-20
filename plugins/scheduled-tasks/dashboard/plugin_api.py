@@ -16,6 +16,9 @@ from pydantic import BaseModel
 from hermes_constants import get_hermes_home
 
 
+MAX_OWNER_SCHEDULED_TASKS = 10
+
+
 _OWNER_SELECTOR_KEYS = frozenset({"profile", "owner", "owner_home", "owner_key"})
 
 
@@ -189,9 +192,17 @@ def create_job_route(request: Request, body: CronJobCreate, profile: str = "defa
         _reject_owner_selectors(profile=body.profile or profile, values=selectors)
         home = get_hermes_home()
         try:
-            return create_job(home, values, allowed_workdir_root=_owner_workdir_root(request))
+            return create_job(
+                home,
+                values,
+                allowed_workdir_root=_owner_workdir_root(request),
+                max_jobs=MAX_OWNER_SCHEDULED_TASKS,
+            )
         except ValueError as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
+            from cron.jobs import CronJobQuotaExceeded
+
+            status_code = 409 if isinstance(exc, CronJobQuotaExceeded) else 400
+            raise HTTPException(status_code=status_code, detail=str(exc)) from exc
     name, home = _local_profile_home(body.profile or profile)
     try:
         return create_job(home, values, profile=name)
@@ -318,6 +329,10 @@ def instantiate_blueprint(request: Request, body: AutomationBlueprintInstantiate
             spec,
             profile=name,
             allowed_workdir_root=_owner_workdir_root(request),
+            max_jobs=MAX_OWNER_SCHEDULED_TASKS if _owner_worker_mode(request) else None,
         )
     except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+        from cron.jobs import CronJobQuotaExceeded
+
+        status_code = 409 if isinstance(exc, CronJobQuotaExceeded) else 400
+        raise HTTPException(status_code=status_code, detail=str(exc)) from exc
