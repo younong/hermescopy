@@ -519,6 +519,16 @@ def policy_from_control_plane_environment() -> DeploymentInferencePolicy:
             pass
 
     route_index = _configured_route_index()
+    default_route_matches = [
+        route
+        for route in route_index.get(model, ())
+        if route[0] == provider
+    ]
+    default_context_length = (
+        default_route_matches[0][4]
+        if len(default_route_matches) == 1
+        else None
+    )
 
     def _runtime_resolver(
         route_provider: str,
@@ -572,6 +582,7 @@ def policy_from_control_plane_environment() -> DeploymentInferencePolicy:
         policy_id=policy_id,
         allowed_models=allowed_models,
         supports_vision=supports_vision,
+        context_length=default_context_length,
         compression_model=compression_model,
         routes=tuple(extra_routes),
     )

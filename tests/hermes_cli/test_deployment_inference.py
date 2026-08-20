@@ -126,6 +126,33 @@ def test_control_plane_environment_factory_does_not_resolve_until_broker_use(mon
     assert policy.descriptor().supports_vision is False
 
 
+def test_control_plane_factory_exposes_default_model_context_length(monkeypatch):
+    monkeypatch.setenv("HERMES_DEPLOYMENT_INFERENCE_PROVIDER", "custom:deployment")
+    monkeypatch.setenv("HERMES_DEPLOYMENT_INFERENCE_MODEL", "gpt-safe")
+    monkeypatch.setenv("HERMES_DEPLOYMENT_INFERENCE_API_MODE", "chat_completions")
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config_readonly",
+        lambda: {
+            "providers": {
+                "deployment": {
+                    "api": "https://provider.example.test/v1",
+                    "default_model": "gpt-safe",
+                    "models": {
+                        "gpt-safe": {"context_length": 128000},
+                    },
+                },
+            },
+        },
+    )
+
+    routes = policy_from_control_plane_environment().route_descriptors()
+
+    assert len(routes) == 1
+    assert routes[0].provider == "custom:deployment"
+    assert routes[0].model == "gpt-safe"
+    assert routes[0].context_length == 128000
+
+
 def test_control_plane_factory_uses_global_model_vision_capability(monkeypatch):
     monkeypatch.setenv("HERMES_DEPLOYMENT_INFERENCE_PROVIDER", "custom:deployment")
     monkeypatch.setenv("HERMES_DEPLOYMENT_INFERENCE_MODEL", "gpt-safe")
