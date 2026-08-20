@@ -115,6 +115,17 @@ _jobs_lock_state = threading.local()
 ONESHOT_GRACE_SECONDS = 120
 
 
+class CronJobQuotaExceeded(ValueError):
+    """Raised when a store has reached its configured job quota."""
+
+    def __init__(self, *, current: int, limit: int):
+        self.current = current
+        self.limit = limit
+        super().__init__(
+            f"Scheduled task limit reached: at most {limit} tasks are allowed."
+        )
+
+
 def _jobs_lock_file() -> Path:
     """Return the advisory lock path for the current cron store."""
     return current_store().cron_dir / ".jobs.lock"
@@ -897,6 +908,7 @@ def create_job(
     no_agent: bool = False,
     attach_to_session: Optional[bool] = None,
     employee_id: Optional[str] = None,
+    max_jobs: Optional[int] = None,
 ) -> Dict[str, Any]:
     """
     Create a new cron job.
@@ -1065,6 +1077,11 @@ def create_job(
 
     with _jobs_lock():
         jobs = load_jobs()
+        if max_jobs is not None:
+            if max_jobs <= 0:
+                raise ValueError("max_jobs must be greater than zero")
+            if len(jobs) >= max_jobs:
+                raise CronJobQuotaExceeded(current=len(jobs), limit=max_jobs)
         jobs.append(job)
         save_jobs(jobs)
 

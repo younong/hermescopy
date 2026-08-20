@@ -418,6 +418,9 @@ export interface GuiChatTranslations {
     none: string;
     differentSearch: string;
     createHint: string;
+    limitHint: string;
+    limitReached: string;
+    countLabel: string;
     noPrompt: string;
     pauseNamed: string;
     resumeNamed: string;

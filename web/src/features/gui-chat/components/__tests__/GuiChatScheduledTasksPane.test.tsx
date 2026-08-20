@@ -146,6 +146,33 @@ describe("GuiChatScheduledTasksPane", () => {
     expect(container.querySelector('[aria-label="搜索定时任务"]')).not.toBeNull();
   });
 
+  it("shows the task count and disables creation at the ten-task limit", async () => {
+    const quotaJobs = Array.from({ length: 10 }, (_, index) => ({
+      ...jobs[0],
+      id: `task-${index}`,
+      name: `Task ${index}`,
+    }));
+    mocks.getCronJobs.mockResolvedValueOnce(quotaJobs);
+    const container = await renderPane();
+
+    expect(container.textContent).toContain("10 / 10 scheduled tasks");
+    expect(container.textContent).toContain("You have reached the 10-task limit.");
+    expect(buttonNamed(container, "New scheduled task")?.disabled).toBe(true);
+  });
+
+  it("keeps creation enabled below the ten-task limit", async () => {
+    const quotaJobs = Array.from({ length: 9 }, (_, index) => ({
+      ...jobs[0],
+      id: `task-${index}`,
+      name: `Task ${index}`,
+    }));
+    mocks.getCronJobs.mockResolvedValueOnce(quotaJobs);
+    const container = await renderPane();
+
+    expect(container.textContent).toContain("9 / 10 scheduled tasks");
+    expect(buttonNamed(container, "New scheduled task")?.disabled).toBe(false);
+  });
+
 });
 
 async function renderPane() {

@@ -33,6 +33,20 @@ def test_crud_is_explicitly_owner_scoped(owner_store):
         assert list_jobs() == []
 
 
+def test_job_quota_is_atomic_and_owner_scoped(tmp_path):
+    from cron.jobs import CronJobQuotaExceeded, CronStore, create_job, use_store
+
+    first = CronStore(tmp_path / "first")
+    second = CronStore(tmp_path / "second")
+    with use_store(first):
+        for index in range(10):
+            create_job(prompt=f"first-{index}", schedule="every 1h", max_jobs=10)
+        with pytest.raises(CronJobQuotaExceeded):
+            create_job(prompt="first-over", schedule="every 1h", max_jobs=10)
+    with use_store(second):
+        create_job(prompt="second", schedule="every 1h", max_jobs=10)
+
+
 def test_two_owner_stores_remain_isolated(tmp_path):
     from cron.jobs import CronStore, create_job, list_jobs, use_store
 
