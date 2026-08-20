@@ -1078,10 +1078,21 @@ class CollaborationStore:
         brief = _identifier(brief, "task brief")
         creator = self._trusted_profile(creator)
         source_kind = _identifier(source_kind, "source kind")
-        if source_kind not in {"web_direct", "web_group", "feishu_direct"}:
+        if source_kind not in {
+            "web_direct",
+            "web_group",
+            "feishu_direct",
+            "cron",
+        }:
             raise ValueError("collaboration source kind is invalid")
         source_provider = _identifier(source_provider, "source provider")
-        expected_provider = "feishu" if source_kind == "feishu_direct" else "web"
+        expected_provider = (
+            "feishu"
+            if source_kind == "feishu_direct"
+            else "cron"
+            if source_kind == "cron"
+            else "web"
+        )
         if source_provider != expected_provider:
             raise ValueError("collaboration source provider is invalid")
         source_connector_account_id = (
@@ -1106,6 +1117,11 @@ class CollaborationStore:
         if source_kind == "feishu_direct":
             if source_connector_account_id is None or source_binding_id is None or source_session_id is None:
                 raise RuntimeError("trusted Feishu origin identity is incomplete")
+        elif source_kind == "cron":
+            if source_connector_account_id is not None or source_binding_id is not None:
+                raise RuntimeError("cron origin identity is invalid")
+            if source_session_id is not None:
+                raise RuntimeError("cron source session identity is invalid")
         elif source_connector_account_id is not None or source_binding_id is not None:
             raise RuntimeError("web origin identity is invalid")
         source_group_id = (

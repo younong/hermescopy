@@ -15,6 +15,7 @@ export interface CronJobFormState {
   enabled_toolsets: string[];
   workdir: string;
   employee_id: string;
+  target_employee_ids: string[];
 }
 
 /** Split a comma/newline list (or array) into trimmed, non-empty items. */
@@ -66,6 +67,7 @@ export function buildCronJobPayload(form: CronJobFormState): CronJobMutation {
     enabled_toolsets: enabledToolsets.length > 0 ? enabledToolsets : null,
     workdir: optionalText(form.workdir),
     employee_id: optionalText(form.employee_id),
+    target_employee_ids: form.target_employee_ids.length > 0 ? form.target_employee_ids : null,
   };
 }
 
@@ -95,5 +97,8 @@ export function cronJobFormFromJob(job: CronJob): CronJobFormState {
     enabled_toolsets: splitCronList(job.enabled_toolsets),
     workdir: asString(job.workdir),
     employee_id: asString(job.employee_id),
+    target_employee_ids: Array.isArray(job.target_employee_ids)
+      ? job.target_employee_ids.filter(Boolean)
+      : [],
   };
 }

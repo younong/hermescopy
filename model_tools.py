@@ -995,6 +995,7 @@ def handle_function_call(
     enabled_toolsets: Optional[List[str]] = None,
     disabled_toolsets: Optional[List[str]] = None,
     employee_policy: Optional[Dict[str, Any]] = None,
+    collaboration_context: Any = None,
 ) -> str:
     """
     Main function call dispatcher that routes calls to the tool registry.
@@ -1099,6 +1100,7 @@ def handle_function_call(
                 enabled_toolsets=enabled_toolsets,
                 disabled_toolsets=disabled_toolsets,
                 employee_policy=employee_policy,
+                collaboration_context=collaboration_context,
             )
 
     _tool_original_args = dict(function_args)
@@ -1266,6 +1268,7 @@ def handle_function_call(
                         task_id=task_id,
                         session_id=session_id,
                         enabled_tools=sandbox_enabled,
+                        collaboration_context=collaboration_context,
                     )
             else:
                 def _dispatch(next_args: Dict[str, Any]) -> Any:
@@ -1274,6 +1277,7 @@ def handle_function_call(
                         task_id=task_id,
                         session_id=session_id,
                         user_task=user_task,
+                        collaboration_context=collaboration_context,
                     )
             from hermes_cli.middleware import run_tool_execution_middleware
 
