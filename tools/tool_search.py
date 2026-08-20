@@ -1,8 +1,8 @@
 """Request-local tool schema selection and progressive disclosure.
 
 The agent retains its complete, policy-admitted executable catalog. For each
-logical model request this module deterministically pre-exposes the schemas most
-relevant to the current turn and places every other registered capability behind
+logical model request this module pre-exposes a small stable set of filesystem
+and terminal tools and places every other registered capability behind
 ``tool_search``, ``tool_describe``, and ``tool_call``. Non-registry injected tools
 and mandatory worker-lifecycle tools remain directly visible.
 
@@ -14,6 +14,7 @@ truncation remain authoritative.
 
 from __future__ import annotations
 
+import copy
 import json
 import logging
 import math
@@ -33,12 +34,19 @@ TOOL_CALL_NAME = "tool_call"
 
 BRIDGE_TOOL_NAMES = frozenset({TOOL_SEARCH_NAME, TOOL_DESCRIBE_NAME, TOOL_CALL_NAME})
 
-# When estimating tokens from char count without a real tokenizer, this is
-# the cheap rule of thumb that's stable across providers. Roughly 4 chars
-# per token for English+JSON. Underestimating leads to false negatives
-# (tool search not activated when it should); overestimating leads to false
-# positives (activated when not needed). 4.0 errs slightly toward
-# underestimating, which is the safer default.
+# These are the only concrete tools exposed on the initial model request.
+# Keep the set small and stable so the request prefix remains cache-friendly;
+# other policy-admitted capabilities stay available through the bridge tools.
+INITIAL_VISIBLE_TOOL_NAMES = frozenset({
+    "read_file",
+    "write_file",
+    "patch",
+    "terminal",
+    "search_files",
+})
+
+# Tool schemas are still estimated for observability and tests. Selection no
+# longer depends on a token threshold: the fixed initial set is the policy.
 CHARS_PER_TOKEN = 4.0
 
 
@@ -477,54 +485,93 @@ class RequestSelectionResult:
         return self.hidden_count > 0
 
 
+def _compress_schema_text(value: Any) -> Any:
+    """Trim redundant prose while preserving schema semantics."""
+    if isinstance(value, dict):
+        result = {key: _compress_schema_text(item) for key, item in value.items()}
+        description = result.get("description")
+        if isinstance(description, str):
+            description = re.sub(r"\s+", " ", description).strip()
+            description = re.sub(r"\b(REQUIRED|IMPORTANT|NOTE):?\s*", "", description, flags=re.I)
+            description = re.sub(r"\b(?:e\.g\.|for example|such as)\b[^.;]{0,180}[.;]?", "", description, flags=re.I)
+            result["description"] = description[:800]
+        # Enum values are part of the callable contract; never drop values.
+        return result
+    if isinstance(value, list):
+        return [_compress_schema_text(item) for item in value]
+    return value
+
+
+def compress_tool_definitions(tool_defs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Return provider-facing schemas with bounded, normalized descriptions."""
+    compressed = copy.deepcopy(tool_defs)
+    for tool in compressed:
+        function = tool.get("function") if isinstance(tool, dict) else None
+        if isinstance(function, dict):
+            description = function.get("description", "")
+            if isinstance(description, str):
+                description = re.sub(r"\s+", " ", description).strip()
+                description = re.sub(r"\b(REQUIRED|IMPORTANT|NOTE):?\s*", "", description, flags=re.I)
+                description = re.sub(r"\b(?:e\.g\.|for example|such as)\b[^.;]{0,180}[.;]?", "", description, flags=re.I)
+                function["description"] = description[:800]
+            else:
+                function["description"] = description
+            function["parameters"] = _compress_schema_text(function.get("parameters", {}))
+    return compressed
+
+
 def select_request_tool_defs(
     tool_defs: List[Dict[str, Any]],
     *,
-    query: str,
+    query: str = "",
     context_length: Optional[int] = None,
     config: Optional[ToolSearchConfig] = None,
 ) -> RequestSelectionResult:
-    """Select request-local schemas while preserving full-catalog order."""
+    """Select a stable initial schema set while preserving catalog scope.
+
+    ``enabled: off`` remains the emergency full-catalog rollback. All other
+    modes use the fixed initial set; the legacy query and context arguments are
+    accepted for configuration compatibility but do not change exposure.
+    """
     if config is None:
         config = load_config()
     incoming = [td for td in tool_defs
                 if (td.get("function") or {}).get("name") not in BRIDGE_TOOL_NAMES]
-    _, candidates = classify_tools(incoming)
-    candidate_names = {
-        (candidate.get("function") or {}).get("name", "")
-        for candidate in candidates
-    }
-    candidate_tokens = estimate_tokens_from_schemas(candidates)
-    if not should_activate(config, candidate_tokens, context_length):
+    if config.enabled == "off":
         return RequestSelectionResult(incoming)
 
-    catalog = build_catalog(candidates)
-    relevant = {
-        entry.name
-        for entry in search_catalog(
-            catalog, query, limit=config.search_default_limit
-        )
-    }
+    deferred_names = _deferred_tool_names(incoming)
     visible: List[Dict[str, Any]] = []
     hidden = 0
     for td in incoming:
         name = (td.get("function") or {}).get("name", "")
         if (
-            name not in candidate_names
+            name not in deferred_names
+            or name in INITIAL_VISIBLE_TOOL_NAMES
             or name in _MANDATORY_VISIBLE_TOOL_NAMES
-            or name in relevant
         ):
             visible.append(td)
         else:
             hidden += 1
-    if not hidden:
-        return RequestSelectionResult(incoming)
+    visible = compress_tool_definitions(visible)
+    # Keep the bridge schemas present even when this scoped session has no
+    # deferred capability. This makes the initial request shape stable and
+    # lets the same model-facing protocol work for every session.
     visible.extend(bridge_tool_schemas(hidden))
     logger.info(
-        "tool_search selected %d/%d concrete schemas; %d hidden",
+        "tool_search selected fixed initial schemas; %d/%d concrete schemas visible, %d hidden",
         len(visible) - len(BRIDGE_TOOL_NAMES), len(incoming), hidden,
     )
     return RequestSelectionResult(visible, hidden_count=hidden)
+
+
+def _deferred_tool_names(tool_defs: List[Dict[str, Any]]) -> frozenset[str]:
+    """Return registered tools eligible for the deferred session catalog."""
+    _, candidates = classify_tools(tool_defs)
+    return frozenset(
+        (td.get("function") or {}).get("name", "")
+        for td in candidates
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -532,18 +579,18 @@ def select_request_tool_defs(
 # ---------------------------------------------------------------------------
 
 
-def bridge_tool_schemas(deferred_count: int) -> List[Dict[str, Any]]:
-    """Build the bridge tool schemas to inject in place of deferred tools.
+def bridge_tool_schemas(deferred_count: Optional[int] = None) -> List[Dict[str, Any]]:
+    """Build stable bridge schemas for the deferred session catalog.
 
-    The schemas are intentionally short — every byte added here is a byte
-    the user pays on every turn. Descriptions are tuned to be unambiguous
-    about the call sequence the model should follow.
+    ``deferred_count`` is retained for callers compiled against the earlier
+    API, but deliberately does not enter descriptions: dynamic descriptions
+    would change the prompt prefix and reduce cache reuse.
     """
     desc_search = (
-        f"Search {deferred_count} additional tools that are loaded on demand. "
-        "Returns up to ``limit`` matches with name and description. Follow "
-        f"with `{TOOL_DESCRIBE_NAME}` to load a tool's full parameter schema, "
-        f"then `{TOOL_CALL_NAME}` to invoke it. Tools listed at the top of this "
+        "Search additional tools that are loaded on demand. Returns up to "
+        "``limit`` matches with name and description. Follow with "
+        f"`{TOOL_DESCRIBE_NAME}` to load a tool's full parameter schema, then "
+        f"`{TOOL_CALL_NAME}` to invoke it. Tools listed at the top of this "
         "system prompt are already available and do not need to be searched."
     )
     desc_describe = (
@@ -750,6 +797,7 @@ __all__ = [
     "TOOL_DESCRIBE_NAME",
     "TOOL_CALL_NAME",
     "BRIDGE_TOOL_NAMES",
+    "INITIAL_VISIBLE_TOOL_NAMES",
     "ToolSearchConfig",
     "CatalogEntry",
     "RequestSelectionResult",
@@ -757,6 +805,7 @@ __all__ = [
     "is_deferrable_tool_name",
     "classify_tools",
     "estimate_tokens_from_schemas",
+    "compress_tool_definitions",
     "should_activate",
     "build_catalog",
     "search_catalog",

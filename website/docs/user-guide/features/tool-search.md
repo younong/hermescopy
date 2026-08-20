@@ -10,18 +10,16 @@ session, their JSON schemas can consume a substantial fraction of the
 context window on every turn — even when only a few of them are relevant
 to what the user actually asked for.
 
-**Tool Search** is Hermes' opt-in progressive-disclosure layer for that
-problem. When activated, MCP and plugin tools are replaced in the
-model-visible tools array by three bridge tools, and the model loads each
-specific tool's schema on demand.
+**Tool Search** is Hermes' progressive-disclosure layer for that problem. On
+each request, Hermes exposes a small fixed initial set and three bridge tools;
+other registered capabilities remain available through the session-scoped
+catalog and are loaded on demand.
 
-:::info Built-in Hermes tools never defer
-The tools that make up Hermes' core capability set (`terminal`,
-`read_file`, `write_file`, `patch`, `search_files`, `todo`, `memory`,
-`browser_*`, `web_search`, `web_extract`, `clarify`, `execute_code`,
-`delegate_task`, `session_search`, and the rest of
-`_HERMES_CORE_TOOLS`) are *always* loaded directly. Only MCP tools and
-non-core plugin tools are eligible for deferral.
+:::info Fixed initial tools
+The initial request exposes `read_file`, `write_file`, `patch`, `terminal`, and
+`search_files` when those tools are available. Other registered capabilities
+are eligible for deferral; non-registry injected tools and mandatory
+worker-lifecycle tools remain directly visible.
 :::
 
 ## How it works
@@ -55,35 +53,26 @@ see the underlying tool, not the bridge.
 
 ## When does it activate?
 
-By default Tool Search runs in `auto` mode: it activates only when the
-deferrable tool schemas would consume at least 10% of the active model's
-context window. Below that, the tools-array assembly is a pure
-pass-through and you pay no overhead.
-
-This decision is re-evaluated every time the tools array is built, so:
-
-- A session with just a few MCP tools and a long context model never
-  activates Tool Search.
-- A session with many MCP servers attached (15+ tools typically) starts
-  activating it.
-- Removing MCP servers mid-session correctly returns to direct exposure
-  on the next assembly.
+The fixed initial set is used on every request by default. The five core
+filesystem/terminal tools remain directly visible; other registered
+capabilities are exposed through the bridge tools. Use `enabled: off` as the
+full-catalog rollback when a model cannot reliably use progressive disclosure.
 
 ## Configuration
 
 ```yaml
 tools:
   tool_search:
-    enabled: auto       # auto (default), on, or off
-    threshold_pct: 10   # percentage of context — only used in auto mode
+    enabled: on        # fixed initial set by default; off restores full catalog
+    threshold_pct: 10  # retained for compatibility; no longer controls exposure
     search_default_limit: 5
     max_search_limit: 20
 ```
 
 | Key | Default | Meaning |
 | --- | --- | --- |
-| `enabled` | `auto` | `auto` activates above threshold; `on` always activates if there's at least one deferrable tool; `off` disables entirely. |
-| `threshold_pct` | `10` | Percentage of context length at which `auto` mode kicks in. Range 0–100. |
+| `enabled` | `on` | `on` uses the fixed initial set; `off` advertises the complete catalog as a rollback. Legacy `auto` is accepted and uses the fixed initial set. |
+| `threshold_pct` | `10` | Retained for configuration compatibility; it no longer controls request-local exposure. |
 | `search_default_limit` | `5` | Hits returned when the model calls `tool_search` without a `limit`. |
 | `max_search_limit` | `20` | Hard upper bound the model can request via `limit`. Range 1–50. |
 
@@ -91,7 +80,7 @@ You can also flip the legacy boolean shape:
 
 ```yaml
 tools:
-  tool_search: true   # equivalent to {enabled: auto}
+  tool_search: true   # equivalent to {enabled: on}
 ```
 
 ## When NOT to use it
@@ -102,8 +91,9 @@ describe → call) for the savings on the deferred schemas. It's a clear
 win when you have many tools and use few per turn; it's overhead when
 you have few tools total.
 
-The `auto` default handles this for you. If you set `enabled: on`
-unconditionally, expect a slight per-turn cost on small toolsets.
+The fixed initial set is intentional even for small toolsets, because it keeps
+the provider payload shape predictable. If the model cannot use progressive
+disclosure reliably, set `enabled: off` to restore direct exposure.
 
 ## Trade-offs that don't go away
 
@@ -124,9 +114,8 @@ to any progressive-disclosure design, not specific to this implementation:
   vs. without tool search) show the upside but also that ~26 points of
   accuracy is still retrieval failure.
 - **Toolset edits invalidate cache.** Adding or removing a tool mid-
-  session changes the bridge tools' descriptions (which include the
-  count of deferred tools) and the catalog, so the prompt cache is
-  invalidated. This is the same trade-off as any toolset edit.
+  session changes the catalog and may change the directly visible tool set, so the prompt
+  cache is invalidated. This is the same trade-off as any toolset edit.
 
 ## Implementation details
 

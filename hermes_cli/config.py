@@ -2579,15 +2579,13 @@ DEFAULT_CONFIG = {
     # lifecycle and non-registry injected tools stay directly visible.
     "tools": {
         "tool_search": {
-            # "auto" (default) — select request-local schemas only when the
-            #   complete registered schema surface exceeds ``threshold_pct`` of
-            #   the active model's context length.
-            # "on"  — select request-local schemas whenever any registered
-            #   capability can be hidden.
-            # "off" — advertise the complete executable catalog.
-            "enabled": "auto",
-            # Percentage of context length at which "auto" mode kicks in.
-            # 10 matches the Claude Code default. Range 0..100.
+            # "on" (default) — expose only the fixed initial tool set and
+            #   load other capabilities through the bridge tools.
+            # "off" — advertise the complete executable catalog (rollback).
+            # Legacy "auto" is accepted and uses the fixed initial set too.
+            "enabled": "on",
+            # Retained for config-file compatibility; no longer controls
+            # request-local exposure.
             "threshold_pct": 10,
             # When the model calls tool_search without a ``limit`` argument,
             # how many hits to return. Range 1..max_search_limit.

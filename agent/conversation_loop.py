@@ -4540,9 +4540,19 @@ def run_conversation(
             # Check for tool calls
             if assistant_message.tool_calls:
                 request_tool_names = set(agent.valid_tool_names)
-                if prepared_request.dispatch_metadata.get("tool_search_active"):
-                    from tools.tool_search import BRIDGE_TOOL_NAMES
-
+                # The fixed request-local selector keeps bridge schemas in the
+                # stable initial payload even when this session has no deferred
+                # tools. Admit them based on the actual advertised payload, not
+                # only hidden_count, so a model can always use the same protocol.
+                from tools.tool_search import BRIDGE_TOOL_NAMES
+                advertised_tools = prepared_request.payload.get("tools")
+                if isinstance(advertised_tools, dict):
+                    advertised_tools = advertised_tools.get("tools")
+                if any(
+                    isinstance(tool, dict)
+                    and (tool.get("function") or {}).get("name") in BRIDGE_TOOL_NAMES
+                    for tool in (advertised_tools or [])
+                ):
                     request_tool_names.update(BRIDGE_TOOL_NAMES)
                 if not agent.quiet_mode:
                     agent._vprint(f"{agent.log_prefix}🔧 Processing {len(assistant_message.tool_calls)} tool call(s)...")

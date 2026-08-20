@@ -232,7 +232,7 @@ class TestRetrieval:
 
 
 class TestRequestSelection:
-    def test_selection_preserves_catalog_order_and_keeps_injected_tools(self):
+    def test_selection_exposes_fixed_core_and_keeps_injected_tools(self):
         from tools.tool_search import ToolSearchConfig, select_request_tool_defs
 
         injected = _td("runtime_memory", "Injected memory provider")
@@ -241,39 +241,51 @@ class TestRequestSelection:
             injected,
             _td("read_file", "Read project files"),
             _td("terminal", "Run shell commands"),
+            _td("memory", "Persistent memory"),
         ]
         result = select_request_tool_defs(
             defs,
-            query="read the project source",
+            query="unrelated query must not affect exposure",
             context_length=200_000,
             config=ToolSearchConfig.from_raw({"enabled": "on", "search_default_limit": 1}),
         )
         names = [tool["function"]["name"] for tool in result.tool_defs]
-        assert names[:2] == ["runtime_memory", "read_file"]
+        assert names[:4] == ["write_file", "runtime_memory", "read_file", "terminal"]
         assert names[-3:] == ["tool_search", "tool_describe", "tool_call"]
-        assert defs[0]["function"]["name"] == "write_file"
+        assert "memory" not in names
+        assert result.hidden_count == 1
 
-    def test_selection_keeps_non_deferrable_tools_and_counts_hidden(self):
+    def test_compression_preserves_schema_contract(self):
+        from tools.tool_search import compress_tool_definitions
+
+        defs = [_td(
+            "example",
+            "IMPORTANT: Use this tool, for example when needed.",
+            {"mode": {
+                "type": "string",
+                "enum": [f"value_{i}" for i in range(12)],
+                "description": "NOTE: choose a value",
+            }},
+        )]
+        original = json.loads(json.dumps(defs))
+        compressed = compress_tool_definitions(defs)
+        assert compressed[0]["function"]["parameters"]["properties"]["mode"]["enum"] == original[0]["function"]["parameters"]["properties"]["mode"]["enum"]
+        assert "IMPORTANT" not in compressed[0]["function"]["description"]
+        assert "NOTE" not in compressed[0]["function"]["parameters"]["properties"]["mode"]["description"]
+        assert defs == original
+
+    def test_off_preserves_full_catalog_as_rollback(self):
         from tools.tool_search import ToolSearchConfig, select_request_tool_defs
 
-        defs = [
-            _td("write_file", "Write project files"),
-            _td("runtime_memory", "Injected memory provider"),
-            _td("read_file", "Read project files"),
-            _td("terminal", "Run shell commands"),
-        ]
+        defs = [_td("read_file", "Read"), _td("memory", "Memory")]
         result = select_request_tool_defs(
             defs,
-            query="read the project source",
-            context_length=200_000,
-            config=ToolSearchConfig.from_raw({"enabled": "on", "search_default_limit": 1}),
+            config=ToolSearchConfig.from_raw({"enabled": "off"}),
         )
-
-        names = [tool["function"]["name"] for tool in result.tool_defs]
-        assert "runtime_memory" in names
-        assert "read_file" in names
-        assert result.hidden_count == 2
-        assert result.activated is True
+        assert [tool["function"]["name"] for tool in result.tool_defs] == [
+            "read_file", "memory"
+        ]
+        assert result.hidden_count == 0
 
     def test_selection_injects_exactly_one_bridge_schema_each(self):
         from tools.tool_search import ToolSearchConfig, select_request_tool_defs
@@ -282,6 +294,7 @@ class TestRequestSelection:
             _td("write_file", "Write project files"),
             _td("read_file", "Read project files"),
             _td("terminal", "Run shell commands"),
+            _td("memory", "Persistent memory"),
         ]
         result = select_request_tool_defs(
             defs,
@@ -467,8 +480,11 @@ class TestRegression_OpenClawCron84141:
             config=ToolSearchConfig.from_raw({"enabled": "on", "search_default_limit": 1}),
         )
         names = [tool["function"]["name"] for tool in result.tool_defs]
-        assert names[0] == "terminal"
-        assert names[-3:] == ["tool_search", "tool_describe", "tool_call"]
+        assert names == [
+            "terminal", "read_file", "write_file",
+            "tool_search", "tool_describe", "tool_call",
+        ]
+        assert result.hidden_count == 0
 
     def test_unwrap_accepts_hidden_core_tool(self):
         from tools.tool_search import resolve_underlying_call
