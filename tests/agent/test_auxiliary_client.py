@@ -183,6 +183,68 @@ class TestResolveTaskProviderModel:
         assert api_key is None
         assert api_mode is None
 
+    def test_deployment_compression_model_uses_relay_route(self, monkeypatch):
+        from hermes_cli.deployment_inference import DeploymentInferenceRouteDescriptor
+
+        monkeypatch.setenv(
+            "HERMES_DEPLOYMENT_INFERENCE_COMPRESSION_MODEL", "gpt-5.6-luna"
+        )
+        monkeypatch.setenv("HERMES_OWNER_KEY", "ok1_test")
+        monkeypatch.setenv("HERMES_DEPLOYMENT_INFERENCE_PROVIDER", "custom:deployment")
+        monkeypatch.setenv("HERMES_DEPLOYMENT_INFERENCE_MODEL", "gpt-safe")
+        monkeypatch.setenv("HERMES_DEPLOYMENT_INFERENCE_API_MODE", "chat_completions")
+        monkeypatch.setenv("HERMES_DEPLOYMENT_INFERENCE_POLICY_ID", "test-deployment-v1")
+        monkeypatch.setenv(
+            "HERMES_DEPLOYMENT_INFERENCE_ALLOWED_MODELS", "gpt-safe,gpt-5.6-luna"
+        )
+        monkeypatch.setenv(
+            "HERMES_DEPLOYMENT_INFERENCE_RELAY_BASE_URL",
+            "http://127.0.0.1:39123/v1",
+        )
+        monkeypatch.setattr(
+            "hermes_cli.owner_runtime.is_owner_worker_env", lambda: True
+        )
+        monkeypatch.setattr(
+            "hermes_cli.deployment_inference.route_descriptors_from_control_plane",
+            lambda: (DeploymentInferenceRouteDescriptor(
+                provider="custom:codex",
+                model="gpt-5.6-luna",
+                api_mode="chat_completions",
+            ),),
+        )
+        monkeypatch.setattr(
+            "agent.auxiliary_client._get_auxiliary_task_config", lambda _task: {}
+        )
+
+        provider, model, base_url, api_key, api_mode = (
+            _resolve_task_provider_model("compression")
+        )
+
+        assert provider == "custom"
+        assert model == "gpt-5.6-luna"
+        assert base_url == "http://127.0.0.1:39123/v1"
+        assert api_key == "deployment-inference-relay"
+        assert api_mode == "chat_completions"
+
+    def test_explicit_compression_model_matching_deployment_default_stays_explicit(
+        self, monkeypatch
+    ):
+        monkeypatch.setenv(
+            "HERMES_DEPLOYMENT_INFERENCE_COMPRESSION_MODEL", "same-model"
+        )
+        with patch(
+            "agent.auxiliary_client._get_auxiliary_task_config",
+            return_value={"provider": "auto", "model": ""},
+        ):
+            provider, model, base_url, api_key, api_mode = _resolve_task_provider_model(
+                "compression", model="same-model"
+            )
+        assert provider == "auto"
+        assert model == "same-model"
+        assert base_url is None
+        assert api_key is None
+        assert api_mode is None
+
     def test_explicit_compression_config_wins_over_deployment_default(
         self, monkeypatch
     ):

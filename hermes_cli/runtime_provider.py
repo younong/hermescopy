@@ -1545,6 +1545,7 @@ def resolve_deployment_inference_runtime(
     explicit_base_url: Optional[str] = None,
     target_model: Optional[str] = None,
     route_descriptors: tuple[Any, ...] | None = None,
+    allow_deployment_task: str | None = None,
 ) -> Dict[str, Any] | None:
     """Return the safe relay runtime when selection matches deployment policy.
 
@@ -1568,7 +1569,7 @@ def resolve_deployment_inference_runtime(
     selected_base_url = str(explicit_base_url or "").strip()
     if selected_base_url:
         return None
-    if raw_owner and route_descriptors is None:
+    if raw_owner and route_descriptors is None and allow_deployment_task != "compression":
         return None
     relay_base_url = os.environ.get("HERMES_DEPLOYMENT_INFERENCE_RELAY_BASE_URL", "").strip()
     if not relay_base_url:
