@@ -404,6 +404,17 @@ class TestSignedClaims:
             verify_ticket(ticket, audience=browser_ws_audience("/api/pub"))
 
     def test_browser_ws_audience_accepts_allowlisted_plugin_route(self):
+        from hermes_cli.dashboard_auth.api_availability import register_plugin_api_routes
+
+        class _WebSocketRoute:
+            path = "/events"
+
+        register_plugin_api_routes(
+            "kanban",
+            api_target="control-plane",
+            routes=[_WebSocketRoute()],
+            prefix="/api/plugins/kanban",
+        )
         audience = browser_ws_audience("/api/plugins/kanban/events")
         assert audience == "browser-ws:/api/plugins/kanban/events"
         ticket = mint_ticket(
@@ -421,9 +432,17 @@ class TestSignedClaims:
             browser_ws_audience("/api/plugins/not-kanban/events")
 
     def test_mint_ticket_accepts_allowlisted_plugin_audience(self):
-        # Minting must succeed for plugin audiences; the previous fail-closed
-        # behavior rejected every browser-ws:/api/plugins/* ticket with a 400
-        # because mint_ticket only knew the three hardcoded public audiences.
+        from hermes_cli.dashboard_auth.api_availability import register_plugin_api_routes
+
+        class _WebSocketRoute:
+            path = "/events"
+
+        register_plugin_api_routes(
+            "kanban",
+            api_target="control-plane",
+            routes=[_WebSocketRoute()],
+            prefix="/api/plugins/kanban",
+        )
         audience = "browser-ws:/api/plugins/kanban/events"
         ticket = mint_ticket(
             user_id="u1",

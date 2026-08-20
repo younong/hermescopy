@@ -9,8 +9,8 @@ gap for headless/VPS users. These tests pin:
   as the agent's ``skill_manage`` tool (frontmatter validation enforced).
 - PUT /api/skills/content rewrites an existing SKILL.md (404 on unknown).
 - DELETE /api/skills removes an existing skill through the guarded delete path.
-- POST /api/cron/jobs accepts ``skills`` and persists it on the job;
-  PUT /api/cron/jobs/{id} can update the list.
+- POST /api/plugins/scheduled-tasks/jobs accepts ``skills`` and persists it on the job;
+  PUT /api/plugins/scheduled-tasks/jobs/{id} can update the list.
 """
 import pytest
 
@@ -36,7 +36,7 @@ def _write_skill(skills_dir, name):
 def isolated_profiles(tmp_path, monkeypatch, _isolate_hermes_home):
     """Isolated default home + one named profile, each with its own skills."""
     from hermes_constants import get_hermes_home
-    from hermes_cli import profiles
+    from hermes_cli import cron_dashboard
 
     default_home = get_hermes_home()
     profiles_root = default_home / "profiles"
@@ -48,8 +48,7 @@ def isolated_profiles(tmp_path, monkeypatch, _isolate_hermes_home):
     _write_skill(default_home / "skills", "dashboard-skill")
     _write_skill(worker_home / "skills", "worker-skill")
 
-    monkeypatch.setattr(profiles, "_get_default_hermes_home", lambda: default_home)
-    monkeypatch.setattr(profiles, "_get_profiles_root", lambda: profiles_root)
+    monkeypatch.setattr(cron_dashboard, "get_default_hermes_root", lambda: default_home)
     return {"default": default_home, "worker_alpha": worker_home}
 
 
@@ -260,7 +259,7 @@ class TestEditorEndpointsAuth:
 class TestCronJobSkills:
     def test_create_job_with_skills(self, client, isolated_profiles):
         resp = client.post(
-            "/api/cron/jobs",
+            "/api/plugins/scheduled-tasks/jobs",
             json={
                 "prompt": "do work",
                 "schedule": "every 1h",
@@ -273,19 +272,19 @@ class TestCronJobSkills:
         assert job["skills"] == ["dashboard-skill"]
 
         # Round-trip: the list endpoint carries the skills field too.
-        listed = client.get("/api/cron/jobs", params={"profile": "default"}).json()
+        listed = client.get("/api/plugins/scheduled-tasks/jobs", params={"profile": "default"}).json()
         match = [j for j in listed if j["id"] == job["id"]]
         assert match and match[0]["skills"] == ["dashboard-skill"]
 
     def test_update_job_skills(self, client, isolated_profiles):
         job = client.post(
-            "/api/cron/jobs",
+            "/api/plugins/scheduled-tasks/jobs",
             json={"prompt": "do work", "schedule": "every 1h"},
         ).json()
         assert job.get("skills") in (None, [])
 
         resp = client.put(
-            f"/api/cron/jobs/{job['id']}",
+            f"/api/plugins/scheduled-tasks/jobs/{job['id']}",
             json={"updates": {"skills": ["dashboard-skill", "worker-skill"]}},
             params={"profile": "default"},
         )
@@ -294,7 +293,7 @@ class TestCronJobSkills:
 
         # Clearing works too.
         resp = client.put(
-            f"/api/cron/jobs/{job['id']}",
+            f"/api/plugins/scheduled-tasks/jobs/{job['id']}",
             json={"updates": {"skills": []}},
             params={"profile": "default"},
         )

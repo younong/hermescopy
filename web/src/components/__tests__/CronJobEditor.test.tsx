@@ -9,7 +9,7 @@ import {
 } from "@/lib/cron-job-editor";
 
 describe("CronJobEditor helpers", () => {
-  it("round-trips the CronPage job shape through the shared schedule editor", () => {
+  it("round-trips the scheduled task page job shape through the shared schedule editor", () => {
     const job: CronJob = {
       id: "weekly",
       name: "Weekly summary",
@@ -34,7 +34,7 @@ describe("CronJobEditor helpers", () => {
     });
   });
 
-  it("keeps the existing interval default for new CronPage and Chat GUI forms", () => {
+  it("keeps the existing interval default for new scheduled task page and Chat GUI forms", () => {
     const form = emptyCronJobForm();
     expect(form.scheduleState.mode).toBe("interval");
     expect(buildCronJobPayloadFromEditor(form).schedule).toBe("every 30m");

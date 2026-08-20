@@ -38,6 +38,7 @@ from unittest.mock import patch
 import pytest
 
 from hermes_cli import web_server
+from hermes_cli.dashboard_plugins import safe_plugin_relpath
 
 
 @pytest.fixture(autouse=True)
@@ -135,13 +136,13 @@ class TestApiPathSanitizer:
     def test_simple_relative_path_accepted(self, tmp_path):
         d = self._dashboard_dir(tmp_path)
         (d / "api.py").write_text("router = None\n")
-        assert web_server._safe_plugin_api_relpath("api.py", dashboard_dir=d) == "api.py"
+        assert safe_plugin_relpath("api.py", dashboard_dir=d) == "api.py"
 
     def test_nested_relative_path_accepted(self, tmp_path):
         d = self._dashboard_dir(tmp_path)
         (d / "backend").mkdir()
         (d / "backend" / "routes.py").write_text("router = None\n")
-        out = web_server._safe_plugin_api_relpath(
+        out = safe_plugin_relpath(
             "backend/routes.py", dashboard_dir=d
         )
         assert out == "backend/routes.py"
@@ -154,7 +155,7 @@ class TestApiPathSanitizer:
     ])
     def test_absolute_path_rejected(self, tmp_path, payload):
         d = self._dashboard_dir(tmp_path)
-        assert web_server._safe_plugin_api_relpath(payload, dashboard_dir=d) is None
+        assert safe_plugin_relpath(payload, dashboard_dir=d) is None
 
     @pytest.mark.parametrize("payload", [
         "../../../etc/passwd",
@@ -164,12 +165,12 @@ class TestApiPathSanitizer:
     ])
     def test_traversal_rejected(self, tmp_path, payload):
         d = self._dashboard_dir(tmp_path)
-        assert web_server._safe_plugin_api_relpath(payload, dashboard_dir=d) is None
+        assert safe_plugin_relpath(payload, dashboard_dir=d) is None
 
     @pytest.mark.parametrize("payload", [None, "", "   ", 42, [], {}])
     def test_non_string_or_empty_rejected(self, tmp_path, payload):
         d = self._dashboard_dir(tmp_path)
-        assert web_server._safe_plugin_api_relpath(payload, dashboard_dir=d) is None
+        assert safe_plugin_relpath(payload, dashboard_dir=d) is None
 
 
 # ---------------------------------------------------------------------------

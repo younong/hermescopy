@@ -113,7 +113,9 @@ export function GuiChatShell() {
   const filesOpen = workspacePath === "/chat/files";
   const kanbanOpen = workspacePath === "/chat/kanban";
   const skillsOpen = workspacePath === "/chat/skills";
-  const scheduledTasksOpen = workspacePath === "/chat/scheduled-tasks";
+  const [scheduledTasksAvailable, setScheduledTasksAvailable] = useState(false);
+  const scheduledTasksOpen =
+    scheduledTasksAvailable && workspacePath === "/chat/scheduled-tasks";
   const contactsOpen = workspacePath === "/chat/contacts" || employeeId !== null;
   const selectedEmployeeId = employeeId;
   const modelsOpen = workspacePath === "/chat/models";
@@ -142,6 +144,32 @@ export function GuiChatShell() {
   const switchTraceByGenerationRef = useRef(new Map<number, GuiChatLatencyTrace>());
   const [resumeNotice, setResumeNotice] = useState<string | null>(null);
   const [sendScrollNonce, setSendScrollNonce] = useState(0);
+
+  useEffect(() => {
+    let active = true;
+    api
+      .getPlugins()
+      .then((plugins) => {
+        if (!active) return;
+        const available = plugins.some(
+          (plugin) => plugin.name === "scheduled-tasks",
+        );
+        setScheduledTasksAvailable(available);
+        if (!available && workspacePath === "/chat/scheduled-tasks") {
+          navigate("/chat", { replace: true });
+        }
+      })
+      .catch(() => {
+        if (!active) return;
+        setScheduledTasksAvailable(false);
+        if (workspacePath === "/chat/scheduled-tasks") {
+          navigate("/chat", { replace: true });
+        }
+      });
+    return () => {
+      active = false;
+    };
+  }, [navigate, workspacePath]);
   const [selectedChatRegistration, setSelectedChatRegistration] =
     useState<GuiChatModelRegistration | null>(null);
   const [pendingModelConfirmation, setPendingModelConfirmation] = useState<{
@@ -1099,18 +1127,20 @@ export function GuiChatShell() {
           <Sparkles />
           <span>{copy.shell.skills}</span>
         </button>
-        <button
-          aria-current={scheduledTasksOpen ? "page" : undefined}
-          className="gui-chat-nav-item"
-          onClick={() => {
-            closeMobilePanel();
-            navigate("/chat/scheduled-tasks");
-          }}
-          type="button"
-        >
-          <CalendarClock />
-          <span>{copy.shell.scheduledTasks}</span>
-        </button>
+        {scheduledTasksAvailable ? (
+          <button
+            aria-current={scheduledTasksOpen ? "page" : undefined}
+            className="gui-chat-nav-item"
+            onClick={() => {
+              closeMobilePanel();
+              navigate("/chat/scheduled-tasks");
+            }}
+            type="button"
+          >
+            <CalendarClock />
+            <span>{copy.shell.scheduledTasks}</span>
+          </button>
+        ) : null}
         <button
           aria-current={modelsOpen ? "page" : undefined}
           aria-label={copy.shell.manageModels}

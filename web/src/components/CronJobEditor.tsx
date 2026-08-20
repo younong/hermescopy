@@ -1,162 +1,220 @@
-import { Input } from "@nous-research/ui/ui/components/input";
-import { Label } from "@nous-research/ui/ui/components/label";
-import { Select, SelectOption } from "@nous-research/ui/ui/components/select";
 import { NameCheckboxPicker } from "@/components/NameCheckboxPicker";
 import { ScheduleBuilder } from "@/components/ScheduleBuilder";
-import { useI18n } from "@/i18n";
-import type {
-  CronDeliveryTarget,
-  ModelOptionsResponse,
-  SkillInfo,
-  ToolsetInfo,
+import { guiChatTranslations, useI18n } from "@/i18n";
+import {
+  employeeDisplayName,
+  type Employee,
+  type ModelRegistration,
+  type SkillInfo,
+  type ToolsetInfo,
 } from "@/lib/api";
-import type { CronJobEditorState } from "@/lib/cron-job-editor";
+import type { CronJobEditorMode, CronJobEditorState } from "@/lib/cron-job-editor";
 
 export interface CronJobFormResources {
   availableSkills: SkillInfo[];
   availableToolsets: ToolsetInfo[];
-  modelOptions: ModelOptionsResponse | null;
-  deliveryTargets: CronDeliveryTarget[];
+  modelRegistrations: ModelRegistration[];
+  employees: Employee[];
 }
 
-function selectOptions(
-  current: string,
-  options: Array<{ value: string; label: string }>,
-) {
-  const known = new Set(options.map((option) => option.value));
-  return [
-    ...options.map((option) => (
-      <SelectOption key={option.value} value={option.value}>
-        {option.label}
-      </SelectOption>
-    )),
-    ...(current && !known.has(current)
-      ? [
-          <SelectOption key={current} value={current}>
-            {current}
-          </SelectOption>,
-        ]
-      : []),
-  ];
+const FIELD_INPUT =
+  "h-9 w-full rounded-lg border border-black/[0.08] bg-white px-3 text-[13px] text-[#202124] outline-none transition placeholder:text-[#a0a3a8] focus:border-black/20";
+const FIELD_TEXTAREA =
+  "min-h-[80px] w-full rounded-lg border border-black/[0.08] bg-white p-3 text-[13px] text-[#202124] outline-none transition placeholder:text-[#a0a3a8] focus:border-black/20";
+
+function Field({
+  children,
+  htmlFor,
+  label,
+}: {
+  children: React.ReactNode;
+  htmlFor?: string;
+  label: string;
+}) {
+  return (
+    <div className="grid gap-1.5">
+      <label className="text-[12px] text-[#85888e]" htmlFor={htmlFor}>
+        {label}
+      </label>
+      {children}
+    </div>
+  );
 }
 
-function CronAdvancedFields({
+function CronEmployeeFields({
   idPrefix,
   form,
+  employees,
   onChange,
-  modelOptions,
-  availableToolsets,
 }: {
   idPrefix: string;
   form: CronJobEditorState;
+  employees: Employee[];
   onChange: (form: CronJobEditorState) => void;
-  modelOptions: ModelOptionsResponse | null;
-  availableToolsets: ToolsetInfo[];
 }) {
+  const { t } = useI18n();
+  const employeeText = guiChatTranslations(t).employees;
+  const active = employees.filter((employee) => employee.lifecycle_status === "active");
+  const known = new Set(active.map((employee) => employee.employee_id));
+  return (
+    <Field htmlFor={`${idPrefix}-employee`} label={t.cron.editor.employee}>
+      <select
+        className={FIELD_INPUT}
+        id={`${idPrefix}-employee`}
+        onChange={(event) => onChange({ ...form, employee_id: event.target.value })}
+        value={form.employee_id}
+      >
+        <option value="">{t.cron.editor.employeePlaceholder}</option>
+        {active.map((employee) => (
+          <option key={employee.employee_id} value={employee.employee_id}>
+            {employeeDisplayName(employee, employeeText.aiAssistant, employeeText.unnamed)}
+          </option>
+        ))}
+        {form.employee_id && !known.has(form.employee_id) ? (
+          <option value={form.employee_id}>{form.employee_id}</option>
+        ) : null}
+      </select>
+      {active.length === 0 ? (
+        <p className="text-[12px] text-[#a0a3a8]">{t.cron.editor.employeesEmpty}</p>
+      ) : null}
+    </Field>
+  );
+}
+
+function CronCustomFields({
+  idPrefix,
+  form,
+  resources,
+  onChange,
+}: {
+  idPrefix: string;
+  form: CronJobEditorState;
+  resources: CronJobFormResources;
+  onChange: (form: CronJobEditorState) => void;
+}) {
+  const { t } = useI18n();
   const update = <K extends keyof CronJobEditorState>(
     key: K,
     next: CronJobEditorState[K],
   ) => onChange({ ...form, [key]: next });
-  const providers = (modelOptions?.providers ?? []).filter(
-    (provider) => provider.authenticated !== false,
+  const registrations = resources.modelRegistrations.filter(
+    (registration) => registration.kind === "chat",
   );
-  const models = providers.find((provider) => provider.slug === form.provider)?.models ?? [];
+  const selectedRegistration = registrations.find(
+    (registration) =>
+      registration.provider === form.provider && registration.model === form.model,
+  );
+  const selectValue = selectedRegistration?.id ?? (form.model ? "__current__" : "");
+  const currentLabel = [form.provider, form.model].filter(Boolean).join(" / ");
 
   return (
-    <details className="border border-border bg-background/30 p-3" open>
-      <summary className="cursor-pointer text-xs font-medium uppercase tracking-wide text-muted-foreground">
-        Advanced fields
-      </summary>
-      <div className="mt-3 grid gap-3">
-        <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
-          <div className="grid gap-1">
-            <Label htmlFor={`${idPrefix}-provider`}>Provider</Label>
-            <Select
-              id={`${idPrefix}-provider`}
-              value={form.provider}
-              onValueChange={(provider) => onChange({ ...form, provider, model: "" })}
-            >
-              <SelectOption value="">Default</SelectOption>
-              {selectOptions(
-                form.provider,
-                providers.map((provider) => ({ value: provider.slug, label: provider.name })),
-              )}
-            </Select>
-          </div>
-          <div className="grid gap-1">
-            <Label htmlFor={`${idPrefix}-model`}>Model</Label>
-            <Select id={`${idPrefix}-model`} value={form.model} onValueChange={(value) => update("model", value)}>
-              <SelectOption value="">Default</SelectOption>
-              {selectOptions(form.model, models.map((model) => ({ value: model, label: model })))}
-            </Select>
-          </div>
-        </div>
+    <>
+      <Field htmlFor={`${idPrefix}-model`} label={t.cron.editor.model}>
+        <select
+          className={FIELD_INPUT}
+          id={`${idPrefix}-model`}
+          onChange={(event) => {
+            const registration = registrations.find((item) => item.id === event.target.value);
+            onChange({
+              ...form,
+              provider: registration?.provider ?? "",
+              model: registration?.model ?? "",
+            });
+          }}
+          value={selectValue}
+        >
+          <option value="">{t.cron.editor.modelDefault}</option>
+          {registrations.map((registration) => (
+            <option key={registration.id} value={registration.id}>
+              {registration.name || `${registration.provider} / ${registration.model}`}
+            </option>
+          ))}
+          {selectValue === "__current__" ? (
+            <option value="__current__">{currentLabel}</option>
+          ) : null}
+        </select>
+      </Field>
 
-        <div className="grid gap-1">
-          <Label htmlFor={`${idPrefix}-base-url`}>Base URL override</Label>
-          <Input
-            id={`${idPrefix}-base-url`}
-            placeholder="https://api.example.com/v1"
-            value={form.base_url}
-            onChange={(event) => update("base_url", event.target.value)}
-          />
-        </div>
+      <Field label={t.cron.editor.skills}>
+        <NameCheckboxPicker
+          id={`${idPrefix}-skills`}
+          available={resources.availableSkills}
+          selected={form.skills}
+          onChange={(skills) => update("skills", skills)}
+          emptyLabel={t.cron.editor.skillsEmpty}
+        />
+        <p className="text-[12px] text-[#a0a3a8]">{t.cron.editor.skillsHint}</p>
+      </Field>
 
-        <div className="grid grid-cols-1 items-end gap-3 sm:grid-cols-2">
-          <label className="flex items-center gap-2 text-xs text-muted-foreground">
+      <details className="rounded-lg border border-black/[0.08] bg-[#f7f8fa] p-3">
+        <summary className="cursor-pointer text-[12px] font-medium text-[#85888e]">
+          {t.cron.editor.advanced}
+        </summary>
+        <div className="mt-3 grid gap-3">
+          <Field htmlFor={`${idPrefix}-base-url`} label={t.cron.editor.baseUrl}>
             <input
-              type="checkbox"
-              className="accent-foreground"
-              checked={form.no_agent}
-              onChange={(event) => update("no_agent", event.target.checked)}
+              className={FIELD_INPUT}
+              id={`${idPrefix}-base-url`}
+              placeholder={t.cron.editor.baseUrlPlaceholder}
+              value={form.base_url}
+              onChange={(event) => update("base_url", event.target.value)}
             />
-            no_agent: run the script only and deliver stdout verbatim
-          </label>
-          <div className="grid gap-1">
-            <Label htmlFor={`${idPrefix}-script`}>Script</Label>
-            <Input
-              id={`${idPrefix}-script`}
-              value={form.script}
-              onChange={(event) => update("script", event.target.value)}
-              placeholder="relative/path/in/scripts"
-            />
-          </div>
-        </div>
+          </Field>
 
-        <div className="grid gap-1">
-          <Label htmlFor={`${idPrefix}-workdir`}>Workdir</Label>
-          <Input
-            id={`${idPrefix}-workdir`}
-            value={form.workdir}
-            onChange={(event) => update("workdir", event.target.value)}
-            placeholder="/absolute/project/path"
-          />
-        </div>
+          <div className="grid grid-cols-1 items-end gap-3 sm:grid-cols-2">
+            <label className="flex items-center gap-2 text-[12px] text-[#85888e]">
+              <input
+                type="checkbox"
+                className="accent-[#202124]"
+                checked={form.no_agent}
+                onChange={(event) => update("no_agent", event.target.checked)}
+              />
+              {t.cron.editor.noAgent}
+            </label>
+            <Field htmlFor={`${idPrefix}-script`} label={t.cron.editor.script}>
+              <input
+                className={FIELD_INPUT}
+                id={`${idPrefix}-script`}
+                placeholder={t.cron.editor.scriptPlaceholder}
+                value={form.script}
+                onChange={(event) => update("script", event.target.value)}
+              />
+            </Field>
+          </div>
 
-        <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
-          <div className="grid gap-1">
-            <Label htmlFor={`${idPrefix}-context-from`}>context_from job IDs</Label>
-            <textarea
-              id={`${idPrefix}-context-from`}
-              className="flex min-h-[64px] w-full border border-border bg-background/40 px-3 py-2 text-xs font-courier shadow-sm placeholder:text-muted-foreground focus-visible:border-foreground/25 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-foreground/30"
-              placeholder="one job id per line"
-              value={form.context_from}
-              onChange={(event) => update("context_from", event.target.value)}
+          <Field htmlFor={`${idPrefix}-workdir`} label={t.cron.editor.workdir}>
+            <input
+              className={FIELD_INPUT}
+              id={`${idPrefix}-workdir`}
+              placeholder={t.cron.editor.workdirPlaceholder}
+              value={form.workdir}
+              onChange={(event) => update("workdir", event.target.value)}
             />
-          </div>
-          <div className="grid gap-1">
-            <Label htmlFor={`${idPrefix}-toolsets`}>enabled_toolsets</Label>
-            <NameCheckboxPicker
-              id={`${idPrefix}-toolsets`}
-              available={availableToolsets}
-              selected={form.enabled_toolsets}
-              onChange={(value) => update("enabled_toolsets", value)}
-              emptyLabel="No toolsets available."
-            />
+          </Field>
+
+          <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+            <Field htmlFor={`${idPrefix}-context-from`} label={t.cron.editor.contextFrom}>
+              <textarea
+                className={`${FIELD_TEXTAREA} min-h-[64px] text-[12px]`}
+                id={`${idPrefix}-context-from`}
+                placeholder={t.cron.editor.contextFromPlaceholder}
+                value={form.context_from}
+                onChange={(event) => update("context_from", event.target.value)}
+              />
+            </Field>
+            <Field label={t.cron.editor.toolsets}>
+              <NameCheckboxPicker
+                id={`${idPrefix}-toolsets`}
+                available={resources.availableToolsets}
+                selected={form.enabled_toolsets}
+                onChange={(value) => update("enabled_toolsets", value)}
+                emptyLabel={t.cron.editor.toolsetsEmpty}
+              />
+            </Field>
           </div>
         </div>
-      </div>
-    </details>
+      </details>
+    </>
   );
 }
 
@@ -174,83 +232,81 @@ export function CronJobFormFields({
   onChange: (form: CronJobEditorState) => void;
 }) {
   const { t } = useI18n();
-  const { availableSkills, availableToolsets, deliveryTargets, modelOptions } = resources;
   const update = <K extends keyof CronJobEditorState>(
     key: K,
     next: CronJobEditorState[K],
   ) => onChange({ ...form, [key]: next });
-  const onlyLocalAvailable = deliveryTargets.every((target) => target.id === "local");
-  const deliveryOptions = selectOptions(
-    form.deliver,
-    deliveryTargets.map((target) => {
-      const base = target.id === "local" ? t.cron.delivery.local : target.name;
-      if (target.id !== "local" && !target.home_target_set) {
-        const hint = t.cron.delivery.needsHomeChannel ?? "set a home channel first";
-        return { value: target.id, label: `${base} — ${hint}` };
-      }
-      return { value: target.id, label: base };
-    }),
-  );
+  const modes: Array<{ value: CronJobEditorMode; label: string }> = [
+    { value: "employee", label: t.cron.editor.modeEmployee },
+    { value: "custom", label: t.cron.editor.modeCustom },
+  ];
 
   return (
     <>
-      <div className="grid gap-2">
-        <Label htmlFor={`${idPrefix}-name`}>{t.cron.nameOptional}</Label>
-        <Input
-          id={`${idPrefix}-name`}
-          autoFocus={autoFocus}
-          placeholder={t.cron.namePlaceholder}
-          value={form.name}
-          onChange={(event) => update("name", event.target.value)}
-        />
+      <div className="grid gap-3">
+        <Field htmlFor={`${idPrefix}-name`} label={t.cron.nameOptional}>
+          <input
+            autoFocus={autoFocus}
+            className={FIELD_INPUT}
+            id={`${idPrefix}-name`}
+            placeholder={t.cron.namePlaceholder}
+            value={form.name}
+            onChange={(event) => update("name", event.target.value)}
+          />
+        </Field>
+
+        <Field htmlFor={`${idPrefix}-prompt`} label={t.cron.prompt}>
+          <textarea
+            className={FIELD_TEXTAREA}
+            id={`${idPrefix}-prompt`}
+            placeholder={t.cron.promptPlaceholder}
+            value={form.prompt}
+            onChange={(event) => update("prompt", event.target.value)}
+          />
+        </Field>
+
+        <ScheduleBuilder value={form.scheduleState} onChange={(state) => update("scheduleState", state)} />
+
+        <Field label={t.cron.editor.modeLabel}>
+          <div
+            aria-label={t.cron.editor.modeLabel}
+            className="flex rounded-lg border border-black/[0.08] bg-[#f3f4f6] p-0.5"
+            role="group"
+          >
+            {modes.map((mode) => (
+              <button
+                aria-pressed={form.mode === mode.value}
+                className={`flex-1 rounded-md px-3 py-1.5 text-[12px] transition ${
+                  form.mode === mode.value
+                    ? "bg-white text-[#202124] shadow-sm"
+                    : "text-[#85888e] hover:text-[#202124]"
+                }`}
+                key={mode.value}
+                onClick={() => update("mode", mode.value)}
+                type="button"
+              >
+                {mode.label}
+              </button>
+            ))}
+          </div>
+        </Field>
+
+        {form.mode === "employee" ? (
+          <CronEmployeeFields
+            idPrefix={`${idPrefix}-employee-mode`}
+            form={form}
+            employees={resources.employees}
+            onChange={onChange}
+          />
+        ) : (
+          <CronCustomFields
+            idPrefix={`${idPrefix}-custom`}
+            form={form}
+            resources={resources}
+            onChange={onChange}
+          />
+        )}
       </div>
-
-      <div className="grid gap-2">
-        <Label htmlFor={`${idPrefix}-prompt`}>{t.cron.prompt}</Label>
-        <textarea
-          id={`${idPrefix}-prompt`}
-          className="flex min-h-[80px] w-full border border-border bg-background/40 px-3 py-2 text-sm font-courier shadow-sm placeholder:text-muted-foreground focus-visible:border-foreground/25 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-foreground/30"
-          placeholder={t.cron.promptPlaceholder}
-          value={form.prompt}
-          onChange={(event) => update("prompt", event.target.value)}
-        />
-      </div>
-
-      <ScheduleBuilder value={form.scheduleState} onChange={(state) => update("scheduleState", state)} />
-
-      <div className="grid gap-2">
-        <Label htmlFor={`${idPrefix}-deliver`}>{t.cron.deliverTo}</Label>
-        <Select id={`${idPrefix}-deliver`} value={form.deliver} onValueChange={(value) => update("deliver", value)}>
-          {deliveryOptions}
-        </Select>
-        {onlyLocalAvailable ? (
-          <p className="text-xs text-muted-foreground">
-            {t.cron.delivery.noneConfigured ?? "No messaging platforms configured. Set one up under Channels to deliver reports."}
-          </p>
-        ) : null}
-      </div>
-
-      <div className="grid gap-2">
-        <Label htmlFor={`${idPrefix}-skills`}>Skills (optional)</Label>
-        <NameCheckboxPicker
-          id={`${idPrefix}-skills`}
-          available={availableSkills}
-          selected={form.skills}
-          onChange={(skills) => update("skills", skills)}
-          emptyLabel="No skills installed for this profile."
-        />
-        <p className="text-xs text-muted-foreground">
-          Selected skills are loaded before the prompt runs — the cron sets when, the skill sets how.
-        </p>
-      </div>
-
-      <CronAdvancedFields
-        idPrefix={`${idPrefix}-advanced`}
-        form={form}
-        onChange={onChange}
-        modelOptions={modelOptions}
-        availableToolsets={availableToolsets}
-      />
     </>
   );
 }

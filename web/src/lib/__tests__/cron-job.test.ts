@@ -24,6 +24,7 @@ function form(overrides: Partial<CronJobFormState> = {}): CronJobFormState {
     context_from: "",
     enabled_toolsets: [],
     workdir: "",
+    employee_id: "",
     ...overrides,
   };
 }

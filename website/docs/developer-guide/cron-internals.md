@@ -17,6 +17,9 @@ The cron subsystem provides scheduled task execution — from simple one-shot de
 | `tools/cronjob_tools.py` | Model-facing `cronjob` tool registration and handler |
 | `gateway/run.py` | Gateway integration — cron ticking in the long-running loop |
 | `hermes_cli/cron.py` | CLI `hermes cron` subcommands |
+| `plugins/scheduled-tasks/dashboard/` | Bundled Dashboard management UI and API |
+
+The Dashboard management surface is plugin-owned, but execution is not: job storage, scheduling, delivery, the `cronjob` tool, CLI commands, gateway ticker, and managed `/api/cron/fire` callback remain core. Disabling the bundled Dashboard plugin therefore hides management in the Dashboard without stopping already-scheduled jobs.
 
 ## Scheduling Model
 

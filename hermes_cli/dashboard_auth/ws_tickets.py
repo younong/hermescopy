@@ -26,7 +26,7 @@ from hermes_cli.dashboard_auth.authority import (
     ReplayContinuity,
     control_plane_home,
 )
-from hermes_cli.dashboard_auth.api_availability import PLUGIN_API_ALLOWED_NAMES
+from hermes_cli.dashboard_auth.api_availability import registered_plugin_websocket_route
 
 TTL_SECONDS = 30
 _TOKEN_VERSION = "bwt1"
@@ -38,11 +38,8 @@ _PUBLIC_AUDIENCES: frozenset[str] = frozenset({
     "browser-ws:/api/pub",
     "browser-ws:/api/events",
 })
-# Plugin WebSocket audiences are accepted by prefix matching
-# ``browser-ws:/api/plugins/<name>/...`` for any name in
-# ``PLUGIN_API_ALLOWED_NAMES``. Mirrors the HTTP allowlist in
-# ``api_availability.PLUGIN_API_ALLOWED_NAMES`` so cookie auth and WS
-# ticket auth extend together when a new plugin is added.
+# Plugin WebSocket audiences are admitted only when a validated trusted plugin
+# router registered that exact path template at mount time.
 
 _lock = threading.Lock()
 _keyring_lock = threading.RLock()
@@ -59,14 +56,7 @@ def _is_plugin_audience(audience: str) -> bool:
     if not audience.startswith("browser-ws:"):
         return False
     path = audience[len("browser-ws:"):].split("?", 1)[0]
-    parts = path.split("/")
-    # "", "api", "plugins", "<name>", ...
-    return (
-        len(parts) >= 5
-        and parts[:3] == ["", "api", "plugins"]
-        and bool(parts[3])
-        and parts[3] in PLUGIN_API_ALLOWED_NAMES
-    )
+    return registered_plugin_websocket_route(path)
 
 
 def browser_ws_audience(path: str) -> str:

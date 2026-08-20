@@ -25,17 +25,11 @@ import { guiChatTranslations, useI18n } from "@/i18n";
 import { describeSchedule, englishOrdinal } from "@/lib/schedule";
 import { GuiChatWorkspaceDialog } from "./GuiChatWorkspaceDialog";
 
-const LOCAL_DELIVERY = {
-  id: "local",
-  name: "Local",
-  home_target_set: true,
-  home_env_var: null,
-};
 const EMPTY_RESOURCES: CronJobFormResources = {
   availableSkills: [],
   availableToolsets: [],
-  modelOptions: null,
-  deliveryTargets: [LOCAL_DELIVERY],
+  modelRegistrations: [],
+  employees: [],
 };
 export function GuiChatScheduledTasksPane() {
   const { locale, t } = useI18n();
@@ -78,15 +72,15 @@ export function GuiChatScheduledTasksPane() {
     Promise.all([
       api.getSkills().catch(() => []),
       api.getToolsets().catch(() => []),
-      api.getModelOptions().catch(() => null),
-      api.getCronDeliveryTargets().catch(() => ({ targets: [LOCAL_DELIVERY] })),
-    ]).then(([skills, toolsets, modelOptions, delivery]) => {
+      api.getModelRegistrations().catch(() => ({ registrations: [] })),
+      api.getEmployees({ status: "active" }).catch(() => ({ employees: [] })),
+    ]).then(([skills, toolsets, registrations, employeeList]) => {
       if (cancelled) return;
       setResources({
         availableSkills: [...skills].sort((a, b) => a.name.localeCompare(b.name)),
         availableToolsets: [...toolsets].sort((a, b) => a.name.localeCompare(b.name)),
-        modelOptions,
-        deliveryTargets: delivery.targets.length ? delivery.targets : [LOCAL_DELIVERY],
+        modelRegistrations: registrations.registrations,
+        employees: employeeList.employees,
       });
     });
     return () => {
@@ -120,6 +114,10 @@ export function GuiChatScheduledTasksPane() {
 
   const saveEditor = async () => {
     if (!editor) return;
+    if (editor.form.mode === "employee" && !editor.form.employee_id) {
+      setError(text.employeeRequired);
+      return;
+    }
     const payload = buildCronJobPayloadFromEditor(editor.form);
     if (!payload.schedule || (!payload.no_agent && !cronJobHasExecutionContent(payload))) {
       setError(text.validationRequired);

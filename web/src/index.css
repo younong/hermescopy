@@ -12,6 +12,9 @@
    Tailwind's JIT purge. */
 @source '../node_modules/@nous-research/ui/dist';
 @source '../../node_modules/streamdown/dist';
+/* First-party dashboard plugins are compiled separately, so Tailwind must scan
+   their source while producing the host stylesheet. */
+@source '../../plugins/*/dashboard/src';
 
 /* Keep native browser text-selection colors instead of the design-system
    global highlight, which can obscure text on themed surfaces. */

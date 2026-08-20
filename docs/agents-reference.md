@@ -1126,6 +1126,12 @@ Cron deliveries are **not** mirrored into the target gateway session —
 they land in their own cron session with a header/footer frame so the
 main conversation's message-role alternation stays intact.
 
+The bundled `plugins/scheduled-tasks/dashboard/` plugin owns the Dashboard
+management page and public management API only. Storage, scheduling,
+execution, delivery, CLI/tool surfaces, Owner Worker internal routes, and the
+managed `/api/cron/fire` callback remain core so disabling the Dashboard
+plugin does not stop existing jobs.
+
 ---
 
 ## Kanban (multi-agent work queue)

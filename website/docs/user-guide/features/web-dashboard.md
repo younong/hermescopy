@@ -470,29 +470,30 @@ Returns log lines. Query parameters: `file` (agent/errors/gateway), `lines` (cou
 
 Returns token usage, cost, and session analytics. Query parameter: `days` (default 30). Response includes daily breakdowns and per-model aggregates.
 
-### GET /api/cron/jobs
+### GET /api/plugins/scheduled-tasks/jobs
 
-Returns all configured cron jobs with their state, schedule, and run history.
+Returns all configured scheduled jobs with their state and schedule. The bundled
+Scheduled Tasks Dashboard plugin owns this management API.
 
-### POST /api/cron/jobs
+### POST /api/plugins/scheduled-tasks/jobs
 
-Creates a new cron job. Body: `{"prompt": "...", "schedule": "0 9 * * *", "name": "...", "deliver": "local"}`.
+Creates a scheduled job. Body: `{"prompt": "...", "schedule": "0 9 * * *", "name": "...", "deliver": "local"}`.
 
-### POST /api/cron/jobs/\{job_id\}/pause
+### POST /api/plugins/scheduled-tasks/jobs/\{job_id\}/pause
 
-Pauses a cron job.
+Pauses a scheduled job.
 
-### POST /api/cron/jobs/\{job_id\}/resume
+### POST /api/plugins/scheduled-tasks/jobs/\{job_id\}/resume
 
-Resumes a paused cron job.
+Resumes a paused scheduled job.
 
-### POST /api/cron/jobs/\{job_id\}/trigger
+### POST /api/plugins/scheduled-tasks/jobs/\{job_id\}/trigger
 
-Immediately triggers a cron job outside its schedule.
+Immediately triggers a scheduled job outside its schedule.
 
-### DELETE /api/cron/jobs/\{job_id\}
+### DELETE /api/plugins/scheduled-tasks/jobs/\{job_id\}
 
-Deletes a cron job.
+Deletes a scheduled job.
 
 ### GET /api/skills
 
@@ -553,7 +554,7 @@ same auth gate as the rest of `/api/`.
 | `PATCH /api/sessions/{id}` | Rename / archive a session |
 | `GET /api/sessions/{id}/export` | Export a session (metadata + messages) as JSON |
 | `POST /api/sessions/prune` | Delete ended sessions older than N days |
-| `PUT /api/cron/jobs/{id}` | Edit a cron job's prompt / schedule / name / deliver |
+| `PUT /api/plugins/scheduled-tasks/jobs/{id}` | Edit a scheduled job's prompt / schedule / name / deliver |
 
 ## Authentication (gated mode)
 
