@@ -5,8 +5,10 @@ import pytest
 
 from agent.artifact_delivery import (
     MAX_DOWNLOAD_BYTES,
+    append_artifact_delivery_failure,
     append_artifact_delivery_warning,
     append_artifact_validation_failure,
+    build_artifact_delivery_nudge,
     build_zip_delivery_nudge,
     extract_declared_artifact_paths,
     validate_declared_artifacts,
@@ -114,6 +116,53 @@ def test_zip_gate_rejects_archive_with_parent_traversal(tmp_path, monkeypatch):
     )
 
     assert nudge is not None
+
+
+def test_artifact_gate_retries_when_declared_file_is_missing(tmp_path, monkeypatch):
+    monkeypatch.setenv("TERMINAL_CWD", str(tmp_path))
+    nudge = build_artifact_delivery_nudge(
+        final_response="生成完成：[下载](missing/report.pdf)",
+        task_id="artifact-test",
+    )
+    assert nudge is not None
+    assert "appropriate tool" in nudge
+
+
+def test_extracts_successful_tool_artifact_paths_but_not_failures():
+    from agent.artifact_delivery import extract_tool_artifact_paths
+
+    assert extract_tool_artifact_paths(
+        "image_generate", '{"success": true, "image": "/workspace/out.png"}'
+    ) == ["/workspace/out.png"]
+    assert extract_tool_artifact_paths(
+        "terminal", '{"success": false, "output_file": "/workspace/out.txt"}'
+    ) == []
+
+
+def test_artifact_gate_does_not_nudge_for_workspace_boundary(tmp_path, monkeypatch):
+    monkeypatch.setenv("TERMINAL_CWD", str(tmp_path))
+    nudge = build_artifact_delivery_nudge(
+        final_response="[下载](/outside/report.pdf)",
+        task_id="artifact-test",
+    )
+    assert nudge is None
+
+
+def test_artifact_gate_stops_after_bounded_retries(tmp_path, monkeypatch):
+    monkeypatch.setenv("TERMINAL_CWD", str(tmp_path))
+    assert build_artifact_delivery_nudge(
+        final_response="生成完成：[下载](missing/report.pdf)",
+        task_id="artifact-test",
+        attempts=2,
+    ) is None
+
+
+def test_artifact_failure_removes_unverifiable_claim():
+    response = append_artifact_delivery_failure(
+        "已生成：MEDIA:/missing/report.pdf", ["/missing/report.pdf"]
+    )
+    assert "MEDIA:" not in response
+    assert "交付失败" in response
 
 
 def test_zip_gate_stops_after_bounded_retries(tmp_path, monkeypatch):

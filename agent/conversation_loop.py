@@ -5215,9 +5215,20 @@ def run_conversation(
                 ):
                     messages.pop()
 
+                _artifact_nudge = None
+                _zip_nudge = None
                 try:
-                    from agent.artifact_delivery import build_zip_delivery_nudge
+                    from agent.artifact_delivery import (
+                        build_artifact_delivery_nudge,
+                        build_zip_delivery_nudge,
+                    )
 
+                    _artifact_nudge = build_artifact_delivery_nudge(
+                        final_response=final_response,
+                        task_id=effective_task_id or "default",
+                        attempts=getattr(agent, "_artifact_delivery_nudges", 0),
+                        tool_artifact_paths=getattr(agent, "_turn_artifact_paths", set()),
+                    )
                     _zip_nudge = build_zip_delivery_nudge(
                         user_message=original_user_message,
                         final_response=final_response,
@@ -5225,8 +5236,7 @@ def run_conversation(
                         attempts=getattr(agent, "_zip_delivery_nudges", 0),
                     )
                 except Exception:
-                    logger.warning("ZIP delivery stop-loop check failed", exc_info=True)
-                    _zip_nudge = None
+                    logger.warning("Artifact delivery stop-loop check failed", exc_info=True)
 
                 if _zip_nudge:
                     agent._zip_delivery_nudges = (
@@ -5240,6 +5250,21 @@ def run_conversation(
                     logger.info(
                         "ZIP delivery stop-loop nudge issued (attempt %d)",
                         agent._zip_delivery_nudges,
+                    )
+                    continue
+
+                if _artifact_nudge:
+                    agent._artifact_delivery_nudges = (
+                        getattr(agent, "_artifact_delivery_nudges", 0) + 1
+                    )
+                    final_msg["finish_reason"] = "artifact_delivery_required"
+                    final_msg["_transient_model_instruction"] = True
+                    messages.append(final_msg)
+                    messages.append(transient_model_instruction(_artifact_nudge))
+                    agent._session_messages = messages
+                    logger.info(
+                        "Artifact delivery stop-loop nudge issued (attempt %d)",
+                        agent._artifact_delivery_nudges,
                     )
                     continue
 
