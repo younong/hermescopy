@@ -97,8 +97,9 @@ def test_dispatch_reads_and_writes_selected_workspace(tmp_path, monkeypatch):
             "name": "source.png", "mime_type": "image/png", "data": b"reference",
         }
         output = Path(payload["image"])
-        assert output.parent == selected / "generated" / "images"
-        assert output.read_bytes() == b"generated"
+        assert payload["image"].startswith("generated/images/")
+        assert (selected / output).read_bytes() == b"generated"
+        assert str(owner) not in json.dumps(payload)
         assert payload["size"] == "1024x1024"
         assert "api_key" not in payload
         assert "base_url" not in payload
@@ -182,8 +183,9 @@ def test_dispatch_video_publishes_returned_bytes(tmp_path, monkeypatch):
             kind="video",
         ))
         output = Path(payload["video"])
-        assert output.parent == paths.default_workspace / "generated" / "videos"
-        assert output.read_bytes() == b"video-bytes"
+        assert payload["video"].startswith("generated/videos/")
+        assert (paths.default_workspace / output).read_bytes() == b"video-bytes"
+        assert str(owner) not in json.dumps(payload)
         assert payload["mime_type"] == "video/mp4"
     finally:
         roots.close()

@@ -1539,7 +1539,7 @@ describe("guiChatReducer history image restoration", () => {
     const artifact = state.artifacts[state.messages[0].artifactIds[0]];
     expect(artifact).toMatchObject({
       mimeType: "image/png",
-      url: "/api/fs/read-data-url?path=file%3A%2F%2F%2Ftmp%2Fcat.png",
+      url: "/api/fs/read-data-url?path=%2Ftmp%2Fcat.png",
     });
     expect(state.messages[0].text).toBe("");
   });
@@ -1615,7 +1615,7 @@ describe("guiChatReducer history image restoration", () => {
     expect(state.messages[0].attachments).toBeUndefined();
     expect(state.messages[0].artifactIds).toHaveLength(1);
     expect(imageArtifact(state, state.messages[0].artifactIds[0]).url).toBe(
-      `/api/fs/read-data-url?path=${encodeURIComponent(absolutePath)}`,
+      `/api/fs/read-data-url?path=${encodeURIComponent(relativePath)}`,
     );
   });
 
@@ -1813,14 +1813,16 @@ describe("guiChatReducer history image restoration", () => {
     expect(state.artifacts["artifact-image-1"].kind).not.toBe("file");
   });
 
-  it("maps generated image cache paths to the static image endpoint", () => {
-    const state = restoreWithMessage(
-      "/opt/hermes/shared/.hermes/cache/images/apiyi_gpt-image-2-medium_20260705_130933_211cd48c.png",
-    );
+  it("uses authenticated filesystem paths for historical image cache references", () => {
+    const path = "/opt/hermes/shared/.hermes/cache/images/apiyi_gpt-image-2-medium_20260705_130933_211cd48c.png";
+    const state = restoreWithMessage(path);
+    const artifact = imageArtifact(state, state.messages[0].artifactIds[0]);
 
-    expect(imageArtifact(state, state.messages[0].artifactIds[0]).url).toBe(
-      "/api/generated-images/apiyi_gpt-image-2-medium_20260705_130933_211cd48c.png",
+    expect(artifact.url).toBe(`/api/fs/read-data-url?path=${encodeURIComponent(path)}`);
+    expect(artifact.downloadUrl).toBe(
+      `/api/files/download?path=${encodeURIComponent(path)}&filename=apiyi_gpt-image-2-medium_20260705_130933_211cd48c.png`,
     );
+    expect(artifact.url).not.toContain("/api/generated-images/");
   });
 
   it("uses authenticated preview paths for selected-workspace images", () => {

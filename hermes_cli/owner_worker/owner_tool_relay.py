@@ -551,16 +551,16 @@ def _rewrite_media_result(
     from hermes_cli.owner_worker.user_files import publish_unique_user_bytes
 
     published = publish_unique_user_bytes(workspace_context, category, filename, data)
-    diagnostic = str(published.diagnostic_path)
+    visible = published.visible_path
     if category == "audio":
-        result["file_path"] = diagnostic
+        result["file_path"] = visible
         voice_prefix = "[[audio_as_voice]]\n" if result.get("voice_compatible") is True else ""
-        result["media_tag"] = f"{voice_prefix}MEDIA:{diagnostic}"
+        result["media_tag"] = f"{voice_prefix}MEDIA:{visible}"
     elif category == "image":
-        result["image"] = diagnostic
+        result["image"] = visible
     else:
-        result["video"] = diagnostic
-        result["media_tag"] = f"MEDIA:{diagnostic}"
+        result["video"] = visible
+        result["media_tag"] = f"MEDIA:{visible}"
     return json.dumps(result, ensure_ascii=False)
 
 
