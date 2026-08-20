@@ -19,6 +19,16 @@ vi.mock("@/App", () => ({
   default: () => <div data-admin-app>Admin dashboard</div>,
 }));
 
+vi.mock("@/plugins", () => ({
+  PluginProvider: ({
+    children,
+    mode,
+  }: {
+    children: React.ReactNode;
+    mode: "admin" | "member";
+  }) => <div data-plugin-mode={mode}>{children}</div>,
+}));
+
 vi.mock("@/contexts/SystemActions", () => ({
   SystemActionsProvider: ({ children }: { children: React.ReactNode }) => (
     <div data-system-actions>{children}</div>
@@ -119,6 +129,7 @@ describe("AuthenticatedApp", () => {
         "/chat",
       );
       expect(document.querySelector("[data-admin-app]")).toBeNull();
+      expect(document.querySelector('[data-plugin-mode="member"]')).not.toBeNull();
       expect(document.querySelector("[data-system-actions]")).not.toBeNull();
     },
   );
@@ -158,6 +169,7 @@ describe("AuthenticatedApp", () => {
       mocks.identity.mockReturnValue(identity({ authMe: me }));
       renderApp("/");
       expect(document.querySelector("[data-admin-app]")).not.toBeNull();
+      expect(document.querySelector('[data-plugin-mode="admin"]')).not.toBeNull();
       expect(document.querySelector("[data-member-chat]")).toBeNull();
       act(() => root?.unmount());
       root = null;

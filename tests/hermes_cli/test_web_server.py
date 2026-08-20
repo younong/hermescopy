@@ -5219,6 +5219,36 @@ class TestNormaliseThemeExtensions:
         assert r["componentStyles"]["card"] == {"opacity": "0.8", "zIndex": "5"}
 
 
+def test_authenticated_member_plugin_api_is_denied(monkeypatch):
+    from types import SimpleNamespace
+    from hermes_cli.dashboard_auth.base import Session
+    from hermes_cli import web_server
+
+    session = Session(
+        user_id="member-1",
+        email="member@example.com",
+        display_name="Member",
+        org_id="org-1",
+        provider="basic",
+        expires_at=9999999999,
+        access_token="access",
+        refresh_token="refresh",
+    )
+    request = SimpleNamespace(
+        url=SimpleNamespace(path="/api/plugins/kanban/board"),
+        method="GET",
+        state=SimpleNamespace(session=session),
+        headers={},
+        app=SimpleNamespace(state=SimpleNamespace(auth_required=True)),
+    )
+    monkeypatch.setattr(web_server, "_local_dashboard_account_role", lambda _request: "member")
+
+    response = web_server._authenticated_owner_control_plane_gate_response(request)
+
+    assert response is not None
+    assert response.status_code == 403
+
+
 class TestAuthenticatedOwnerWorkerSessionProxy:
     @pytest.fixture(autouse=True)
     def _setup(self, monkeypatch, _isolate_hermes_home, tmp_path):
@@ -7063,8 +7093,7 @@ class TestPluginAPIAuth:
 
 
 class TestDashboardPluginManifestExtensions:
-    """Tests for the extended plugin manifest fields (tab.override,
-    tab.hidden, slots) read by _discover_dashboard_plugins()."""
+    """Tests for normalized dashboard and Chat plugin manifest fields."""
 
     def _write_plugin(self, tmp_path, name, manifest):
         import json
@@ -7072,6 +7101,58 @@ class TestDashboardPluginManifestExtensions:
         plug_dir.mkdir(parents=True)
         (plug_dir / "manifest.json").write_text(json.dumps(manifest))
         return plug_dir
+
+    def test_web_server_discovery_uses_canonical_chat_workspace_normalization(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        self._write_plugin(tmp_path, "chat-tools", {
+            "name": "chat-tools",
+            "entry": "dist/index.js",
+            "chat": {
+                "workspaces": [{
+                    "id": "board",
+                    "path": "/chat/board",
+                    "label": "Board",
+                    "description": "Plan work",
+                    "icon": "SquareKanban",
+                    "position": 20,
+                }],
+            },
+        })
+        from hermes_cli import web_server
+        web_server._dashboard_plugins_cache = None
+
+        plugins = web_server._get_dashboard_plugins(force_rescan=True)
+
+        entry = next(p for p in plugins if p["name"] == "chat-tools")
+        assert "tab" not in entry
+        assert entry["chat"]["workspaces"] == [{
+            "id": "board",
+            "path": "/chat/board",
+            "label": "Board",
+            "description": "Plan work",
+            "icon": "SquareKanban",
+            "position": 20,
+            "admin_only": False,
+        }]
+
+    def test_web_server_discovery_rejects_malformed_chat_workspace_manifest(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        self._write_plugin(tmp_path, "bad-chat", {
+            "name": "bad-chat",
+            "tab": {"path": "/bad-chat"},
+            "entry": "dist/index.js",
+            "chat": {"workspaces": [{"id": "bad", "path": "/settings"}]},
+        })
+        from hermes_cli import web_server
+        web_server._dashboard_plugins_cache = None
+
+        plugins = web_server._get_dashboard_plugins(force_rescan=True)
+
+        assert "bad-chat" not in {plugin["name"] for plugin in plugins}
 
     def test_override_and_hidden_carried_through(self, tmp_path, monkeypatch):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
@@ -7102,8 +7183,7 @@ class TestDashboardPluginManifestExtensions:
         from hermes_cli import web_server
         web_server._dashboard_plugins_cache = None
         plugins = web_server._get_dashboard_plugins(force_rescan=True)
-        entry = next(p for p in plugins if p["name"] == "bad-override")
-        assert "override" not in entry["tab"]
+        assert "bad-override" not in {plugin["name"] for plugin in plugins}
 
     def test_slots_default_empty(self, tmp_path, monkeypatch):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))

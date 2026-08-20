@@ -1,4 +1,5 @@
 import ast
+import json
 import re
 import tomllib
 from pathlib import Path
@@ -154,6 +155,36 @@ def test_bundled_plugin_manifests_ship_in_both_wheel_and_sdist():
     assert "recursive-include plugins" in manifest and "plugin.yaml" in manifest, (
         "MANIFEST.in must recursive-include plugins plugin.yaml/plugin.yml (sdist)"
     )
+
+
+def test_dashboard_plugin_assets_ship_in_both_wheel_and_sdist():
+    """Dashboard discovery must have prebuilt assets after either install path."""
+    dashboards = sorted((REPO_ROOT / "plugins").glob("*/dashboard/manifest.json"))
+    dashboards += sorted((REPO_ROOT / "plugins" / "memory").glob("*/dashboard/manifest.json"))
+    bundled = []
+    for manifest_path in dashboards:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        if (manifest_path.parent / "src" / "index.tsx").is_file():
+            bundled.append((manifest_path, manifest))
+
+    assert bundled, "expected source-built dashboard plugins"
+    for manifest_path, manifest in bundled:
+        assert (manifest_path.parent / manifest.get("entry", "dist/index.js")).is_file()
+        if manifest.get("css"):
+            assert (manifest_path.parent / manifest["css"]).is_file()
+
+    data = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    plugins_pkg_data = data["tool"]["setuptools"]["package-data"]["plugins"]
+    assert "*/dashboard/manifest.json" in plugins_pkg_data
+    assert "*/dashboard/dist/*" in plugins_pkg_data
+    assert "memory/*/dashboard/manifest.json" in plugins_pkg_data
+    assert "memory/*/dashboard/dist/*" in plugins_pkg_data
+
+    sdist_manifest = (REPO_ROOT / "MANIFEST.in").read_text(encoding="utf-8")
+    assert "*/dashboard/manifest.json" in sdist_manifest
+    assert "*/dashboard/dist/*" in sdist_manifest
+    assert "memory/*/dashboard/manifest.json" in sdist_manifest
+    assert "memory/*/dashboard/dist/*" in sdist_manifest
 
 
 # Minimum non-vulnerable Starlette: CVE-2026-48710 ("BadHost") was fixed in

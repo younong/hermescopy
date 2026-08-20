@@ -922,10 +922,37 @@ async def host_header_middleware(request: Request, call_next):
     return await call_next(request)
 
 
+def _session_local_account_role(session: Any) -> Optional[str]:
+    """Resolve a durable-local role without trusting browser input."""
+    if session is None or session.provider != "basic":
+        return None
+    try:
+        from hermes_cli.dashboard_auth import get_provider
+
+        provider = get_provider("basic")
+        resolver = getattr(provider, "local_account_for_session", None)
+        account = resolver(session) if callable(resolver) else None
+    except Exception:
+        return None
+    return str(account.role) if account is not None else None
+
+
+def _local_dashboard_account_role(request: Request) -> Optional[str]:
+    return _session_local_account_role(getattr(request.state, "session", None))
+
+
 def _authenticated_owner_control_plane_gate_response(request: Request) -> Optional[JSONResponse]:
     """Return a fail-closed response for authenticated APIs not behind workers."""
     path = request.url.path
     method = request.method
+    if (
+        path.startswith("/api/plugins/")
+        and _local_dashboard_account_role(request) == "member"
+    ):
+        return JSONResponse(
+            status_code=403,
+            content={"detail": "Administrator access required"},
+        )
     if (
         getattr(request.app.state, "auth_required", False)
         and getattr(request.state, "session", None) is not None
@@ -12268,8 +12295,10 @@ async def set_dashboard_font(body: FontSetBody):
 # ---------------------------------------------------------------------------
 
 # Shared validation/discovery is also used by Owner Workers so manifests have one
-# trust model and one api_target interpretation across both runtimes.
-from hermes_cli.dashboard_plugins import discover_dashboard_plugins as _discover_dashboard_plugins
+# trust model and one api_target interpretation across both runtimes. The
+# dashboard_owner_payloads variant (PR #261) honors chat-only plugins and adds
+# api_target / authenticated_api passthrough for the legacy #259 API plugins.
+from hermes_cli.dashboard_owner_payloads import discover_dashboard_plugins as _discover_dashboard_plugins
 
 
 # Cache discovered plugins per-process (refresh on explicit re-scan).

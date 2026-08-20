@@ -2,7 +2,7 @@
   "name": "kanban",
   "label": "Kanban",
   "description": "Multi-agent collaboration board — drag-drop cards across columns, read comment threads, see which profile is running what",
-  "icon": "Package",
+  "icon": "SquareKanban",
   "version": "1.0.0",
   "tab": {
     "path": "/kanban",
@@ -12,5 +12,18 @@
   "css": "dist/style.css",
   "api": "plugin_api.py",
   "api_target": "control-plane",
-  "authenticated_api": "dashboard-session"
+  "authenticated_api": "dashboard-session",
+  "chat": {
+    "workspaces": [
+      {
+        "id": "kanban",
+        "path": "/chat/kanban",
+        "label": "Kanban",
+        "description": "Multi-agent collaboration board",
+        "icon": "SquareKanban",
+        "position": "after:files",
+        "admin_only": true
+      }
+    ]
+  }
 }

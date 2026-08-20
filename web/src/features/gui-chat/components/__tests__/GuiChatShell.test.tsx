@@ -17,6 +17,7 @@ import { GuiChatShell } from "../GuiChatShell";
 
 const mocks = vi.hoisted(() => ({
   connectGuiChat: vi.fn(),
+  pluginsLoading: false,
   connectMockGuiChat: vi.fn(),
   createILinkEnrollment: vi.fn(),
   getAuthMe: vi.fn(),
@@ -175,9 +176,45 @@ vi.mock("@/features/files/components/GuiChatFilesPane", () => ({
   GuiChatFilesPane: () => <section data-files-pane>Files pane</section>,
 }));
 
-vi.mock("@/features/kanban/components/GuiChatKanbanPane", () => ({
-  GuiChatKanbanPane: () => <section data-kanban-pane>Kanban pane</section>,
-}));
+vi.mock("@/plugins", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("@/plugins")>();
+  return {
+    ...actual,
+    ChatPluginWorkspace: ({ workspaceId }: { workspaceId: string }) => (
+      <section data-kanban-pane={workspaceId === "kanban" || undefined} data-statistics-pane={workspaceId === "statistics" || undefined}>
+        {workspaceId === "kanban" ? "Kanban pane" : "Message statistics"}
+      </section>
+    ),
+    usePlugins: () => ({
+      loading: mocks.pluginsLoading,
+      manifests: [
+        {
+          name: "message-statistics",
+          label: "Message statistics",
+          description: "Message composition statistics",
+          icon: "PieChart",
+          version: "1.0.0",
+          chat: { workspaces: [{ id: "statistics", path: "/chat/statistics", label: "Message statistics", description: "Message composition statistics", icon: "PieChart", position: "after:contacts", admin_only: false }] },
+          entry: "dist/index.js",
+          has_api: false,
+          source: "bundled",
+        },
+        {
+          name: "kanban",
+          label: "Kanban",
+          description: "Board",
+          icon: "SquareKanban",
+          version: "1.0.0",
+          chat: { workspaces: [{ id: "kanban", path: "/chat/kanban", label: "Board", description: "Board", icon: "SquareKanban", position: "after:files", admin_only: true }] },
+          entry: "dist/index.js",
+          has_api: true,
+          source: "bundled",
+        },
+      ],
+      plugins: [],
+    }),
+  };
+});
 
 vi.mock("../GuiChatSkillsPane", () => ({
   GuiChatSkillsPane: () => <section data-skills-pane>Skills pane</section>,
@@ -197,6 +234,7 @@ beforeEach(() => {
   (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT: boolean })
     .IS_REACT_ACT_ENVIRONMENT = true;
   mocks.connectGuiChat.mockReset();
+  mocks.pluginsLoading = false;
   mocks.connectMockGuiChat.mockReset();
   mocks.createILinkEnrollment.mockReset();
   mocks.getAuthMe.mockReset();
@@ -343,6 +381,36 @@ afterEach(async () => {
 });
 
 describe("GuiChatShell", () => {
+  it("holds an unresolved plugin deep link while manifests load without creating a chat", async () => {
+    const connection = createConnection();
+    mocks.getAuthMe.mockResolvedValue(authIdentity());
+    mocks.connectGuiChat.mockReturnValue(connection);
+    mocks.pluginsLoading = true;
+
+    await renderShellAt("/chat/future-workspace");
+
+    expect(document.querySelector('[role="status"]')?.textContent).toContain("Loading");
+    expect(connection.createOrAttach).not.toHaveBeenCalled();
+    await act(async () => root?.unmount());
+  });
+
+  it("redirects an unknown plugin path only after manifest discovery completes", async () => {
+    const connection = createConnection();
+    mocks.getAuthMe.mockResolvedValue(authIdentity());
+    mocks.connectGuiChat.mockReturnValue(connection);
+
+    await renderShellAt(
+      "/chat/missing-workspace",
+      <><GuiChatShell /><LocationProbe /></>,
+    );
+
+    await vi.waitFor(() => {
+      expect(document.querySelector("[data-location]")?.textContent).toBe("/chat");
+    });
+    expect(connection.createOrAttach).toHaveBeenCalledOnce();
+    await act(async () => root?.unmount());
+  });
+
   it("downloads a stored attachment before queuing an explicit reuse", async () => {
     const connection = createConnection();
     mocks.getAuthMe.mockResolvedValue(authIdentity());
@@ -386,7 +454,7 @@ describe("GuiChatShell", () => {
     expect(contactsEntries[0]?.textContent).toContain("Contacts");
     expect(sidebar?.querySelector('[aria-label="Employees"]')).toBeNull();
     expect(sidebar?.querySelector('[aria-label="Start employee chat"]')).toBeNull();
-    expect(sidebar?.querySelector('[aria-label="Message composition statistics"]')?.textContent).toContain("Message statistics");
+    expect(sidebar?.querySelector('[aria-label="Message statistics"]')?.textContent).toContain("Message statistics");
     expect(Array.from(sidebar?.querySelectorAll("button") ?? [])
       .some((button) => button.textContent?.includes("Board"))).toBe(true);
     const languageSwitcher = sidebar?.querySelector<HTMLButtonElement>('[aria-label="Switch language"]');
@@ -726,15 +794,13 @@ describe("GuiChatShell", () => {
 
     await renderShell(<GuiChatShell />);
     await act(async () => {
-      document.querySelector<HTMLButtonElement>('[aria-label="Message composition statistics"]')?.click();
+      document.querySelector<HTMLButtonElement>('[aria-label="Message statistics"]')?.click();
       await Promise.resolve();
       await Promise.resolve();
     });
 
     const statisticsPane = document.querySelector("[data-statistics-pane]");
     expect(statisticsPane).not.toBeNull();
-    expect(statisticsPane?.getAttribute("data-theme")).toBe("chat-workspace");
-    expect(statisticsPane?.classList.contains("gui-chat-statistics-pane")).toBe(true);
     expect(document.body.textContent).toContain("Message statistics");
     expect(document.querySelector("[data-composer-send]")).toBeNull();
     expect(Array.from(document.querySelectorAll<HTMLButtonElement>('button[aria-current="page"]'))
@@ -1337,7 +1403,7 @@ describe("GuiChatShell", () => {
     });
 
     expect(() => {
-      document.querySelector<HTMLButtonElement>("button[aria-label='Message composition statistics']")?.click();
+      document.querySelector<HTMLButtonElement>("button[aria-label='Message statistics']")?.click();
     }).not.toThrow();
     await act(async () => {
       await Promise.resolve();

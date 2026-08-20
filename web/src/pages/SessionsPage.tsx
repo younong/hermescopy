@@ -35,7 +35,6 @@ import type {
   SessionInfo,
   SessionMessage,
   SessionSearchResult,
-  SessionStoreStats,
   StatusResponse,
 } from "@/lib/api";
 import { timeAgo } from "@/lib/utils";
@@ -720,44 +719,6 @@ type SessionsView = "list" | "overview";
 
 const PAGE_SIZE = 20;
 const OVERVIEW_SESSION_LIMIT = 30;
-const COMPOSITION_SESSION_LIMIT = 50;
-const DEFAULT_DATE_RANGE_DAYS = 30;
-
-export interface SessionDateRange {
-  allTime: boolean;
-  start: string;
-  end: string;
-}
-
-function toLocalDateInput(date: Date): string {
-  const year = date.getFullYear();
-  const month = String(date.getMonth() + 1).padStart(2, "0");
-  const day = String(date.getDate()).padStart(2, "0");
-  return `${year}-${month}-${day}`;
-}
-
-export function defaultSessionDateRange(now = new Date()): SessionDateRange {
-  const end = new Date(now.getFullYear(), now.getMonth(), now.getDate());
-  const start = new Date(end);
-  start.setDate(start.getDate() - (DEFAULT_DATE_RANGE_DAYS - 1));
-  return { allTime: false, start: toLocalDateInput(start), end: toLocalDateInput(end) };
-}
-
-function localDateEpoch(date: string, nextDay = false): number | undefined {
-  const parts = date.split("-").map(Number);
-  if (parts.length !== 3 || parts.some((part) => !Number.isInteger(part))) return undefined;
-  const [year, month, day] = parts;
-  const local = new Date(year, month - 1, day + (nextDay ? 1 : 0));
-  return Number.isNaN(local.getTime()) ? undefined : Math.floor(local.getTime() / 1000);
-}
-
-export function sessionDateFilter(range: SessionDateRange) {
-  if (range.allTime) return {};
-  return {
-    active_from: localDateEpoch(range.start),
-    active_before: localDateEpoch(range.end, true),
-  };
-}
 
 export function fetchSessionsOverview() {
   return api.getSessions(OVERVIEW_SESSION_LIMIT, 0, "recent", true);
@@ -832,9 +793,6 @@ export default function SessionsPage() {
   const [sessions, setSessions] = useState<SessionInfo[]>([]);
   const [total, setTotal] = useState(0);
   const [page, setPage] = useState(0);
-  const [dateRange, setDateRange] = useState<SessionDateRange>(
-    defaultSessionDateRange,
-  );
   const [loading, setLoading] = useState(true);
   const [readerUnavailable, setReaderUnavailable] = useState(false);
   const [search, setSearch] = useState("");
@@ -874,14 +832,12 @@ export default function SessionsPage() {
   const lastClickedIndexRef = useRef<number | null>(null);
   const [deleteSelectedOpen, setDeleteSelectedOpen] = useState(false);
   const [deletingSelected, setDeletingSelected] = useState(false);
-  const [stats, setStats] = useState<SessionStoreStats | null>(null);
   const [pruneOpen, setPruneOpen] = useState(false);
   const [pruneDays, setPruneDays] = useState("90");
   const [pruning, setPruning] = useState(false);
   const { toast, showToast } = useToast();
   const { t } = useI18n();
   const chatText = guiChatTranslations(t);
-  const compositionText = sessionCompositionTranslations(t);
   const { setAfterTitle, setEnd } = usePageHeader();
   const { activeAction, actionStatus, dismissLog } = useSystemActions();
 
@@ -942,7 +898,7 @@ export default function SessionsPage() {
         p * PAGE_SIZE,
         "created",
         false,
-        { ...sessionDateFilter(dateRange), signal: controller.signal },
+        { signal: controller.signal },
       )
       .then((resp) => {
         if (controller.signal.aborted) return;
@@ -956,18 +912,7 @@ export default function SessionsPage() {
       .finally(() => {
         if (!silent && !controller.signal.aborted) setLoading(false);
       });
-  }, [dateRange]);
-
-  const loadStats = useCallback(() => {
-    api
-      .getSessionStats()
-      .then(setStats)
-      .catch(() => {});
   }, []);
-
-  useEffect(() => {
-    loadStats();
-  }, [loadStats]);
 
   // Refs for the overview poll's new-session detection. The poll effect
   // below is mounted once with stable deps, so it reads the current page
@@ -1052,16 +997,6 @@ export default function SessionsPage() {
     },
     [clearSelection],
   );
-  const updateDateRange = useCallback(
-    (next: SessionDateRange) => {
-      setDateRange(next);
-      setPage(0);
-      setExpandedId(null);
-      clearSelection();
-    },
-    [clearSelection],
-  );
-
   // Debounced FTS search
   useEffect(() => {
     if (debounceRef.current) clearTimeout(debounceRef.current);
@@ -1078,11 +1013,7 @@ export default function SessionsPage() {
     searchAbortRef.current = controller;
     debounceRef.current = setTimeout(() => {
       api
-        .searchSessions(
-          search.trim(),
-          controller.signal,
-          sessionDateFilter(dateRange),
-        )
+        .searchSessions(search.trim(), controller.signal)
         .then((resp) => {
           if (!controller.signal.aborted) {
             setSearchResults(resp.results);
@@ -1101,7 +1032,7 @@ export default function SessionsPage() {
       if (debounceRef.current) clearTimeout(debounceRef.current);
       controller.abort();
     };
-  }, [dateRange, search]);
+  }, [search]);
 
   const sessionDelete = useConfirmDelete({
     onDelete: useCallback(
@@ -1124,7 +1055,6 @@ export default function SessionsPage() {
           // ticks down without waiting for the next page navigation.
           refreshEmptyCount();
           showToast(t.sessions.sessionDeleted, "success");
-          loadStats();
         } catch {
           showToast(t.sessions.failedToDelete, "error");
           throw new Error("delete failed");
@@ -1134,7 +1064,6 @@ export default function SessionsPage() {
         expandedId,
         refreshEmptyCount,
         showToast,
-        loadStats,
         t.sessions.sessionDeleted,
         t.sessions.failedToDelete,
       ],
@@ -1172,12 +1101,9 @@ export default function SessionsPage() {
             else next.delete(rowId);
           }
         } else if (willSelect) {
-          if (next.size < COMPOSITION_SESSION_LIMIT) next.add(id);
+          next.add(id);
         } else {
           next.delete(id);
-        }
-        if (next.size > COMPOSITION_SESSION_LIMIT) {
-          return new Set(Array.from(next).slice(0, COMPOSITION_SESSION_LIMIT));
         }
         return next;
       });
@@ -1192,10 +1118,7 @@ export default function SessionsPage() {
   const selectAllOnPage = useCallback((visibleList: SessionInfo[]) => {
     setSelectedIds((prev) => {
       const next = new Set(prev);
-      for (const s of visibleList) {
-        if (next.size >= COMPOSITION_SESSION_LIMIT) break;
-        next.add(s.id);
-      }
+      for (const s of visibleList) next.add(s.id);
       return next;
     });
   }, []);
@@ -1292,12 +1215,11 @@ export default function SessionsPage() {
           prev.map((s) => (s.id === id ? { ...s, title } : s)),
         );
         showToast("Session renamed", "success");
-        loadStats();
       } catch {
         showToast("Failed to rename session", "error");
       }
     },
-    [showToast, loadStats],
+    [showToast],
   );
 
   const handleExport = useCallback(
@@ -1337,13 +1259,12 @@ export default function SessionsPage() {
       setPruneOpen(false);
       loadSessions(0);
       setPage(0);
-      loadStats();
     } catch {
       showToast("Failed to prune sessions", "error");
     } finally {
       setPruning(false);
     }
-  }, [pruneDays, showToast, loadSessions, loadStats]);
+  }, [pruneDays, showToast, loadSessions]);
 
   const pendingSession = sessionDelete.pendingId
     ? sessions.find((s) => s.id === sessionDelete.pendingId)
@@ -1412,7 +1333,7 @@ export default function SessionsPage() {
   }
 
   return (
-    <div className="session-statistics-content flex min-w-0 w-full max-w-full flex-col gap-4">
+    <div className="flex min-w-0 w-full max-w-full flex-col gap-4">
       <PluginSlot name="sessions:top" />
       <Toast toast={toast} />
 
@@ -1528,50 +1449,11 @@ export default function SessionsPage() {
             size="sm"
             onClick={() => {
               loadSessions(page);
-              loadStats();
               refreshEmptyCount();
             }}
           >
             {t.common.retry}
           </Button>
-        </div>
-      )}
-
-      {stats && (
-        <div className="flex flex-wrap items-center gap-x-6 gap-y-2 border border-border bg-background-base/40 px-4 py-3">
-          <div className="flex flex-col">
-            <span className="text-lg font-semibold tabular-nums leading-none">
-              {stats.total}
-            </span>
-            <span className="text-xs text-muted-foreground">{chatText.statistics.total}</span>
-          </div>
-          <div className="flex flex-col">
-            <span className="text-lg font-semibold tabular-nums leading-none text-success">
-              {stats.active_store}
-            </span>
-            <span className="text-xs text-muted-foreground">{chatText.statistics.activeInStore}</span>
-          </div>
-          <div className="flex flex-col">
-            <span className="text-lg font-semibold tabular-nums leading-none">
-              {stats.archived}
-            </span>
-            <span className="text-xs text-muted-foreground">{chatText.statistics.archived}</span>
-          </div>
-          <div className="flex flex-col">
-            <span className="text-lg font-semibold tabular-nums leading-none">
-              {stats.messages}
-            </span>
-            <span className="text-xs text-muted-foreground">{chatText.statistics.messages}</span>
-          </div>
-          {Object.keys(stats.by_source).length > 0 && (
-            <div className="flex min-w-0 flex-1 flex-wrap items-center gap-1.5">
-              {Object.entries(stats.by_source).map(([src, count]) => (
-                <Badge key={src} tone="outline" className="text-xs">
-                  {src}: {count}
-                </Badge>
-              ))}
-            </div>
-          )}
         </div>
       )}
 
@@ -1659,46 +1541,6 @@ export default function SessionsPage() {
         </div>
       )}
 
-      {showList && (
-        <div className="flex min-w-0 flex-col gap-2 border border-border bg-background-base/40 p-3" aria-label={compositionText.dateRange}>
-          <div className="flex flex-wrap items-end gap-3">
-            <label className="flex min-w-36 flex-1 flex-col gap-1 text-xs font-medium text-muted-foreground sm:flex-none">
-              {compositionText.startDate}
-              <Input
-                aria-label={compositionText.startDate}
-                type="date"
-                value={dateRange.start}
-                disabled={dateRange.allTime}
-                max={dateRange.end}
-                onChange={(event) => updateDateRange({ ...dateRange, start: event.target.value })}
-                className="h-8 py-0 text-xs"
-              />
-            </label>
-            <label className="flex min-w-36 flex-1 flex-col gap-1 text-xs font-medium text-muted-foreground sm:flex-none">
-              {compositionText.endDate}
-              <Input
-                aria-label={compositionText.endDate}
-                type="date"
-                value={dateRange.end}
-                disabled={dateRange.allTime}
-                min={dateRange.start}
-                onChange={(event) => updateDateRange({ ...dateRange, end: event.target.value })}
-                className="h-8 py-0 text-xs"
-              />
-            </label>
-            <Button
-              outlined={!dateRange.allTime}
-              size="sm"
-              aria-pressed={dateRange.allTime}
-              onClick={() => updateDateRange({ ...dateRange, allTime: !dateRange.allTime })}
-            >
-              {compositionText.allTime}
-            </Button>
-          </div>
-          <p className="text-xs text-muted-foreground">{compositionText.dateHelp}</p>
-        </div>
-      )}
-
       {(showOverviewTab && !isSearching) || showList ? (
         <div className="flex w-full min-w-0 flex-wrap items-center gap-2 sm:gap-3">
           <div className="flex min-w-0 flex-1 flex-wrap items-center gap-2 sm:gap-3">
@@ -1773,10 +1615,9 @@ export default function SessionsPage() {
       ) : null}
 
       {showList && selectedIds.size > 0 && (
-        <div className="flex min-w-0 flex-col gap-3">
-          <div
-            className="flex flex-wrap items-center gap-2 border border-primary/30 bg-primary/[0.06] px-3 py-2"
-            role="region"
+        <div
+          className="flex flex-wrap items-center gap-2 border border-primary/30 bg-primary/[0.06] px-3 py-2"
+          role="region"
           aria-label={t.sessions.selectedCount.replace(
             "{count}",
             String(selectedIds.size),
@@ -1834,15 +1675,7 @@ export default function SessionsPage() {
                 String(selectedIds.size),
               )}
             </span>
-            </Button>
-          </div>
-          <p className="text-xs text-muted-foreground">
-            {compositionText.selectionLimit}
-          </p>
-          <SessionCompositionCharts
-            ids={Array.from(selectedIds)}
-            title={compositionText.selectedTitle}
-          />
+          </Button>
         </div>
       )}
 

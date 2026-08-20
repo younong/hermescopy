@@ -78,6 +78,7 @@ export type AuthedFetch = (url: string, init?: RequestInit) => Promise<Response>
 export type BuildWsUrl = (
   path: string,
   params?: Record<string, string>,
+  options?: { signal?: AbortSignal },
 ) => Promise<string>;
 
 /**
@@ -94,6 +95,12 @@ export type BuildWsAuthParam = (path: string) => Promise<[string, string]>;
 export interface PluginRegistry {
   /** Register the plugin's main tab component by manifest name. */
   register(name: string, component: ComponentType<Record<string, never>>): void;
+  /** Register a Chat workspace component declared by the plugin manifest. */
+  registerWorkspace(
+    pluginName: string,
+    workspaceId: string,
+    component: ComponentType<Record<string, never>>,
+  ): void;
   /** Register a component into a named host slot. */
   registerSlot(slot: string, name: string, component: ComponentType): void;
 }
@@ -107,9 +114,9 @@ export interface HermesPluginSDK {
   readonly sdkVersion: string;
 
   /** React core — use instead of importing/bundling react. */
-  React: {
-    createElement: typeof import("react").createElement;
-    Fragment: typeof import("react").Fragment;
+  React: typeof import("react").default;
+  reactDom: {
+    createPortal: typeof import("react-dom").createPortal;
   };
   hooks: {
     useState: <T>(initial: T | (() => T)) => [T, Dispatch<SetStateAction<T>>];
@@ -168,6 +175,9 @@ export interface HermesPluginSDK {
     showToast: (message: string, type: "error" | "success") => void;
     toast: { message: string; type: "error" | "success" } | null;
   };
+
+  /** Host-provided icon components so plugin bundles do not ship lucide/react. */
+  icons: Record<string, ComponentType<{ className?: string }>>;
 
   utils: {
     cn: (...classes: Array<string | false | null | undefined>) => string;

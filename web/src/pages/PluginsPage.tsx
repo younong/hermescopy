@@ -343,7 +343,7 @@ export default function PluginsPage() {
                   {m.label ?? m.name} — {m.description || m.tab?.path}
 
 
-                  {!m.tab?.hidden ? (
+                  {m.tab && !m.tab.hidden ? (
 
 
                     <Link className="ml-3 inline-flex items-center gap-1 underline" to={m.tab.path}>

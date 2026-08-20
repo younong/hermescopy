@@ -313,6 +313,9 @@ plugins = [
   "*/dashboard/plugin_api.py",
   "*/dashboard/dist/*",
   "*/dashboard/dist/**/*",
+  "memory/*/dashboard/manifest.json",
+  "memory/*/dashboard/dist/*",
+  "memory/*/dashboard/dist/**/*",
   # Plugin discovery (hermes_cli/plugins.py) reads a plugin.yaml/plugin.yml
   # manifest from each bundled plugin directory to register it. Wheels only
   # carry files declared here, so without this glob the wheel ships every

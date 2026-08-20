@@ -7,7 +7,7 @@ import {
 } from "./registry";
 import { useI18n } from "@/i18n";
 import { cn } from "@/lib/utils";
-import type { Translations } from "@/i18n/types";
+import { formatPluginError } from "./errors";
 
 /** Renders a plugin tab once its bundle has called `register()`. */
 export function PluginPage({ name }: { name: string }) {
@@ -55,10 +55,4 @@ export function PluginPage({ name }: { name: string }) {
       <span>{t.common.loading}</span>
     </div>
   );
-}
-
-function formatPluginError(code: string, t: Translations): string {
-  if (code === "LOAD_FAILED") return t.common.pluginLoadFailed;
-  if (code === "NO_REGISTER") return t.common.pluginNotRegistered;
-  return code;
 }

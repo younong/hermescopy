@@ -166,8 +166,8 @@ function click(element: Element) {
   element.dispatchEvent(new MouseEvent("click", { bubbles: true }));
 }
 
-describe("SessionsPage composition flow", () => {
-  it("resets selection and expansion on date change and requests aggregate/detail composition without dates", async () => {
+describe("SessionsPage session management", () => {
+  it("keeps bulk selection for deletion without requesting aggregate composition", async () => {
     mockSessionsPageApi();
     const { container, root } = await renderSessionsPage();
     const history = Array.from(container.querySelectorAll('[role="radio"]')).find((button) => button.textContent === "History")!;
@@ -176,54 +176,37 @@ describe("SessionsPage composition flow", () => {
     await vi.waitFor(() => {
       expect(container.querySelector('[role="checkbox"]'), container.innerHTML).not.toBeNull();
     });
-    const checkbox = container.querySelector('[role="checkbox"]')!;
-    await act(async () => click(checkbox));
-    expect(api.getSessionComposition).toHaveBeenCalledWith(["session-a"], expect.objectContaining({ signal: expect.any(AbortSignal) }));
+    await act(async () => click(container.querySelector('[role="checkbox"]')!));
 
-    const row = Array.from(container.querySelectorAll("div")).find((node) =>
-      node.textContent?.includes("session-a") && node.className.includes("cursor-pointer"),
-    )!;
-    await act(async () => click(row));
-    expect(api.getSessionComposition).toHaveBeenCalledTimes(2);
-
-    const allTime = Array.from(container.querySelectorAll("button")).find((button) => button.textContent === "All time")!;
-    await act(async () => click(allTime));
-    await vi.waitFor(() => expect(container.textContent).not.toContain("1 selected"));
-    expect(api.getSessions).toHaveBeenCalledWith(
-      20,
-      0,
-      "created",
-      false,
-      expect.objectContaining({ signal: expect.any(AbortSignal) }),
-    );
-    const filteredCalls = vi.mocked(api.getSessions).mock.calls.filter(([limit]) => limit === 20);
-    expect(filteredCalls.at(-1)?.[4]).not.toHaveProperty("active_from");
-    expect(filteredCalls.at(-1)?.[4]).not.toHaveProperty("active_before");
-    for (const [ids, options] of vi.mocked(api.getSessionComposition).mock.calls) {
-      expect(ids).toEqual(["session-a"]);
-      expect(options).not.toHaveProperty("active_from");
-      expect(options).not.toHaveProperty("active_before");
-    }
+    expect(container.textContent).toContain("1 selected");
+    expect(container.textContent).toContain("Delete 1");
+    expect(api.getSessionComposition).not.toHaveBeenCalled();
+    expect(api.getSessionStats).not.toHaveBeenCalled();
+    expect(Array.from(container.querySelectorAll('input[type="date"]'))).toHaveLength(0);
     await act(async () => root.unmount());
   });
-  it("renders Chat-visible store statistics in Chinese", async () => {
+
+  it("preserves useful per-session composition details on expansion", async () => {
     mockSessionsPageApi();
-    vi.mocked(api.getSessionStats).mockResolvedValue({
-      total: 3,
-      active_store: 1,
-      archived: 1,
-      messages: 8,
-      by_source: {},
+    const { container, root } = await renderSessionsPage();
+    const history = Array.from(container.querySelectorAll('[role="radio"]')).find((button) => button.textContent === "History")!;
+    await act(async () => click(history));
+    const row = await vi.waitFor(() => {
+      const candidate = Array.from(container.querySelectorAll("div")).find((node) =>
+        node.textContent?.includes("session-a") && node.className.includes("cursor-pointer"),
+      );
+      expect(candidate).toBeDefined();
+      return candidate!;
     });
 
-    const { container, root } = await renderSessionsPage("zh");
-    await vi.waitFor(() => expect(container.textContent).toContain("存储中活跃"));
-    expect(container.textContent).toContain("总计");
-    expect(container.textContent).toContain("已归档");
-    expect(container.textContent).toContain("消息");
+    await act(async () => click(row));
+
+    expect(api.getSessionComposition).toHaveBeenCalledWith(
+      ["session-a"],
+      expect.objectContaining({ signal: expect.any(AbortSignal) }),
+    );
     await act(async () => root.unmount());
   });
-
 });
 
 describe("SessionMessageList", () => {

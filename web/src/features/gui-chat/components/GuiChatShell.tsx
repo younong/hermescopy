@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useReducer, useRef, useState, type ReactNode } from "react";
+import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { useLocation, useNavigate, useSearchParams } from "react-router-dom";
 import { Button } from "@nous-research/ui/ui/components/button";
@@ -12,12 +12,10 @@ import {
   LogOut,
   Menu,
   MessageSquarePlus,
-  PieChart,
   RefreshCw,
   Search,
   QrCode,
   Settings2,
-  SquareKanban,
   UsersRound,
   SlidersHorizontal,
   Sparkles,
@@ -35,11 +33,10 @@ import {
 } from "@/features/collaboration/routing";
 import type { CollaborationGroup } from "@/features/collaboration/types";
 import { ConnectWeChatModal } from "@/features/ilink/ConnectWeChatModal";
-import { PageHeaderContext } from "@/contexts/page-header-context";
 import { GuiChatFilesPane } from "@/features/files/components/GuiChatFilesPane";
-import { GuiChatKanbanPane } from "@/features/kanban/components/GuiChatKanbanPane";
 import { guiChatTranslations, useI18n } from "@/i18n";
-import SessionsPage from "@/pages/SessionsPage";
+import { usePlugins } from "@/plugins";
+import { buildChatWorkspaces } from "../chatWorkspaces";
 import {
   api,
   employeeDisplayName,
@@ -83,15 +80,10 @@ import { GuiChatWorkspaceDialog } from "./GuiChatWorkspaceDialog";
 import { GuiChatSkillsPane } from "./GuiChatSkillsPane";
 import { MessageList } from "./MessageList";
 
-const EMBEDDED_PAGE_HEADER = {
-  setAfterTitle: (_node: ReactNode) => undefined,
-  setEnd: (_node: ReactNode) => undefined,
-  setTitle: (_title: string | null) => undefined,
-};
-
 export function GuiChatShell() {
   const { t } = useI18n();
   const copy = guiChatTranslations(t);
+  const { loading: pluginsLoading, manifests } = usePlugins();
   const location = useLocation();
   const navigate = useNavigate();
   const [searchParams, setSearchParams] = useSearchParams();
@@ -109,9 +101,7 @@ export function GuiChatShell() {
     ? decodeURIComponent(legacyEmployeeMatch[1])
     : null;
   const employeeId = employeeRouteId ?? legacyEmployeeId;
-  const statisticsOpen = workspacePath === "/chat/statistics";
   const filesOpen = workspacePath === "/chat/files";
-  const kanbanOpen = workspacePath === "/chat/kanban";
   const skillsOpen = workspacePath === "/chat/skills";
   const [scheduledTasksAvailable, setScheduledTasksAvailable] = useState(false);
   const scheduledTasksOpen =
@@ -119,7 +109,30 @@ export function GuiChatShell() {
   const contactsOpen = workspacePath === "/chat/contacts" || employeeId !== null;
   const selectedEmployeeId = employeeId;
   const modelsOpen = workspacePath === "/chat/models";
-  const workspacePaneOpen = statisticsOpen || filesOpen || kanbanOpen || skillsOpen || scheduledTasksOpen || contactsOpen || modelsOpen;
+  const coreWorkspaces = useMemo(() => [
+    { id: "contacts", path: "/chat/contacts", label: copy.shell.contacts, description: copy.shell.workspace, icon: ContactRound },
+    { id: "files", path: "/chat/files", label: copy.shell.files, description: copy.shell.workspace, icon: FolderOpen },
+    { id: "skills", path: "/chat/skills", label: copy.shell.skills, description: copy.shell.workspace, icon: Sparkles },
+    ...(scheduledTasksAvailable
+      ? [{ id: "scheduled-tasks", path: "/chat/scheduled-tasks", label: copy.shell.scheduledTasks, description: copy.shell.workspace, icon: CalendarClock }]
+      : []),
+    { id: "models", path: "/chat/models", label: copy.shell.models, description: copy.shell.workspace, icon: SlidersHorizontal },
+  ], [copy, scheduledTasksAvailable]);
+  const chatWorkspaces = useMemo(
+    () => buildChatWorkspaces(coreWorkspaces, manifests),
+    [coreWorkspaces, manifests],
+  );
+  const activePluginWorkspace = chatWorkspaces.find(
+    (workspace) => workspace.pluginName && workspace.path === workspacePath,
+  );
+  const unknownWorkspaceRoute = workspacePath.startsWith("/chat/")
+    && !filesOpen
+    && !skillsOpen
+    && !scheduledTasksOpen
+    && !contactsOpen
+    && !modelsOpen
+    && !activePluginWorkspace;
+  const workspacePaneOpen = Boolean(activePluginWorkspace) || unknownWorkspaceRoute || filesOpen || skillsOpen || scheduledTasksOpen || contactsOpen || modelsOpen;
   const [state, dispatch] = useReducer(guiChatReducer, initialGuiChatState);
   const connectionRef = useRef<GuiChatConnection | null>(null);
   const historyAbortRef = useRef<AbortController | null>(null);
@@ -398,6 +411,7 @@ export function GuiChatShell() {
   switchCoordinatorRef.current = switchCoordinator;
 
   const connectRoute = useCallback(() => {
+    if (workspacePaneOpen && !contactsOpen && !groupId) return;
     if (contactsOpen && !employeeId) {
       if (employeeRouteTargetRef.current === null) return;
       employeeRouteTargetRef.current = null;
@@ -517,6 +531,7 @@ export function GuiChatShell() {
     resumeSessionId,
     switchCoordinator,
     updateSearchParams,
+    workspacePaneOpen,
   ]);
 
   const retryConnection = useCallback(() => {
@@ -1037,6 +1052,9 @@ export function GuiChatShell() {
       )
     : copy.shell.unnamedEmployee;
   const conversationSurfaceOpen = !workspacePaneOpen || (contactsOpen && selectedEmployeeAvailable);
+  useEffect(() => {
+    if (!pluginsLoading && unknownWorkspaceRoute) navigate("/chat", { replace: true });
+  }, [navigate, pluginsLoading, unknownWorkspaceRoute]);
   const accountLabel = authMe?.display_name || authMe?.email || copy.shell.workspaceAccount;
   const handleLogout = () => {
     dashboardAuthTransition.reset();
@@ -1065,95 +1083,28 @@ export function GuiChatShell() {
           <MessageSquarePlus />
           <span>{copy.shell.newChat}</span>
         </button>
-        <button
-          aria-current={contactsOpen ? "page" : undefined}
-          aria-label={copy.shell.contacts}
-          className="gui-chat-nav-item"
-          onClick={() => {
-            closeMobilePanel();
-            navigate(`/chat/contacts${contactsSearch}`);
-          }}
-          type="button"
-        >
-          <ContactRound />
-          <span>{copy.shell.contacts}</span>
-        </button>
-        <button
-          aria-current={statisticsOpen ? "page" : undefined}
-          aria-label={copy.shell.messageCompositionStatistics}
-          className="gui-chat-nav-item"
-          onClick={() => {
-            closeMobilePanel();
-            navigate("/chat/statistics");
-          }}
-          type="button"
-        >
-          <PieChart />
-          <span>{copy.shell.messageStatistics}</span>
-        </button>
-        <button
-          aria-current={filesOpen ? "page" : undefined}
-          className="gui-chat-nav-item"
-          onClick={() => {
-            closeMobilePanel();
-            navigate("/chat/files");
-          }}
-          type="button"
-        >
-          <FolderOpen />
-          <span>{copy.shell.files}</span>
-        </button>
-        <button
-          aria-current={kanbanOpen ? "page" : undefined}
-          className="gui-chat-nav-item"
-          onClick={() => {
-            closeMobilePanel();
-            navigate("/chat/kanban");
-          }}
-          type="button"
-        >
-          <SquareKanban />
-          <span>{t.kanban.board}</span>
-        </button>
-        <button
-          aria-current={skillsOpen ? "page" : undefined}
-          className="gui-chat-nav-item"
-          onClick={() => {
-            closeMobilePanel();
-            navigate("/chat/skills");
-          }}
-          type="button"
-        >
-          <Sparkles />
-          <span>{copy.shell.skills}</span>
-        </button>
-        {scheduledTasksAvailable ? (
-          <button
-            aria-current={scheduledTasksOpen ? "page" : undefined}
-            className="gui-chat-nav-item"
-            onClick={() => {
-              closeMobilePanel();
-              navigate("/chat/scheduled-tasks");
-            }}
-            type="button"
-          >
-            <CalendarClock />
-            <span>{copy.shell.scheduledTasks}</span>
-          </button>
-        ) : null}
-        <button
-          aria-current={modelsOpen ? "page" : undefined}
-          aria-label={copy.shell.manageModels}
-          className="gui-chat-nav-item"
-          onClick={() => {
-            closeMobilePanel();
-            navigate("/chat/models");
-          }}
-          type="button"
-        >
-          <SlidersHorizontal />
-          <span>{copy.shell.models}</span>
-        </button>
+{chatWorkspaces.map((workspace) => {
+          const Icon = workspace.icon;
+          const active = workspace.id === "contacts"
+            ? contactsOpen
+            : workspace.path === workspacePath;
+          return (
+            <button
+              aria-current={active ? "page" : undefined}
+              aria-label={workspace.id === "models" ? copy.shell.manageModels : workspace.label}
+              className="gui-chat-nav-item"
+              key={`${workspace.pluginName ?? "core"}:${workspace.id}`}
+              onClick={() => {
+                closeMobilePanel();
+                navigate(workspace.id === "contacts" ? `${workspace.path}${contactsSearch}` : workspace.path);
+              }}
+              type="button"
+            >
+              <Icon />
+              <span>{workspace.label}</span>
+            </button>
+          );
+        })}
       </nav>
       <GroupsSidebar
         activeGroupId={groupId}
@@ -1379,21 +1330,19 @@ export function GuiChatShell() {
           ) : <div className="w-8" />}
           <div className="pointer-events-none absolute inset-x-20 top-1/2 min-w-0 -translate-y-1/2 text-center">
             <h1 className="truncate text-[14px] font-medium leading-[22px] text-[#25282d]">
-              {statisticsOpen
-                ? copy.shell.messageStatistics
+              {activePluginWorkspace
+                ? activePluginWorkspace.label
                 : filesOpen
                   ? copy.shell.files
-                  : kanbanOpen
-                    ? t.kanban.board
-                : skillsOpen
-                  ? copy.shell.skills
-                  : scheduledTasksOpen
-                    ? copy.shell.scheduledTasks
-                    : contactsOpen
-                      ? contactTitle
-                      : modelsOpen
-                        ? copy.shell.models
-                        : conversationTitle}
+                  : skillsOpen
+                    ? copy.shell.skills
+                    : scheduledTasksOpen
+                      ? copy.shell.scheduledTasks
+                      : contactsOpen
+                        ? contactTitle
+                        : modelsOpen
+                          ? copy.shell.models
+                          : conversationTitle}
             </h1>
             <p className="truncate text-[0.625rem] text-[#969aa1]">
               {contactsOpen
@@ -1402,8 +1351,8 @@ export function GuiChatShell() {
                       .replace("{role}", contactRole)
                       .replace("{connection}", state.connection)
                   : copy.shell.selectContact
-                : workspacePaneOpen
-                  ? copy.shell.workspace
+                : activePluginWorkspace?.description || workspacePaneOpen
+                  ? activePluginWorkspace?.description || copy.shell.workspace
                   : groupId
                   ? copy.shell.workspaceSummaryGroup
                       .replace("{status}", activeGroup?.status ?? copy.shell.group)
@@ -1437,20 +1386,14 @@ export function GuiChatShell() {
           ) : null}
         </header>
 
-        {statisticsOpen ? (
-          <PageHeaderContext.Provider value={EMBEDDED_PAGE_HEADER}>
-            <div
-              data-statistics-pane
-              data-theme="chat-workspace"
-              className="gui-chat-statistics-pane min-h-0 flex-1 overflow-auto"
-            >
-              <SessionsPage />
-            </div>
-          </PageHeaderContext.Provider>
+        {unknownWorkspaceRoute ? (
+          <div className="flex min-h-0 flex-1 items-center justify-center px-6 text-sm text-[#777c84]" role="status">
+            {t.common.loading}
+          </div>
+        ) : activePluginWorkspace?.render ? (
+          activePluginWorkspace.render()
         ) : filesOpen ? (
           <GuiChatFilesPane />
-        ) : kanbanOpen ? (
-          <GuiChatKanbanPane />
         ) : skillsOpen ? (
           <GuiChatSkillsPane />
         ) : scheduledTasksOpen ? (
