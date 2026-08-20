@@ -4112,6 +4112,44 @@ class TestRunConversation:
         sent_messages = agent.client.chat.completions.create.call_args.kwargs["messages"]
         assert all("attachments" not in message for message in sent_messages)
 
+    def test_loopback_provider_receives_fixed_initial_tool_payload(self, agent):
+        """The real conversation loop sends only the stable initial tool set."""
+        self._setup_agent(agent)
+        from tools.tool_search import ToolSearchConfig, estimate_tokens_from_schemas
+
+        agent.tools = [
+            _make_tool_defs("terminal")[0],
+            _make_tool_defs("read_file")[0],
+            _make_tool_defs("write_file")[0],
+            _make_tool_defs("memory")[0],
+        ]
+        agent.valid_tool_names = {tool["function"]["name"] for tool in agent.tools}
+        agent.client.chat.completions.create.return_value = _mock_response(
+            content="Done", finish_reason="stop"
+        )
+
+        with (
+            patch(
+                "tools.tool_search.load_config",
+                return_value=ToolSearchConfig.from_raw({"enabled": "on"}),
+            ),
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("inspect the project")
+
+        assert result["completed"] is True
+        payload = agent.client.chat.completions.create.call_args.kwargs
+        advertised = payload["tools"]
+        names = [tool["function"]["name"] for tool in advertised]
+        assert names == [
+            "terminal", "read_file", "write_file",
+            "tool_search", "tool_describe", "tool_call",
+        ]
+        assert "memory" not in names
+        assert estimate_tokens_from_schemas(advertised) < 3500
+
     def test_request_local_tool_selection_does_not_mutate_executable_catalog(
         self, agent
     ):
@@ -4148,13 +4186,15 @@ class TestRunConversation:
         advertised = agent.client.chat.completions.create.call_args.kwargs["tools"]
         advertised_names = [tool["function"]["name"] for tool in advertised]
         assert advertised_names == [
+            "terminal",
             "read_file",
+            "write_file",
             "tool_search",
             "tool_describe",
             "tool_call",
         ]
-        assert "terminal" not in advertised_names
-        assert "write_file" not in advertised_names
+        assert "terminal" in advertised_names
+        assert "write_file" in advertised_names
         assert agent.tools == original_tools
         assert agent.valid_tool_names == {"terminal", "read_file", "write_file"}
         assert result["completed"] is True
