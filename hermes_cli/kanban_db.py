@@ -2284,7 +2284,7 @@ def _canonical_assignee(assignee: Optional[str]) -> Optional[str]:
     """Lowercase-assignee normalization for Kanban rows (dashboard/CLI parity)."""
     if assignee is None:
         return None
-    from hermes_cli.profiles import normalize_profile_name
+    from hermes_cli.cron_dashboard import normalize_profile_name
 
     return normalize_profile_name(assignee)
 
@@ -7678,7 +7678,7 @@ def _default_spawn(
     if not task.assignee:
         raise ValueError(f"task {task.id} has no assignee")
 
-    from hermes_cli.profiles import normalize_profile_name
+    from hermes_cli.cron_dashboard import normalize_profile_name
 
     profile_arg = normalize_profile_name(task.assignee)
 
@@ -7694,9 +7694,9 @@ def _default_spawn(
     # back to Path.home() / ".hermes" (the DEFAULT profile root), ignoring the
     # profile-specific config entirely.  Fixes profile-scoped fallback_providers
     # being invisible to kanban workers.
-    from hermes_cli.profiles import resolve_profile_env
+    from hermes_cli.cron_dashboard import profile_home
     try:
-        env["HERMES_HOME"] = resolve_profile_env(profile_arg)
+        env["HERMES_HOME"] = str(profile_home(profile_arg)[1])
     except FileNotFoundError:
         # Profile dir doesn't exist — defer resolution to the CLI's
         # _apply_profile_override() via HERMES_PROFILE (set below).
