@@ -437,10 +437,13 @@ _GENERIC_DESCRIPTION = (
     "`hermes tools` → Video Generation; the agent does not pick them. "
     "Long-running generations may take 30 seconds to several minutes — "
     "the call blocks until the video is ready. Returns the result in the "
-    "`video` field — either an HTTP URL or an absolute file path. To show "
-    "it to the user, reference that path/URL in your response using the "
-    "file-delivery convention for the current platform (your platform "
-    "guidance describes how files are delivered here)."
+    "`video` field — for HTTP-backed providers it is an `http(s)://` URL; "
+    "for local sandbox outputs it is a workspace-relative path such as "
+    "`generated/videos/clip.mp4`. Reference that value verbatim in your "
+    "response using the file-delivery convention for the current platform "
+    "(for example `MEDIA:<value>`). Do not prefix local paths with the "
+    "sandbox cwd alias `/workspace/` or any other leading directory — the "
+    "gateway needs the workspace-relative form to authenticate the download."
 )
 
 

@@ -51,6 +51,36 @@ describe("session files", () => {
     );
   });
 
+  it("normalizes the /workspace/ sandbox cwd alias to a workspace-relative path", () => {
+    const resolved = resolveSessionImageReference("/workspace/generated/images/cat.png", "/workspace", "cat.png");
+    expect(resolved.sourcePath).toBe("generated/images/cat.png");
+    expect(resolved.previewUrl).toBe("/api/fs/read-data-url?path=generated%2Fimages%2Fcat.png&cwd=%2Fworkspace");
+    expect(resolved.downloadUrl).toBe(
+      "/api/files/download?path=generated%2Fimages%2Fcat.png&cwd=%2Fworkspace&filename=cat.png",
+    );
+  });
+
+  it.each([
+    ["/workspace/generated/audio/voice.mp3"],
+    ["/workspace/generated/videos/clip.mp4"],
+  ] as const)("normalizes /workspace/ prefixes for %s categories", (path) => {
+    const resolved = resolveSessionImageReference(path);
+    expect(resolved.sourcePath).toBe(path.replace(/^\/workspace\//, ""));
+  });
+
+  it("keeps unrelated /workspace/ paths absolute so the resolver does not over-match", () => {
+    const resolved = resolveSessionImageReference("/workspace/uploads/photo.png");
+    // Outside the generated/{images,audio,videos} subtree the resolver must
+    // not strip the /workspace/ prefix; the absolute path stays intact.
+    expect(resolved.sourcePath).toBe("/workspace/uploads/photo.png");
+    expect(resolved.previewUrl).toBe(
+      "/api/fs/read-data-url?path=%2Fworkspace%2Fuploads%2Fphoto.png",
+    );
+    expect(resolved.downloadUrl).toBe(
+      "/api/files/download?path=%2Fworkspace%2Fuploads%2Fphoto.png&filename=photo.png",
+    );
+  });
+
   it.each([
     ["page.html", undefined, "html"],
     ["download", "application/pdf", "pdf"],

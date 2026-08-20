@@ -89,7 +89,13 @@ export function resolveSessionImageReference(
 
 function workspaceVisiblePath(path: string): string | undefined {
   const normalized = path.replaceAll("\\", "/");
-  const match = normalized.match(/(?:^|\/)workspaces\/.+\/(generated\/(?:images|audio|videos)\/[^/]+)$/);
+  // Match both the on-disk layout (`/workspaces/<name>/generated/...`) and
+  // the tool-executor sandbox cwd alias (`/workspace/generated/...`) that the
+  // LLM occasionally inserts when narrating tool results. Both forms resolve
+  // to the same workspace-relative artifact path.
+  const match = normalized.match(
+    /(?:^|\/)(?:workspaces\/[^/]+\/|workspace\/)(generated\/(?:images|audio|videos)\/[^/]+)$/,
+  );
   return match?.[1];
 }
 
