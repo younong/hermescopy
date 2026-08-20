@@ -378,6 +378,7 @@ def test_gated_require_token_routes_reject_cookie_session_in_owner_mode(
         ("/api/sessions/abc123/export", False),
         ("/api/analytics/usage", True),
         ("/api/model/info", True),
+        ("/api/model/options", True),
         ("/api/logs", True),
         ("/api/fs/read-data-url", True),
         ("/api/sessions/abc123/unmigrated", False),
@@ -617,15 +618,18 @@ def test_authenticated_skill_routes_are_explicit_owner_worker_routes(method, pat
 @pytest.mark.parametrize(
     ("method", "path"),
     [
-        ("GET", "/api/cron/jobs"),
-        ("POST", "/api/cron/jobs"),
-        ("GET", "/api/cron/jobs/job-1"),
-        ("PUT", "/api/cron/jobs/job-1"),
-        ("DELETE", "/api/cron/jobs/job-1"),
-        ("POST", "/api/cron/jobs/job-1/pause"),
-        ("POST", "/api/cron/jobs/job-1/resume"),
-        ("POST", "/api/cron/jobs/job-1/trigger"),
-        ("GET", "/api/cron/delivery-targets"),
+        ("GET", "/api/plugins/scheduled-tasks/jobs"),
+        ("POST", "/api/plugins/scheduled-tasks/jobs"),
+        ("GET", "/api/plugins/scheduled-tasks/jobs/job-1"),
+        ("PUT", "/api/plugins/scheduled-tasks/jobs/job-1"),
+        ("DELETE", "/api/plugins/scheduled-tasks/jobs/job-1"),
+        ("POST", "/api/plugins/scheduled-tasks/jobs/job-1/pause"),
+        ("POST", "/api/plugins/scheduled-tasks/jobs/job-1/resume"),
+        ("POST", "/api/plugins/scheduled-tasks/jobs/job-1/trigger"),
+        ("GET", "/api/plugins/scheduled-tasks/jobs/job-1/runs"),
+        ("GET", "/api/plugins/scheduled-tasks/delivery-targets"),
+        ("GET", "/api/plugins/scheduled-tasks/blueprints"),
+        ("POST", "/api/plugins/scheduled-tasks/blueprints/instantiate"),
     ],
 )
 def test_authenticated_cron_routes_are_owner_worker_bound(method, path):
@@ -637,13 +641,13 @@ def test_authenticated_cron_routes_are_owner_worker_bound(method, path):
 @pytest.mark.parametrize(
     ("method", "path"),
     [
-        ("DELETE", "/api/cron/jobs"),
-        ("POST", "/api/cron/jobs/job-1"),
-        ("PATCH", "/api/cron/jobs/job-1"),
-        ("GET", "/api/cron/jobs/job-1/pause"),
-        ("POST", "/api/cron/jobs/job-1/runs"),
-        ("GET", "/api/cron/jobs/job-1/private"),
-        ("POST", "/api/cron/delivery-targets"),
+        ("DELETE", "/api/plugins/scheduled-tasks/jobs"),
+        ("POST", "/api/plugins/scheduled-tasks/jobs/job-1"),
+        ("PATCH", "/api/plugins/scheduled-tasks/jobs/job-1"),
+        ("GET", "/api/plugins/scheduled-tasks/jobs/job-1/pause"),
+        ("POST", "/api/plugins/scheduled-tasks/jobs/job-1/runs"),
+        ("GET", "/api/plugins/scheduled-tasks/jobs/job-1/private"),
+        ("POST", "/api/plugins/scheduled-tasks/delivery-targets"),
     ],
 )
 def test_authenticated_cron_routes_are_method_and_path_exact(method, path):
@@ -1084,9 +1088,7 @@ def test_gated_plugin_api_allowed_path_is_not_403_by_owner_gate(gated_app):
 
 
 def test_gated_unknown_plugin_path_is_still_403_by_owner_gate(gated_app):
-    """Plugin names not in PLUGIN_API_ALLOWED_NAMES must still fall through
-    the gate's fail-closed semantics — only explicitly opened gates can
-    broaden cookie auth."""
+    """Unregistered plugin routes retain the gate's fail-closed semantics."""
     _complete_stub_login(gated_app)
     r = gated_app.get("/api/plugins/not-kanban/boards", follow_redirects=False)
     assert r.status_code == 403

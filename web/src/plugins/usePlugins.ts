@@ -13,7 +13,6 @@ import type { PluginManifest, RegisteredPlugin } from "./types";
 import {
   getPluginComponent,
   onPluginRegistered,
-  notifyPluginRegistry,
   setPluginLoadError,
 } from "./registry";
 
@@ -85,7 +84,6 @@ export function usePlugins() {
         );
       };
       script.onload = () => {
-        notifyPluginRegistry();
         queueMicrotask(() => {
           if (getPluginComponent(manifest.name)) return;
           setPluginLoadError(manifest.name, "NO_REGISTER");

@@ -157,25 +157,56 @@ def _notify_provider() -> None:
     _notify_provider_jobs_changed()
 
 
-def list_jobs(home: str | Path, *, include_disabled: bool = True) -> list[dict[str, Any]]:
-    with use_store(_store(home)):
+def _annotate_job(
+    job: Mapping[str, Any],
+    *,
+    profile: str | None,
+    home: Path,
+) -> dict[str, Any]:
+    result = dict(job)
+    if profile is not None:
+        result.update(
+            profile=profile,
+            profile_name=profile,
+            hermes_home=str(home),
+            is_default_profile=profile == "default",
+        )
+    return result
+
+
+def list_jobs(
+    home: str | Path,
+    *,
+    profile: str | None = None,
+    include_disabled: bool = True,
+) -> list[dict[str, Any]]:
+    store = _store(home)
+    with use_store(store):
         from cron.jobs import list_jobs as load_jobs
 
-        return [dict(job) for job in load_jobs(include_disabled)]
+        jobs = load_jobs(include_disabled)
+    return [_annotate_job(job, profile=profile, home=store.owner_home) for job in jobs]
 
 
-def get_job(home: str | Path, job_id: str) -> dict[str, Any] | None:
-    with use_store(_store(home)):
+def get_job(
+    home: str | Path,
+    job_id: str,
+    *,
+    profile: str | None = None,
+) -> dict[str, Any] | None:
+    store = _store(home)
+    with use_store(store):
         from cron.jobs import get_job as load_job
 
         job = load_job(job_id)
-        return dict(job) if job else None
+    return _annotate_job(job, profile=profile, home=store.owner_home) if job else None
 
 
 def create_job(
     home: str | Path,
     values: Mapping[str, Any],
     *,
+    profile: str | None = None,
     allowed_workdir_root: Path | None = None,
 ) -> dict[str, Any]:
     store = _store(home)
@@ -206,7 +237,7 @@ def create_job(
             no_agent=bool(normalized.get("no_agent")),
         )
         _notify_provider()
-        return dict(job)
+    return _annotate_job(job, profile=profile, home=store.owner_home)
 
 
 def update_job(
@@ -214,6 +245,7 @@ def update_job(
     job_id: str,
     updates: Mapping[str, Any],
     *,
+    profile: str | None = None,
     allowed_workdir_root: Path | None = None,
 ) -> dict[str, Any] | None:
     store = _store(home)
@@ -236,10 +268,17 @@ def update_job(
         job = persist_update(job_id, normalized)
         if job:
             _notify_provider()
-        return dict(job) if job else None
+    return _annotate_job(job, profile=profile, home=store.owner_home) if job else None
 
 
-def mutate_job(home: str | Path, job_id: str, action: str) -> dict[str, Any] | None:
+def mutate_job(
+    home: str | Path,
+    job_id: str,
+    action: str,
+    *,
+    profile: str | None = None,
+) -> dict[str, Any] | None:
+    store = _store(home)
     functions = {
         "pause": "pause_job",
         "resume": "resume_job",
@@ -247,13 +286,13 @@ def mutate_job(home: str | Path, job_id: str, action: str) -> dict[str, Any] | N
     }
     if action not in functions:
         raise ValueError(f"unsupported cron action: {action}")
-    with use_store(_store(home)):
+    with use_store(store):
         from cron import jobs as cron_jobs
 
         job = getattr(cron_jobs, functions[action])(job_id)
         if job:
             _notify_provider()
-        return dict(job) if job else None
+    return _annotate_job(job, profile=profile, home=store.owner_home) if job else None
 
 
 def delete_job(home: str | Path, job_id: str) -> bool:
@@ -267,12 +306,29 @@ def delete_job(home: str | Path, job_id: str) -> bool:
 
 
 def delivery_targets(home: str | Path) -> list[dict[str, Any]]:
-    del home
-    return [
-        {
-            "id": "local",
-            "name": "Local (save only)",
-            "home_target_set": True,
+    """Return Local plus platforms configured inside the selected owner home."""
+    from gateway.config import load_gateway_config
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
+    selected_home = Path(home).expanduser().resolve()
+    token = set_hermes_home_override(selected_home)
+    try:
+        config = load_gateway_config()
+    finally:
+        reset_hermes_home_override(token)
+
+    targets = [{
+        "id": "local",
+        "name": "Local (save only)",
+        "home_target_set": True,
+        "home_env_var": None,
+    }]
+    for platform in config.get_connected_platforms():
+        platform_id = str(getattr(platform, "value", platform))
+        targets.append({
+            "id": platform_id,
+            "name": platform_id.replace("_", " ").title(),
+            "home_target_set": config.get_home_channel(platform) is not None,
             "home_env_var": None,
-        }
-    ]
+        })
+    return targets

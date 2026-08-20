@@ -87,34 +87,6 @@ class SkillDelete(BaseModel):
     profile: str | None = None
 
 
-class CronJobCreate(BaseModel):
-    prompt: str = ""
-    schedule: str
-    name: str = ""
-    deliver: str = "local"
-    skills: list[str] | None = None
-    model: str | None = None
-    provider: str | None = None
-    base_url: str | None = None
-    script: str | None = None
-    context_from: Any = None
-    enabled_toolsets: list[str] | None = None
-    workdir: str | None = None
-    no_agent: bool = False
-    profile: str | None = None
-    owner: str | None = None
-    owner_home: str | None = None
-    owner_key: str | None = None
-
-
-class CronJobUpdate(BaseModel):
-    updates: dict[str, Any]
-    profile: str | None = None
-    owner: str | None = None
-    owner_home: str | None = None
-    owner_key: str | None = None
-
-
 class CronTick(BaseModel):
     tick_id: str
 
@@ -439,6 +411,7 @@ def create_app(
     app.state.owner_worker_id = worker_id
     app.state.owner_worker_socket_path = runtime_paths.worker_socket
     app.state.owner_worker_controlled_roots = controlled_roots
+    app.state.owner_worker_workspace_root = runtime_paths.workspace_root
     app.state.owner_worker_control_home = os.environ.get("HERMES_CONTROL_HOME", "") or None
     app.state.owner_worker_lease = fallback_lease or _worker_lease_from_env(owner_key)
     app.state.owner_worker_capability_verifier = fallback_verifier or {
@@ -709,6 +682,25 @@ def create_app(
                     status_code=400,
                     content={"detail": "owner selection is not available in authenticated mode"},
                 )
+        path = request.url.path
+        if path.startswith("/api/plugins/"):
+            parts = path.split("/")
+            if len(parts) >= 4 and parts[3]:
+                from hermes_cli.dashboard_plugins import plugin_api_enabled
+
+                plugin = next(
+                    (
+                        candidate
+                        for candidate in app.state.owner_worker_dashboard_plugins
+                        if candidate.get("name") == parts[3]
+                    ),
+                    None,
+                )
+                if plugin is None or not plugin_api_enabled(plugin):
+                    return JSONResponse(
+                        status_code=404,
+                        content={"detail": "Plugin not found"},
+                    )
         return await call_next(request)
 
     def _require_owner_token(request: Request, authorization: str | None = Header(default=None)) -> None:
@@ -1464,142 +1456,6 @@ def create_app(
         with use_store(CronStore(owner_home)):
             return {"recorded": record_delivery_result(fire_id, error=error)}
 
-    @app.get("/api/cron/jobs")
-    def list_cron_jobs(
-        profile: str | None = None,
-        _: None = Depends(_require_owner_token),
-    ) -> list[dict[str, Any]]:
-        _reject_profile(profile)
-        from hermes_cli.cron_management import list_jobs
-
-        return list_jobs(owner_home)
-
-    @app.get("/api/cron/jobs/{job_id}")
-    def get_cron_job(
-        job_id: str,
-        profile: str | None = None,
-        _: None = Depends(_require_owner_token),
-    ) -> dict[str, Any]:
-        _reject_profile(profile)
-        from hermes_cli.cron_management import get_job
-
-        job = get_job(owner_home, job_id)
-        if not job:
-            raise HTTPException(status_code=404, detail="Job not found")
-        return job
-
-    @app.post("/api/cron/jobs")
-    def create_cron_job(
-        body: CronJobCreate,
-        _: None = Depends(_require_owner_token),
-    ) -> dict[str, Any]:
-        _reject_owner_selectors(body)
-        from hermes_cli.cron_management import create_job
-
-        values = body.model_dump(
-            exclude={"profile", "owner", "owner_home", "owner_key"}
-        )
-        try:
-            return create_job(
-                owner_home,
-                values,
-                allowed_workdir_root=runtime_paths.workspace_root,
-            )
-        except ValueError as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
-
-    @app.put("/api/cron/jobs/{job_id}")
-    def update_cron_job(
-        job_id: str,
-        body: CronJobUpdate,
-        _: None = Depends(_require_owner_token),
-    ) -> dict[str, Any]:
-        _reject_owner_selectors(body)
-        forbidden = {"profile", "owner", "owner_home", "owner_key"}.intersection(
-            body.updates
-        )
-        if forbidden:
-            raise HTTPException(
-                status_code=400,
-                detail="owner and profile selection are not available in authenticated mode",
-            )
-        from hermes_cli.cron_management import update_job
-
-        try:
-            job = update_job(
-                owner_home,
-                job_id,
-                body.updates,
-                allowed_workdir_root=runtime_paths.workspace_root,
-            )
-        except ValueError as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
-        if not job:
-            raise HTTPException(status_code=404, detail="Job not found")
-        return job
-
-    def _mutate_cron_job(job_id: str, action: str) -> dict[str, Any]:
-        from hermes_cli.cron_management import mutate_job
-
-        job = mutate_job(owner_home, job_id, action)
-        if not job:
-            raise HTTPException(status_code=404, detail="Job not found")
-        return job
-
-    @app.post("/api/cron/jobs/{job_id}/pause")
-    def pause_cron_job(
-        job_id: str,
-        profile: str | None = None,
-        _: None = Depends(_require_owner_token),
-    ) -> dict[str, Any]:
-        _reject_profile(profile)
-        return _mutate_cron_job(job_id, "pause")
-
-    @app.post("/api/cron/jobs/{job_id}/resume")
-    def resume_cron_job(
-        job_id: str,
-        profile: str | None = None,
-        _: None = Depends(_require_owner_token),
-    ) -> dict[str, Any]:
-        _reject_profile(profile)
-        return _mutate_cron_job(job_id, "resume")
-
-    @app.post("/api/cron/jobs/{job_id}/trigger")
-    def trigger_cron_job(
-        job_id: str,
-        profile: str | None = None,
-        _: None = Depends(_require_owner_token),
-    ) -> dict[str, Any]:
-        _reject_profile(profile)
-        return _mutate_cron_job(job_id, "trigger")
-
-    @app.delete("/api/cron/jobs/{job_id}")
-    def delete_cron_job(
-        job_id: str,
-        profile: str | None = None,
-        _: None = Depends(_require_owner_token),
-    ) -> dict[str, bool]:
-        _reject_profile(profile)
-        from hermes_cli.cron_management import delete_job
-
-        try:
-            removed = delete_job(owner_home, job_id)
-        except ValueError as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
-        if not removed:
-            raise HTTPException(status_code=404, detail="Job not found")
-        return {"ok": True}
-
-    @app.get("/api/cron/delivery-targets")
-    def get_cron_delivery_targets(
-        profile: str | None = None,
-        _: None = Depends(_require_owner_token),
-    ) -> dict[str, Any]:
-        _reject_profile(profile)
-        from hermes_cli.cron_management import delivery_targets
-
-        return {"targets": delivery_targets(owner_home)}
-
     @app.get("/api/dashboard/font")
     def get_dashboard_font(_: None = Depends(_require_owner_token)) -> dict[str, str]:
         from hermes_cli.dashboard_owner_payloads import dashboard_font_payload
@@ -1610,7 +1466,9 @@ def create_app(
     def get_dashboard_plugins(_: None = Depends(_require_owner_token)) -> list[dict[str, Any]]:
         from hermes_cli.dashboard_owner_payloads import active_dashboard_plugin_payload
 
-        return active_dashboard_plugin_payload()
+        return active_dashboard_plugin_payload(
+            app.state.owner_worker_dashboard_plugins,
+        )
 
     @app.get("/api/skills")
     def get_skills(profile: str | None = None, _: None = Depends(_require_owner_token)) -> list[dict[str, Any]]:
@@ -1740,6 +1598,25 @@ def create_app(
         return model_info_payload_from_config(
             load_config(),
             deployment_descriptor=deployment_descriptor_from_environment(),
+        )
+
+    @app.get("/api/model/options")
+    def get_model_options(
+        profile: str | None = None,
+        refresh: bool = False,
+        _: None = Depends(_require_owner_token),
+    ) -> dict[str, Any]:
+        _reject_profile(profile)
+        from hermes_cli.inventory import build_models_payload, load_picker_context
+
+        return build_models_payload(
+            load_picker_context(),
+            include_unconfigured=True,
+            picker_hints=True,
+            canonical_order=True,
+            pricing=True,
+            capabilities=True,
+            refresh=bool(refresh),
         )
 
     def _registration_error(exc: Exception) -> HTTPException:
@@ -1989,6 +1866,23 @@ def create_app(
             )
         finally:
             db.close()
+
+    # Mount only APIs whose validated manifests explicitly target Owner Workers.
+    # Discovery runs after HERMES_HOME admission, preserving per-owner user plugin
+    # roots while bundled APIs remain shared and project Python stays untrusted.
+    from hermes_cli.dashboard_plugins import (
+        discover_dashboard_plugins,
+        mount_dashboard_plugin_apis,
+    )
+
+    owner_worker_plugins = discover_dashboard_plugins()
+    app.state.owner_worker_dashboard_plugins = owner_worker_plugins
+    mount_dashboard_plugin_apis(
+        app,
+        owner_worker_plugins,
+        runtime_target="owner-worker",
+        owner_dependency=_require_owner_token,
+    )
 
     # Register worker-local WebSocket handlers without importing the Control
     # Plane web_server module. This keeps owner-worker runtime state scoped to

@@ -35,8 +35,15 @@
  *     shape the right boundary for external authors?
  */
 
-import type { ComponentType } from "react";
-
+import type {
+  ComponentType,
+  Context,
+  DependencyList,
+  Dispatch,
+  EffectCallback,
+  ReactNode,
+  SetStateAction,
+} from "react";
 // ---------------------------------------------------------------------------
 // Auth-relevant helpers (the surface this PR adds/sanctions)
 // ---------------------------------------------------------------------------
@@ -100,15 +107,18 @@ export interface HermesPluginSDK {
   readonly sdkVersion: string;
 
   /** React core — use instead of importing/bundling react. */
-  React: typeof import("react").default;
+  React: {
+    createElement: typeof import("react").createElement;
+    Fragment: typeof import("react").Fragment;
+  };
   hooks: {
-    useState: typeof import("react").useState;
-    useEffect: typeof import("react").useEffect;
-    useCallback: typeof import("react").useCallback;
-    useMemo: typeof import("react").useMemo;
-    useRef: typeof import("react").useRef;
-    useContext: typeof import("react").useContext;
-    createContext: typeof import("react").createContext;
+    useState: <T>(initial: T | (() => T)) => [T, Dispatch<SetStateAction<T>>];
+    useEffect: (effect: EffectCallback, deps?: DependencyList) => void;
+    useCallback: <T extends (...args: never[]) => unknown>(callback: T, deps: DependencyList) => T;
+    useMemo: <T>(factory: () => T, deps: DependencyList) => T;
+    useRef: <T>(initial: T) => { current: T };
+    useContext: <T>(context: Context<T>) => T;
+    createContext: <T>(defaultValue: T) => Context<T>;
   };
 
   /**
@@ -133,10 +143,31 @@ export interface HermesPluginSDK {
    * boundary: the host's concrete components (some of which require props like
    * ``active``/``value``/``name``) must be assignable here, and external plugin
    * authors render them dynamically without the host's internal prop types.
-   * ``ComponentType<never>`` accepts any component regardless of its prop
-   * requirements (props are contravariant).
+   * ``ComponentType<any>`` intentionally keeps component names public without
+   * leaking or falsely constraining the host's internal prop types.
    */
-  components: Record<string, ComponentType<never>>;
+  components: Record<string, ComponentType<any>>; // eslint-disable-line @typescript-eslint/no-explicit-any
+
+  /** Generic host hooks available to plugin-owned pages. */
+  useConfirmDelete: <TId>(options: {
+    onDelete: (id: TId) => Promise<void>;
+  }) => {
+    cancel: () => void;
+    confirm: () => Promise<void>;
+    isDeleting: boolean;
+    isOpen: boolean;
+    pendingId: TId | null;
+    requestDelete: (id: TId) => void;
+  };
+  usePageHeader: () => {
+    setAfterTitle: (node: ReactNode) => void;
+    setEnd: (node: ReactNode) => void;
+    setTitle: (title: string | null) => void;
+  };
+  useToast: (duration?: number) => {
+    showToast: (message: string, type: "error" | "success") => void;
+    toast: { message: string; type: "error" | "success" } | null;
+  };
 
   utils: {
     cn: (...classes: Array<string | false | null | undefined>) => string;
@@ -147,11 +178,14 @@ export interface HermesPluginSDK {
   };
 
   /**
-   * i18n hook. Returns the host's i18n context value; typed loosely at the
-   * boundary so the contract doesn't couple to the host's internal
+   * i18n hook. Returns the host's locale plus a deliberately loose translation
+   * tree so the public SDK does not import or mirror the host's internal
    * ``I18nContextValue`` shape. Plugins typically call ``useI18n().t(...)``.
    */
-  useI18n: () => unknown;
+  useI18n: () => {
+    locale: string;
+    t: any; // eslint-disable-line @typescript-eslint/no-explicit-any
+  };
 }
 
 declare global {

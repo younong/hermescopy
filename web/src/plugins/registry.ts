@@ -24,10 +24,24 @@ import { Button } from "@nous-research/ui/ui/components/button";
 import { Checkbox } from "@nous-research/ui/ui/components/checkbox";
 import { Select, SelectOption } from "@nous-research/ui/ui/components/select";
 import { Card, CardHeader, CardTitle, CardContent } from "@nous-research/ui/ui/components/card";
+import { ConfirmDialog } from "@nous-research/ui/ui/components/confirm-dialog";
+import {
+  Dialog,
+  DialogContent,
+  DialogHeader,
+  DialogTitle,
+} from "@nous-research/ui/ui/components/dialog";
 import { Input } from "@nous-research/ui/ui/components/input";
 import { Label } from "@nous-research/ui/ui/components/label";
+import { Segmented } from "@nous-research/ui/ui/components/segmented";
 import { Separator } from "@nous-research/ui/ui/components/separator";
+import { Spinner } from "@nous-research/ui/ui/components/spinner";
 import { Tabs, TabsList, TabsTrigger } from "@nous-research/ui/ui/components/tabs";
+import { Toast } from "@nous-research/ui/ui/components/toast";
+import { H2 } from "@nous-research/ui/ui/components/typography/h2";
+import { useConfirmDelete } from "@nous-research/ui/hooks/use-confirm-delete";
+import { useToast } from "@nous-research/ui/hooks/use-toast";
+import { usePageHeader } from "@/contexts/usePageHeader";
 import { useI18n } from "@/i18n";
 import { registerSlot, PluginSlot } from "./slots";
 
@@ -45,11 +59,6 @@ function _notify() {
   for (const fn of _listeners) {
     try { fn(); } catch { /* ignore */ }
   }
-}
-
-/** Re-run registry subscribers (e.g. after a plugin script onload, or dev HMR re-inject). */
-export function notifyPluginRegistry() {
-  _notify();
 }
 
 /** Register a plugin component. Called by plugin JS bundles. */
@@ -95,7 +104,7 @@ export function getRegisteredCount(): number {
  * Exposed at runtime as ``window.__HERMES_PLUGIN_SDK__.sdkVersion`` so a
  * plugin (or a future host-side compatibility gate) can read it.
  */
-export const SDK_CONTRACT_VERSION = "1.1.0";
+export const SDK_CONTRACT_VERSION = "1.2.0";
 
 // Window globals for the plugin SDK are declared in ``plugins/sdk.d.ts`` —
 // the single source of truth for the public contract. Don't redeclare them
@@ -148,21 +157,33 @@ export function exposePluginSDK() {
       Badge,
       Button,
       Checkbox,
+      ConfirmDialog,
+      Dialog,
+      DialogContent,
+      DialogHeader,
+      DialogTitle,
+      H2,
       Input,
       Label,
+      PluginSlot,
+      Segmented,
       Select,
       SelectOption,
       Separator,
+      Spinner,
       Tabs,
       TabsList,
       TabsTrigger,
-      PluginSlot,
+      Toast,
     },
 
     // Utilities
     utils: { cn, timeAgo, isoTimeAgo },
 
     // Hooks
+    useConfirmDelete,
     useI18n,
+    usePageHeader,
+    useToast,
   };
 }

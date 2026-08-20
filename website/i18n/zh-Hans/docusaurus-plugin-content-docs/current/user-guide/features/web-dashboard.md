@@ -256,27 +256,27 @@ Web Dashboard 暴露了一个供前端使用的 REST API。你也可以直接调
 
 返回 token 用量、成本和会话分析。查询参数：`days`（默认 30）。响应包含每日明细和按模型聚合数据。
 
-### GET /api/cron/jobs
+### GET /api/plugins/scheduled-tasks/jobs
 
-返回所有已配置的定时任务，包含其状态、计划和运行历史。
+返回所有已配置的定时任务及其状态和计划。此管理 API 由内置的 Scheduled Tasks Dashboard 插件提供。
 
-### POST /api/cron/jobs
+### POST /api/plugins/scheduled-tasks/jobs
 
 创建新定时任务。请求体：`{"prompt": "...", "schedule": "0 9 * * *", "name": "...", "deliver": "local"}`。
 
-### POST /api/cron/jobs/\{job_id\}/pause
+### POST /api/plugins/scheduled-tasks/jobs/\{job_id\}/pause
 
 暂停定时任务。
 
-### POST /api/cron/jobs/\{job_id\}/resume
+### POST /api/plugins/scheduled-tasks/jobs/\{job_id\}/resume
 
 恢复已暂停的定时任务。
 
-### POST /api/cron/jobs/\{job_id\}/trigger
+### POST /api/plugins/scheduled-tasks/jobs/\{job_id\}/trigger
 
 在计划之外立即触发定时任务。
 
-### DELETE /api/cron/jobs/\{job_id\}
+### DELETE /api/plugins/scheduled-tasks/jobs/\{job_id\}
 
 删除定时任务。
 

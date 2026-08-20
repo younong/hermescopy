@@ -591,50 +591,49 @@ export const api = {
       body: JSON.stringify({ key }),
     }),
 
-  // Cron jobs
-  getCronJobs: () => fetchJSON<CronJob[]>("/api/cron/jobs"),
+  // Scheduled tasks dashboard plugin. Chat GUI keeps using the shared editor
+  // and types, but all task mutations go through the plugin-owned API.
+  getCronJobs: () =>
+    fetchJSON<CronJob[]>("/api/plugins/scheduled-tasks/jobs"),
   getCronDeliveryTargets: () =>
-    fetchJSON<{ targets: CronDeliveryTarget[] }>("/api/cron/delivery-targets"),
+    fetchJSON<{ targets: CronDeliveryTarget[] }>(
+      "/api/plugins/scheduled-tasks/delivery-targets",
+    ),
   createCronJob: (job: CronJobMutation) =>
-    fetchJSON<CronJob>("/api/cron/jobs", {
+    fetchJSON<CronJob>("/api/plugins/scheduled-tasks/jobs", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(job),
     }),
   pauseCronJob: (id: string) =>
-    fetchJSON<CronJob>(`/api/cron/jobs/${encodeURIComponent(id)}/pause`, {
-      method: "POST",
-    }),
+    fetchJSON<CronJob>(
+      `/api/plugins/scheduled-tasks/jobs/${encodeURIComponent(id)}/pause`,
+      { method: "POST" },
+    ),
   updateCronJob: (id: string, updates: CronJobMutation) =>
-    fetchJSON<CronJob>(`/api/cron/jobs/${encodeURIComponent(id)}`, {
-      method: "PUT",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ updates }),
-    }),
+    fetchJSON<CronJob>(
+      `/api/plugins/scheduled-tasks/jobs/${encodeURIComponent(id)}`,
+      {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ updates }),
+      },
+    ),
   resumeCronJob: (id: string) =>
-    fetchJSON<CronJob>(`/api/cron/jobs/${encodeURIComponent(id)}/resume`, {
-      method: "POST",
-    }),
+    fetchJSON<CronJob>(
+      `/api/plugins/scheduled-tasks/jobs/${encodeURIComponent(id)}/resume`,
+      { method: "POST" },
+    ),
   triggerCronJob: (id: string) =>
-    fetchJSON<CronJob>(`/api/cron/jobs/${encodeURIComponent(id)}/trigger`, {
-      method: "POST",
-    }),
+    fetchJSON<CronJob>(
+      `/api/plugins/scheduled-tasks/jobs/${encodeURIComponent(id)}/trigger`,
+      { method: "POST" },
+    ),
   deleteCronJob: (id: string) =>
-    fetchJSON<{ ok: boolean }>(`/api/cron/jobs/${encodeURIComponent(id)}`, {
-      method: "DELETE",
-    }),
-
-  // Automation blueprints
-  getAutomationBlueprints: () =>
-    fetchJSON<{ blueprints: AutomationBlueprint[] }>("/api/cron/blueprints"),
-  instantiateAutomationBlueprint: (
-    body: { blueprint: string; values: Record<string, string> },
-  ) =>
-    fetchJSON<CronJob>("/api/cron/blueprints/instantiate", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body),
-    }),
+    fetchJSON<{ ok: boolean }>(
+      `/api/plugins/scheduled-tasks/jobs/${encodeURIComponent(id)}`,
+      { method: "DELETE" },
+    ),
 
   // Skills & toolsets
   getSkills: () => fetchJSON<SkillInfo[]>("/api/skills"),

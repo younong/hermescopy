@@ -57,6 +57,10 @@ Every morning at 9am, check Hacker News for AI news and send me a summary on Tel
 
 Hermes 会在内部使用统一的 `cronjob` 工具。
 
+## Dashboard 管理界面
+
+Dashboard 的 `/cron` 页面及其管理 API 由内置的 `scheduled-tasks` 插件提供。禁用该插件会隐藏页面并关闭管理 API，但不会停止 Core 中已有的调度器、CLI、`cronjob` 工具或内部 tick/fire 执行路径。
+
 ## 附带 skill 的 cron 任务
 
 Cron 任务可以在运行 prompt（提示词）之前加载一个或多个 skill。
