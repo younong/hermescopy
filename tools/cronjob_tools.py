@@ -667,7 +667,10 @@ def cronjob(
     workdir: Optional[str] = None,
     no_agent: Optional[bool] = None,
     attach_to_session: Optional[bool] = None,
+    employee_id: Optional[str] = None,
+    target_employee_ids: Optional[List[str]] = None,
     task_id: str = None,
+    collaboration_context: Any = None,
 ) -> str:
     """Unified cron job management tool."""
     del task_id  # unused but kept for handler signature compatibility
@@ -723,13 +726,59 @@ def cronjob(
                             success=False,
                         )
 
+            if target_employee_ids and collaboration_context is None:
+                return tool_error(
+                    "target_employee_ids require a trusted source employee context",
+                    success=False,
+                )
+            if target_employee_ids and collaboration_context is not None:
+                if getattr(collaboration_context, "role", "") != "source":
+                    return tool_error(
+                        "scheduled employee tasks require a source employee context",
+                        success=False,
+                    )
+                if int(getattr(collaboration_context, "source_depth", 0)) != 0:
+                    return tool_error(
+                        "nested collaboration employees cannot create scheduled employee tasks",
+                        success=False,
+                    )
+                if not getattr(collaboration_context, "may_create_authorized", False):
+                    return tool_error(
+                        "employee is not authorized to create scheduled employee tasks",
+                        success=False,
+                    )
+                if getattr(collaboration_context, "source_task_id", None) is not None:
+                    return tool_error(
+                        "collaboration task employees cannot create scheduled employee tasks",
+                        success=False,
+                    )
+                service = getattr(collaboration_context, "service", None)
+                if service is None:
+                    return tool_error(
+                        "employee scheduling authority is unavailable",
+                        success=False,
+                    )
+                service.resolver.resolve_current(
+                    str(collaboration_context.creator_employee_id)
+                )
+                for target_id in target_employee_ids:
+                    resolved_target = service.resolver.resolve_current(str(target_id))
+                    if not resolved_target.may_participate:
+                        raise RuntimeError("target employee participation is revoked")
+
+            cron_origin = _origin_from_env()
+            if target_employee_ids and collaboration_context is not None:
+                cron_origin = dict(cron_origin or {})
+                cron_origin["creator_employee_id"] = str(
+                    collaboration_context.creator_employee_id
+                )
             job = create_job(
                 prompt=prompt or "",
                 schedule=schedule,
                 name=name,
                 repeat=repeat,
                 deliver=_normalize_deliver_param(deliver),
-                origin=_origin_from_env(),
+                origin=cron_origin,
                 skills=canonical_skills,
                 model=_normalize_optional_job_value(model),
                 provider=_normalize_optional_job_value(provider),
@@ -740,6 +789,8 @@ def cronjob(
                 workdir=_normalize_optional_job_value(workdir),
                 no_agent=_no_agent,
                 attach_to_session=attach_to_session,
+                employee_id=_normalize_optional_job_value(employee_id),
+                target_employee_ids=target_employee_ids,
             )
             _notify_provider_jobs_changed_safe()
             _create_message = f"Cron job '{job['name']}' created."
@@ -1067,6 +1118,17 @@ Important safety rule: cron-run sessions should not recursively schedule more cr
                 "items": {"type": "string"},
                 "description": "Optional list of toolset names to restrict the job's agent to (e.g. [\"web\", \"terminal\", \"file\", \"delegation\"]). When set, only tools from these toolsets are loaded, significantly reducing input token overhead. When omitted, all default tools are loaded. Infer from the job's prompt — e.g. use \"web\" if it calls web_search, \"terminal\" if it runs scripts, \"file\" if it reads files, \"delegation\" if it calls delegate_task. On update, pass an empty array to clear."
             },
+            "employee_id": {
+                "type": "string",
+                "description": "Optional single AI employee whose current policy runs this job. Mutually exclusive with target_employee_ids."
+            },
+            "target_employee_ids": {
+                "type": "array",
+                "items": {"type": "string"},
+                "maxItems": 32,
+                "uniqueItems": True,
+                "description": "Optional explicit list of AI employee IDs to execute this job in parallel. Use list_employee_catalog or the employee catalog to choose IDs. Mutually exclusive with employee_id; targets are revalidated at fire time."
+            },
             "workdir": {
                 "type": "string",
                 "description": "Optional absolute path to run the job from. When set, AGENTS.md / CLAUDE.md / .cursorrules from that directory are injected into the system prompt, and the terminal/file/code_exec tools use it as their working directory — useful for running a job inside a specific project repo. Must be an absolute path that exists. When unset (default), preserves the original behaviour: no project context files, tools use the scheduler's cwd. On update, pass an empty string to clear. Jobs with workdir run sequentially (not parallel) to keep per-job directories isolated."
@@ -1130,7 +1192,10 @@ registry.register(
         enabled_toolsets=args.get("enabled_toolsets"),
         workdir=args.get("workdir"),
         no_agent=args.get("no_agent"),
+        employee_id=args.get("employee_id"),
+        target_employee_ids=args.get("target_employee_ids"),
         task_id=kw.get("task_id"),
+        collaboration_context=kw.get("collaboration_context"),
     ))(),
     check_fn=check_cronjob_requirements,
     emoji="⏰",

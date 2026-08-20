@@ -2400,6 +2400,7 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
                     enabled_toolsets=getattr(agent, "enabled_toolsets", None),
                     disabled_toolsets=getattr(agent, "disabled_toolsets", None),
                     employee_policy=getattr(agent, "employee_policy", None),
+                    collaboration_context=getattr(agent, "collaboration_context", None),
                     tool_request_middleware_trace=list(_tool_middleware_trace),
                 )
     else:

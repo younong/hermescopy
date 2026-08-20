@@ -57,9 +57,12 @@ class CronJobCreate(OwnerSelectors):
     workdir: str | None = None
     no_agent: bool = False
     employee_id: str | None = None
+    target_employee_ids: list[str] | None = None
 
 
 class CronJobUpdate(OwnerSelectors):
+    # Partial cron mutation payload. The cron management layer validates and
+    # normalizes target_employee_ids alongside the other mutable fields.
     updates: dict[str, Any]
 
 

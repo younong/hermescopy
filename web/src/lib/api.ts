@@ -2249,6 +2249,7 @@ export interface CronJobMutation {
   enabled_toolsets?: string[] | null;
   workdir?: string | null;
   employee_id?: string | null;
+  target_employee_ids?: string[] | null;
 }
 
 export interface CronJob {
@@ -2271,6 +2272,7 @@ export interface CronJob {
   enabled_toolsets?: string[] | null;
   workdir?: string | null;
   employee_id?: string | null;
+  target_employee_ids?: string[] | null;
   last_run_at?: string | null;
   next_run_at?: string | null;
   last_status?: string | null;
