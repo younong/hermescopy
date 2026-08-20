@@ -55,6 +55,32 @@ def _policy(
     )
 
 
+def test_route_descriptor_exposes_context_capability_without_secrets():
+    from hermes_cli.deployment_inference import DeploymentInferenceRouteDescriptor
+
+    descriptor = DeploymentInferenceRouteDescriptor(
+        provider="custom:deployment",
+        model="gpt-safe",
+        api_mode="chat_completions",
+        context_length=128000,
+    )
+
+    assert descriptor.payload() == {
+        "provider": "custom:deployment",
+        "model": "gpt-safe",
+        "api_mode": "chat_completions",
+        "context_length": 128000,
+    }
+    assert "base_url" not in descriptor.payload()
+    with pytest.raises(DeploymentInferencePolicyInvalid, match="context_length"):
+        DeploymentInferenceRouteDescriptor(
+            provider="custom:deployment",
+            model="gpt-safe",
+            api_mode="chat_completions",
+            context_length=0,
+        )
+
+
 def test_policy_descriptor_and_worker_environment_are_secret_free(monkeypatch):
     descriptor = _policy(supports_vision=True).descriptor()
     monkeypatch.setenv("HERMES_DEPLOYMENT_INFERENCE_PROVIDER", descriptor.provider)
@@ -1562,6 +1588,10 @@ def test_owner_relay_route_metadata_is_live_lease_fenced_and_secret_free(tmp_pat
             "model": "gpt-safe",
             "api_mode": "chat_completions",
         }]
+        assert httpx.get(
+            relay.base_url.removesuffix("/v1") + "/v1/models",
+            timeout=5,
+        ).status_code == 405
         assert "secret" not in response.text
         assert "upstream.example.test" not in response.text
 

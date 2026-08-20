@@ -35,6 +35,48 @@ from agent.model_metadata import (
 )
 
 
+def test_deployment_relay_uses_route_metadata_without_models_probe(monkeypatch):
+    from types import SimpleNamespace
+
+    route = SimpleNamespace(
+        provider="custom:codex",
+        model="gpt-5.6-luna",
+        context_length=512000,
+    )
+    monkeypatch.setattr(
+        "hermes_cli.deployment_inference.route_descriptors_from_control_plane",
+        lambda: (route,),
+    )
+    endpoint_probe = MagicMock(side_effect=AssertionError("relay must not probe /models"))
+    monkeypatch.setattr("agent.model_metadata.fetch_endpoint_model_metadata", endpoint_probe)
+
+    assert get_model_context_length(
+        "gpt-5.6-luna",
+        base_url="http://127.0.0.1:9999/v1",
+        api_key="deployment-inference-relay",
+        provider="custom:codex",
+    ) == 512000
+    endpoint_probe.assert_not_called()
+
+
+def test_deployment_relay_falls_back_when_route_capability_is_missing(monkeypatch):
+    monkeypatch.setattr(
+        "hermes_cli.deployment_inference.route_descriptors_from_control_plane",
+        lambda: (),
+    )
+    monkeypatch.setattr(
+        "agent.model_metadata.fetch_endpoint_model_metadata",
+        MagicMock(side_effect=AssertionError("relay must not probe /models")),
+    )
+
+    assert get_model_context_length(
+        "gpt-5.6-luna",
+        base_url="http://127.0.0.1:9999/v1",
+        api_key="deployment-inference-relay",
+        provider="custom:codex",
+    ) == 400000
+
+
 # =========================================================================
 # Token estimation
 # =========================================================================
