@@ -1,10 +1,14 @@
 # Hermes Agent - Development Guide
 
-Instructions for AI coding assistants and developers working on the hermes-agent codebase.
+This is the canonical instruction file for Codex CLI, Claude Code, and other
+coding agents working on the hermes-agent codebase. `CLAUDE.md` is a Claude Code
+entrypoint that points here; do not maintain a second copy of these rules.
 
 **Never give up on the right solution.**
 
-This file is intentionally short so it can be loaded on every agent startup without context truncation. The full long-form guide was moved to [`docs/agents-reference.md`](docs/agents-reference.md). Read that reference when you need subsystem-specific details or the rationale behind these rules.
+The full long-form guide is in [`docs/agents-reference.md`](docs/agents-reference.md).
+Read that reference when you need subsystem-specific details or the rationale
+behind these rules.
 
 ## What Hermes Is
 
@@ -30,7 +34,7 @@ investigation reaches a Strict trigger.
 | Path | Use when | Required discovery and validation |
 | --- | --- | --- |
 | **Fast** | A small, reversible change in one owned concern with no Strict trigger. | Read the target region and closest focused test; run the narrowest relevant check. |
-| **Standard** | Normal work, unclear ownership, or nearby multi-file changes in one subsystem. | Use the `CLAUDE.md` ownership map and focused search; expand into one adjacent subsystem only when needed; validate the directly affected boundary. |
+| **Standard** | Normal work, unclear ownership, or nearby multi-file changes in one subsystem. | Use this file's ownership map and focused search; expand into one adjacent subsystem only when needed; validate the directly affected boundary. |
 | **Strict** | Owner-worker; session/resume; gateway, approval, authentication, or security behavior; remote backends; file/network I/O; config/profile propagation; or shared agent/gateway code that can affect Terminal, TUI, dashboard, or desktop. | Read the relevant section—not all—of `docs/agents-reference.md`; inspect original intent before restrictions; exercise the real path and applicable integration/E2E checks. |
 
 Fast never relaxes prompt-cache, message-role, profile-isolation, safety, or
