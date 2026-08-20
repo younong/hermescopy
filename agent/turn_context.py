@@ -413,6 +413,8 @@ def build_turn_context(
     agent._verification_stop_nudges = 0
     agent._pre_verify_nudges = 0
     agent._zip_delivery_nudges = 0
+    agent._artifact_delivery_nudges = 0
+    agent._turn_artifact_paths = set()
 
     # Record the execution thread so interrupt()/clear_interrupt() can scope
     # the tool-level interrupt signal to THIS agent's thread only.

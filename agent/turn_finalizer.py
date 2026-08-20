@@ -320,6 +320,7 @@ def finalize_turn(
     if final_response and not interrupted and not failed:
         try:
             from agent.artifact_delivery import (
+                append_artifact_delivery_failure,
                 append_artifact_delivery_warning,
                 extract_declared_artifact_paths,
                 validate_declared_artifacts,
@@ -340,10 +341,16 @@ def finalize_turn(
                 artifacts = []
                 _rejected_artifacts = _declared_paths or ["ZIP delivery requirement"]
             if _rejected_artifacts:
-                final_response = append_artifact_delivery_warning(
-                    final_response,
-                    _rejected_artifacts,
-                )
+                if getattr(agent, "_artifact_delivery_nudges", 0) >= 2:
+                    final_response = append_artifact_delivery_failure(
+                        final_response,
+                        _rejected_artifacts,
+                    )
+                else:
+                    final_response = append_artifact_delivery_warning(
+                        final_response,
+                        _rejected_artifacts,
+                    )
         except Exception as _artifact_err:
             from agent.artifact_delivery import append_artifact_validation_failure
 

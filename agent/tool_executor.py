@@ -985,6 +985,15 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
             stage=f"tool result {name}",
         )
 
+        try:
+            from agent.artifact_delivery import extract_tool_artifact_paths
+            if not is_error:
+                getattr(agent, "_turn_artifact_paths", set()).update(
+                    extract_tool_artifact_paths(function_name, function_result)
+                )
+        except Exception:
+            logger.debug("tool artifact registration failed", exc_info=True)
+
         # ── Per-tool /steer drain ───────────────────────────────────
         # Same as the sequential path: drain between each collected
         # result so the steer lands as early as possible.
@@ -1641,6 +1650,15 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             messages,
             stage=f"tool result {function_name}",
         )
+
+        try:
+            from agent.artifact_delivery import extract_tool_artifact_paths
+            if not is_error:
+                getattr(agent, "_turn_artifact_paths", set()).update(
+                    extract_tool_artifact_paths(function_name, function_result)
+                )
+        except Exception:
+            logger.debug("tool artifact registration failed", exc_info=True)
 
         # ── Per-tool /steer drain ───────────────────────────────────
         # Drain pending steer BETWEEN individual tool calls so the

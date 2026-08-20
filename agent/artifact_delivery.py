@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import mimetypes
+import os
 import re
 import zipfile
 from pathlib import PurePosixPath
@@ -33,6 +35,45 @@ _ZIP_REJECTION_RE = re.compile(
     re.IGNORECASE,
 )
 _MAX_ZIP_DELIVERY_NUDGES = 2
+_MAX_ARTIFACT_DELIVERY_NUDGES = 2
+_ARTIFACT_PATH_KEYS = (
+    "path", "file", "file_path", "output", "output_file", "image",
+    "host_image", "agent_visible_image",
+)
+
+
+def _iter_result_values(value: object):
+    if isinstance(value, dict):
+        for key, item in value.items():
+            if key in _ARTIFACT_PATH_KEYS and isinstance(item, str):
+                yield item
+            yield from _iter_result_values(item)
+    elif isinstance(value, list):
+        for item in value:
+            yield from _iter_result_values(item)
+
+
+def extract_tool_artifact_paths(tool_name: str, result: object) -> list[str]:
+    """Extract candidate paths from a successful tool result, not model text."""
+    if not tool_name or isinstance(result, str):
+        try:
+            result = json.loads(result) if isinstance(result, str) else result
+        except (TypeError, ValueError):
+            return []
+    if not isinstance(result, (dict, list)):
+        return []
+    success = result.get("success") if isinstance(result, dict) else True
+    if success is False:
+        return []
+    paths = []
+    seen = set()
+    for path in _iter_result_values(result):
+        if path.startswith(("http://", "https://", "data:")):
+            continue
+        if path not in seen and os.path.splitext(path)[1]:
+            seen.add(path)
+            paths.append(path)
+    return paths
 
 
 def _inside_fenced_code(index: int, ranges: list[tuple[int, int]]) -> bool:
@@ -127,6 +168,119 @@ def zip_delivery_satisfied(
         len(declared_paths) == 1
         and len(artifacts) == 1
         and str(artifacts[0].get("name") or "").lower().endswith(".zip")
+    )
+
+
+def _validate_declared_artifacts_detailed(
+    text: str,
+    *,
+    task_id: str = "default",
+    artifact_namespace: str = "",
+    declared_paths: list[str] | None = None,
+) -> tuple[list[dict[str, object]], list[dict[str, str]]]:
+    """Validate declarations while retaining a safe, user-independent reason."""
+    artifacts: list[dict[str, object]] = []
+    rejected: list[dict[str, str]] = []
+    if declared_paths is None:
+        declared_paths = extract_declared_artifact_paths(text)
+    for path in declared_paths:
+        try:
+            resolved = resolve_delegated_artifact_path(
+                path,
+                task_id,
+                require_workspace=True,
+                maximum_bytes=MAX_DOWNLOAD_BYTES,
+            )
+        except ValueError as exc:
+            message = str(exc).lower()
+            reason = "boundary" if "outside" in message or "workspace" in message else (
+                "oversized" if "exceeds" in message else "unavailable"
+            )
+            rejected.append({"path": path, "reason": reason})
+            continue
+        child_path = str(resolved["path"])
+        name = PurePosixPath(child_path.replace("\\", "/")).name
+        if name.lower().endswith(".zip") and not _valid_zip(
+            str(resolved.get("diagnostic_path") or child_path)
+        ):
+            rejected.append({"path": path, "reason": "invalid_archive"})
+            continue
+        mime_type = (
+            "application/zip"
+            if name.lower().endswith(".zip")
+            else mimetypes.guess_type(name)[0]
+        )
+        identity = f"{artifact_namespace}\0{child_path}\0{int(resolved['size_bytes'])}".encode("utf-8")
+        artifact: dict[str, object] = {
+            "id": "artifact-" + hashlib.sha256(identity).hexdigest()[:20],
+            "name": name,
+            "path": child_path,
+            "size_bytes": int(resolved["size_bytes"]),
+        }
+        if mime_type:
+            artifact["mime_type"] = mime_type
+        artifacts.append(artifact)
+    return artifacts, rejected
+
+
+def build_artifact_delivery_nudge(
+    *,
+    final_response: str,
+    task_id: str = "default",
+    attempts: int = 0,
+    max_attempts: int = _MAX_ARTIFACT_DELIVERY_NUDGES,
+    declared_paths: list[str] | None = None,
+    tool_artifact_paths: set[str] | None = None,
+) -> str | None:
+    """Keep the tool loop running when a declared artifact is not real."""
+    if attempts >= max_attempts:
+        return None
+    _artifacts, rejected = _validate_declared_artifacts_detailed(
+        final_response, task_id=task_id, declared_paths=declared_paths
+    )
+    if any(item["reason"] == "unavailable" for item in rejected):
+        return (
+            "[System: You declared one or more deliverable files, but the current "
+            "workspace does not contain a valid readable file at the declared path(s). "
+            "Do not claim the file is generated. Continue now: use the appropriate "
+            "tool to create the real artifact, then provide its verified path, or "
+            "remove the invalid delivery claim from your final answer.]"
+        )
+
+    # When the executor has facts from this turn, a valid file is deliverable
+    # only if a successful tool actually reported that same file. This prevents
+    # stale workspace files from satisfying a newly fabricated declaration.
+    if tool_artifact_paths is not None:
+        registered: set[str] = set()
+        for candidate in tool_artifact_paths:
+            try:
+                resolved = resolve_delegated_artifact_path(
+                    candidate, task_id, require_workspace=True,
+                    maximum_bytes=MAX_DOWNLOAD_BYTES,
+                )
+            except (TypeError, ValueError):
+                continue
+            registered.add(os.path.normcase(str(resolved["path"])))
+        declared = {
+            os.path.normcase(str(artifact["path"])) for artifact in _artifacts
+        }
+        if declared and not declared.intersection(registered):
+            return (
+                "[System: The declared deliverable exists, but it was not produced "
+                "by a successful tool call in this turn. Do not claim it is newly "
+                "generated. Call the appropriate tool to create the artifact now, "
+                "or remove the delivery claim.]"
+            )
+    return None
+
+
+def append_artifact_delivery_failure(text: str, rejected: list[str]) -> str:
+    """Return a terminal failure without preserving unverifiable paths."""
+    if not rejected:
+        return text
+    return (
+        "⚠️ 文件交付失败：声明的文件未在当前工作区中验证成功，"
+        "因此没有生成下载卡片。请重新调用相应工具生成文件。"
     )
 
 
