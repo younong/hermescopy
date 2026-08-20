@@ -12,6 +12,8 @@ from hermes_cli.dashboard_plugins import (
     discover_dashboard_plugins,
     safe_plugin_relpath as safe_plugin_api_relpath,
 )
+from hermes_constants import get_hermes_home
+from utils import env_var_enabled
 
 
 _log = logging.getLogger(__name__)
@@ -247,7 +249,12 @@ def normalize_dashboard_plugin_manifest(
             raise ValueError("chat.workspaces contains duplicate paths")
         chat_info = {"workspaces": workspaces}
 
-    if tab_info is None and chat_info is None:
+    raw_api = data.get("api")
+    has_api = bool(raw_api) and isinstance(raw_api, str)
+    # Reject bare manifests (no tab, no chat.workspaces, no api). Legacy
+    # api-only plugins (e.g. #259's owner-worker / control-plane API plugins)
+    # declare just ``api`` + ``api_target`` and must still be discovered.
+    if tab_info is None and chat_info is None and not has_api:
         raise ValueError("manifest must declare tab or chat.workspaces")
 
     slots_src = data.get("slots")
@@ -283,8 +290,16 @@ def normalize_dashboard_plugin_manifest(
 
 
 def discover_dashboard_plugins() -> list[dict[str, Any]]:
-    """Discover dashboard manifests under owner, bundled, and opted-in project roots."""
+    """Discover dashboard manifests under owner, bundled, and opted-in project roots.
+
+    Validates each manifest via :func:`normalize_dashboard_plugin_manifest`. The
+    schema accepts either a ``tab`` declaration (legacy dashboard tab) or a
+    ``chat.workspaces`` declaration (PR #261 chat workspace plugins), and
+    preserves the ``api_target`` / ``authenticated_api`` fields added by #259.
+    """
     from hermes_cli.plugins import get_bundled_plugins_dir
+
+    _API_TARGETS = frozenset({"control-plane", "owner-worker"})
 
     bundled_root = get_bundled_plugins_dir()
     search_dirs = [
@@ -304,7 +319,7 @@ def discover_dashboard_plugins() -> list[dict[str, Any]]:
             if not child.is_dir():
                 continue
             manifest_file = child / "dashboard" / "manifest.json"
-            if not manifest_file.exists():
+            if not manifest_file.is_file():
                 continue
             try:
                 data = json.loads(manifest_file.read_text(encoding="utf-8"))
@@ -313,6 +328,21 @@ def discover_dashboard_plugins() -> list[dict[str, Any]]:
                     default_name=child.name,
                     dashboard_dir=child / "dashboard",
                     source=source,
+                )
+                raw_target = data.get("api_target", "control-plane")
+                api_target = raw_target if raw_target in _API_TARGETS else None
+                if api_target is None and plugin.get("has_api"):
+                    _log.warning(
+                        "Plugin %s: refusing invalid api_target %r (expected control-plane or owner-worker)",
+                        plugin["name"],
+                        raw_target,
+                    )
+                    plugin["_api_file"] = None
+                    plugin["has_api"] = False
+                authenticated_api = data.get("authenticated_api")
+                plugin["api_target"] = api_target or "control-plane"
+                plugin["_authenticated_control_plane_api"] = (
+                    source == "bundled" and authenticated_api == "dashboard-session"
                 )
                 name = plugin["name"]
                 if name in seen_names:

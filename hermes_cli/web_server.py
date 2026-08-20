@@ -12295,8 +12295,10 @@ async def set_dashboard_font(body: FontSetBody):
 # ---------------------------------------------------------------------------
 
 # Shared validation/discovery is also used by Owner Workers so manifests have one
-# trust model and one api_target interpretation across both runtimes.
-from hermes_cli.dashboard_plugins import discover_dashboard_plugins as _discover_dashboard_plugins
+# trust model and one api_target interpretation across both runtimes. The
+# dashboard_owner_payloads variant (PR #261) honors chat-only plugins and adds
+# api_target / authenticated_api passthrough for the legacy #259 API plugins.
+from hermes_cli.dashboard_owner_payloads import discover_dashboard_plugins as _discover_dashboard_plugins
 
 
 # Cache discovered plugins per-process (refresh on explicit re-scan).

@@ -21,7 +21,6 @@ import {
 import {
   BarChart3,
   BookOpen,
-  Clock,
   Cpu,
   Download,
   FileText,
