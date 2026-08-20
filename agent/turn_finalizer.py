@@ -321,14 +321,24 @@ def finalize_turn(
         try:
             from agent.artifact_delivery import (
                 append_artifact_delivery_warning,
+                extract_declared_artifact_paths,
                 validate_declared_artifacts,
+                zip_delivery_required,
+                zip_delivery_satisfied,
             )
 
+            _declared_paths = extract_declared_artifact_paths(final_response)
             artifacts, _rejected_artifacts = validate_declared_artifacts(
                 final_response,
                 task_id=effective_task_id or "default",
                 artifact_namespace=turn_id,
+                declared_paths=_declared_paths,
             )
+            if zip_delivery_required(original_user_message, _declared_paths) and not zip_delivery_satisfied(
+                _declared_paths, artifacts
+            ):
+                artifacts = []
+                _rejected_artifacts = _declared_paths or ["ZIP delivery requirement"]
             if _rejected_artifacts:
                 final_response = append_artifact_delivery_warning(
                     final_response,

@@ -5216,6 +5216,34 @@ def run_conversation(
                     messages.pop()
 
                 try:
+                    from agent.artifact_delivery import build_zip_delivery_nudge
+
+                    _zip_nudge = build_zip_delivery_nudge(
+                        user_message=original_user_message,
+                        final_response=final_response,
+                        task_id=effective_task_id or "default",
+                        attempts=getattr(agent, "_zip_delivery_nudges", 0),
+                    )
+                except Exception:
+                    logger.warning("ZIP delivery stop-loop check failed", exc_info=True)
+                    _zip_nudge = None
+
+                if _zip_nudge:
+                    agent._zip_delivery_nudges = (
+                        getattr(agent, "_zip_delivery_nudges", 0) + 1
+                    )
+                    final_msg["finish_reason"] = "zip_delivery_required"
+                    final_msg["_transient_model_instruction"] = True
+                    messages.append(final_msg)
+                    messages.append(transient_model_instruction(_zip_nudge))
+                    agent._session_messages = messages
+                    logger.info(
+                        "ZIP delivery stop-loop nudge issued (attempt %d)",
+                        agent._zip_delivery_nudges,
+                    )
+                    continue
+
+                try:
                     from agent.verification_stop import (
                         build_verify_on_stop_nudge,
                         verify_on_stop_enabled,

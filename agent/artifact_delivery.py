@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import mimetypes
 import re
+import zipfile
 from pathlib import PurePosixPath
 
 from gateway.platforms.response_media import MEDIA_TAG_CLEANUP_RE
@@ -22,6 +23,16 @@ _LABELED_PATH_RE = re.compile(
 )
 _FENCED_CODE_RE = re.compile(r"```[\s\S]*?```")
 _REMOTE_SCHEMES = ("http://", "https://", "data:", "blob:", "mailto:", "javascript:")
+_ZIP_REQUEST_RE = re.compile(
+    r"(?:\.zip\b|\bzip\b|压缩包|打包(?:成|为)?(?:\s*zip)?|归档文件)",
+    re.IGNORECASE,
+)
+_ZIP_REJECTION_RE = re.compile(
+    r"(?:不|无需|不用|不要).{0,4}(?:\.zip\b|\bzip\b|压缩包|打包)|"
+    r"(?:do\s+not|don't|without)\s+(?:a\s+)?(?:zip|archive)",
+    re.IGNORECASE,
+)
+_MAX_ZIP_DELIVERY_NUDGES = 2
 
 
 def _inside_fenced_code(index: int, ranges: list[tuple[int, int]]) -> bool:
@@ -71,16 +82,102 @@ def extract_declared_artifact_paths(text: str) -> list[str]:
     return paths
 
 
+def zip_delivery_requested(user_message: object) -> bool:
+    """Return whether the current user explicitly requested a ZIP archive."""
+    if isinstance(user_message, str):
+        text = user_message
+    elif isinstance(user_message, list):
+        text = "\n".join(
+            str(part.get("text") or "")
+            for part in user_message
+            if isinstance(part, dict) and part.get("type") == "text"
+        )
+    else:
+        text = ""
+    return bool(_ZIP_REQUEST_RE.search(text)) and not bool(_ZIP_REJECTION_RE.search(text))
+
+
+def _valid_zip(path: str) -> bool:
+    """Require a readable archive with safe names and at least one real file."""
+    try:
+        with zipfile.ZipFile(path, "r") as archive:
+            members = archive.infolist()
+            if not members or not any(not member.is_dir() for member in members):
+                return False
+            for member in members:
+                member_path = PurePosixPath(member.filename.replace("\\", "/"))
+                if member_path.is_absolute() or ".." in member_path.parts:
+                    return False
+            return archive.testzip() is None
+    except (OSError, zipfile.BadZipFile, RuntimeError):
+        return False
+
+
+def zip_delivery_required(user_message: object, declared_paths: list[str]) -> bool:
+    """Require one archive for an explicit ZIP request or a multi-file offer."""
+    return zip_delivery_requested(user_message) or len(declared_paths) > 1
+
+
+def zip_delivery_satisfied(
+    declared_paths: list[str],
+    artifacts: list[dict[str, object]],
+) -> bool:
+    """Return whether the response offers exactly one validated ZIP artifact."""
+    return (
+        len(declared_paths) == 1
+        and len(artifacts) == 1
+        and str(artifacts[0].get("name") or "").lower().endswith(".zip")
+    )
+
+
+def build_zip_delivery_nudge(
+    *,
+    user_message: object,
+    final_response: str,
+    task_id: str = "default",
+    attempts: int = 0,
+    max_attempts: int = _MAX_ZIP_DELIVERY_NUDGES,
+    declared_paths: list[str] | None = None,
+) -> str | None:
+    """Keep the tool loop running until an explicitly requested ZIP is valid."""
+    if attempts >= max_attempts:
+        return None
+
+    if declared_paths is None:
+        declared_paths = extract_declared_artifact_paths(final_response)
+    if not zip_delivery_required(user_message, declared_paths):
+        return None
+
+    artifacts, _rejected = validate_declared_artifacts(
+        final_response,
+        task_id=task_id,
+        declared_paths=declared_paths,
+    )
+    if zip_delivery_satisfied(declared_paths, artifacts):
+        return None
+
+    return (
+        "[System: This turn requires a ZIP archive, but your attempted final answer "
+        "does not offer a valid, non-empty ZIP from the current task "
+        "workspace. Continue now: create one archive containing only the intended "
+        "deliverables (never the entire workspace), verify that it opens and its "
+        "members are correct, then provide a markdown download link to the .zip file.]"
+    )
+
+
 def validate_declared_artifacts(
     text: str,
     *,
     task_id: str = "default",
     artifact_namespace: str = "",
+    declared_paths: list[str] | None = None,
 ) -> tuple[list[dict[str, object]], list[str]]:
     """Validate explicit file offers and return gateway metadata plus rejected inputs."""
     artifacts: list[dict[str, object]] = []
     rejected: list[str] = []
-    for path in extract_declared_artifact_paths(text):
+    if declared_paths is None:
+        declared_paths = extract_declared_artifact_paths(text)
+    for path in declared_paths:
         try:
             resolved = resolve_delegated_artifact_path(
                 path,
@@ -93,7 +190,16 @@ def validate_declared_artifacts(
             continue
         child_path = str(resolved["path"])
         name = PurePosixPath(child_path.replace("\\", "/")).name
-        mime_type, _encoding = mimetypes.guess_type(name)
+        if name.lower().endswith(".zip") and not _valid_zip(
+            str(resolved.get("diagnostic_path") or child_path)
+        ):
+            rejected.append(path)
+            continue
+        mime_type = (
+            "application/zip"
+            if name.lower().endswith(".zip")
+            else mimetypes.guess_type(name)[0]
+        )
         identity = (
             f"{artifact_namespace}\0{child_path}\0{int(resolved['size_bytes'])}"
         ).encode("utf-8")
