@@ -48,6 +48,16 @@ export interface KanbanWarningsSummary {
   highest_severity: KanbanDiagnosticSeverity | null;
 }
 
+export interface KanbanWorkflowStep {
+  key: string;
+  assignee: string;
+}
+
+export interface KanbanWorkflow {
+  steps: KanbanWorkflowStep[];
+  auto_advance: boolean;
+}
+
 export interface KanbanTask {
   id: string;
   title: string;
@@ -76,6 +86,7 @@ export interface KanbanTask {
   current_run_id: number | null;
   workflow_template_id: string | null;
   current_step_key: string | null;
+  workflow: KanbanWorkflow | null;
   skills: string[] | null;
   model_override: string | null;
   max_retries: number | null;
@@ -177,6 +188,7 @@ export interface KanbanCreateTaskInput {
   skills?: string[] | null;
   goal_mode?: boolean;
   goal_max_turns?: number | null;
+  workflow?: KanbanWorkflow | null;
 }
 
 export interface KanbanUpdateTaskInput {
@@ -189,6 +201,7 @@ export interface KanbanUpdateTaskInput {
   block_reason?: string | null;
   summary?: string | null;
   metadata?: KanbanMetadata | null;
+  workflow?: KanbanWorkflow | null;
 }
 
 export interface KanbanBulkTaskInput {

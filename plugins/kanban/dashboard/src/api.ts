@@ -31,6 +31,7 @@ import {
   type KanbanUpdateTaskInput,
   type KanbanWorkerLog,
   type KanbanAssignee,
+  type KanbanWorkflow,
 } from "./types";
 
 const BASE = "/api/plugins/kanban";
@@ -51,6 +52,7 @@ export interface KanbanApi {
   getBoard(board: string, filters?: KanbanBoardFilters, signal?: AbortSignal): Promise<KanbanBoardResponse>;
   getTask(board: string, taskId: string, runState?: { type: KanbanRunStateType; name: string }, signal?: AbortSignal): Promise<KanbanTaskDetailResponse>;
   createTask(board: string, input: KanbanCreateTaskInput): Promise<{ task: KanbanTask | null; warning?: string }>;
+  updateWorkflow(board: string, taskId: string, workflow: KanbanWorkflow | null): Promise<{ task: KanbanTask | null }>;
   updateTask(board: string, taskId: string, input: KanbanUpdateTaskInput): Promise<{ task: KanbanTask | null }>;
   deleteTask(board: string, taskId: string): Promise<{ deleted: boolean; task_id: string }>;
   bulkUpdate(board: string, input: KanbanBulkTaskInput): Promise<{ results: KanbanBulkResult[] }>;
@@ -138,6 +140,8 @@ export const kanbanApi: KanbanApi = {
     ),
   createTask: (board, input) =>
     fetchJSON(`${BASE}/tasks?${boardParams(board)}`, jsonInit("POST", input)),
+  updateWorkflow: (board, taskId, workflow) =>
+    fetchJSON(`${BASE}/tasks/${encodePath(taskId)}?${boardParams(board)}`, jsonInit("PATCH", { workflow })),
   updateTask: (board, taskId, input) =>
     fetchJSON(`${BASE}/tasks/${encodePath(taskId)}?${boardParams(board)}`, jsonInit("PATCH", input)),
   deleteTask: (board, taskId) =>

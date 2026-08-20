@@ -879,6 +879,9 @@ class Task:
     current_run_id: Optional[int] = None
     workflow_template_id: Optional[str] = None
     current_step_key: Optional[str] = None
+    # Ordered workflow definition. Each step is {"key": ..., "assignee": ...}.
+    # Stored as JSON so one task can hand off across multiple AI profiles.
+    workflow: Optional[dict] = None
     # Force-loaded skills for the worker on this task (passed via
     # --skills). Stored as a JSON array of skill names. None = use only
     # the defaults; empty list = explicitly no extra skills.
@@ -931,6 +934,14 @@ class Task:
                     skills_value = [str(s) for s in parsed if s]
             except Exception:
                 skills_value = None
+        workflow_value: Optional[dict] = None
+        if "workflow" in keys and row["workflow"]:
+            try:
+                parsed_workflow = json.loads(row["workflow"])
+                if isinstance(parsed_workflow, dict):
+                    workflow_value = parsed_workflow
+            except (TypeError, ValueError, json.JSONDecodeError):
+                workflow_value = None
         return cls(
             id=row["id"],
             title=row["title"],
@@ -980,6 +991,7 @@ class Task:
             current_step_key=(
                 row["current_step_key"] if "current_step_key" in keys else None
             ),
+            workflow=workflow_value,
             skills=skills_value,
             model_override=row["model_override"] if "model_override" in keys and row["model_override"] else None,
             max_retries=(
@@ -1133,11 +1145,11 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- Pointer into task_runs for the currently-active run (NULL if no
     -- run is in-flight). Denormalised for cheap reads.
     current_run_id       INTEGER,
-    -- Forward-compat for v2 workflow routing. In v1 the kernel writes
-    -- these when the task is opted into a template but otherwise ignores
-    -- them; the dispatcher doesn't consult them for routing yet.
+    -- Workflow routing metadata. The ordered step map is stored as JSON so
+    -- one task can hand off to multiple AI profiles without a second scheduler.
     workflow_template_id TEXT,
     current_step_key     TEXT,
+    workflow             TEXT,
     -- Force-loaded skills for the worker on this task, stored as JSON.
     -- Passed to the worker via `--skills`. NULL or empty array = no extras.
     skills               TEXT,
@@ -1823,6 +1835,8 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         _add_column_if_missing(
             conn, "tasks", "current_step_key", "current_step_key TEXT"
         )
+    if "workflow" not in cols:
+        _add_column_if_missing(conn, "tasks", "workflow", "workflow TEXT")
     if "skills" not in cols:
         # JSON array of skill names the dispatcher force-loads into the
         # worker via --skills. NULL is fine for existing rows.
@@ -2275,6 +2289,29 @@ def _canonical_assignee(assignee: Optional[str]) -> Optional[str]:
     return normalize_profile_name(assignee)
 
 
+def _normalize_workflow(workflow: dict) -> dict:
+    """Validate and canonicalize an ordered multi-profile workflow."""
+    if not isinstance(workflow, dict):
+        raise ValueError("workflow must be an object")
+    raw_steps = workflow.get("steps")
+    if not isinstance(raw_steps, list) or not raw_steps:
+        raise ValueError("workflow.steps must be a non-empty list")
+    steps: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for raw in raw_steps:
+        if not isinstance(raw, dict):
+            raise ValueError("workflow steps must be objects")
+        key = str(raw.get("key") or "").strip()
+        assignee = _canonical_assignee(raw.get("assignee"))
+        if not key or not assignee:
+            raise ValueError("each workflow step requires key and assignee")
+        if key in seen:
+            raise ValueError(f"duplicate workflow step key: {key}")
+        seen.add(key)
+        steps.append({"key": key, "assignee": assignee})
+    return {"steps": steps, "auto_advance": bool(workflow.get("auto_advance", True))}
+
+
 def create_task(
     conn: sqlite3.Connection,
     *,
@@ -2299,6 +2336,7 @@ def create_task(
     session_id: Optional[str] = None,
     board: Optional[str] = None,
     project_id: Optional[str] = None,
+    workflow: Optional[dict] = None,
 ) -> str:
     """Create a new task and optionally link it under parent tasks.
 
@@ -2324,6 +2362,10 @@ def create_task(
     translation skill regardless of the profile's default config).
     """
     assignee = _canonical_assignee(assignee)
+    if workflow is not None:
+        workflow = _normalize_workflow(workflow)
+        if workflow and assignee is None:
+            assignee = workflow["steps"][0]["assignee"]
     if not title or not title.strip():
         raise ValueError("title is required")
     if initial_status not in VALID_INITIAL_STATUSES:
@@ -2527,8 +2569,9 @@ def create_task(
                         created_by, created_at, workspace_kind, workspace_path,
                         branch_name, project_id, tenant, idempotency_key,
                         max_runtime_seconds,
-                        skills, max_retries, goal_mode, goal_max_turns, session_id
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        skills, max_retries, goal_mode, goal_max_turns, session_id, workflow,
+                        current_step_key
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id,
@@ -2551,6 +2594,8 @@ def create_task(
                         1 if goal_mode else 0,
                         int(goal_max_turns) if goal_max_turns is not None else None,
                         session_id,
+                        json.dumps(workflow, ensure_ascii=False) if workflow else None,
+                        workflow["steps"][0]["key"] if workflow else None,
                     ),
                 )
                 for pid in parents:
@@ -3867,6 +3912,62 @@ class HallucinatedCardsError(ValueError):
         )
 
 
+def _advance_workflow_after_completion(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    run_id: Optional[int],
+    summary: Optional[str],
+) -> Optional[dict]:
+    """Hand off a completed step to the next AI profile exactly once.
+
+    The completion write happens first, then this small transaction changes the
+    task back to ``ready`` for the next profile.  A completed final step stays
+    ``done``.  The current step key is the idempotency fence: a repeated
+    completion cannot advance the same step twice.
+    """
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT status, workflow, current_step_key, assignee FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if not row or row["status"] != "done" or not row["workflow"]:
+            return None
+        try:
+            workflow = _normalize_workflow(json.loads(row["workflow"]))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return None
+        if not workflow.get("auto_advance", True):
+            return None
+        steps = workflow["steps"]
+        current_key = row["current_step_key"] or steps[0]["key"]
+        try:
+            index = next(i for i, step in enumerate(steps) if step["key"] == current_key)
+        except StopIteration:
+            return None
+        if index >= len(steps) - 1:
+            _append_event(conn, task_id, "workflow_completed", {
+                "step_key": current_key, "run_id": run_id,
+            }, run_id=run_id)
+            return None
+        previous = steps[index]
+        following = steps[index + 1]
+        cur = conn.execute(
+            "UPDATE tasks SET status = 'ready', assignee = ?, current_step_key = ?, "
+            "completed_at = NULL, claim_lock = NULL, claim_expires = NULL, "
+            "worker_pid = NULL WHERE id = ? AND status = 'done' AND current_step_key = ?",
+            (following["assignee"], following["key"], task_id, current_key),
+        )
+        if cur.rowcount != 1:
+            return None
+        _append_event(conn, task_id, "workflow_advanced", {
+            "from_step": previous["key"], "to_step": following["key"],
+            "from_assignee": previous["assignee"], "to_assignee": following["assignee"],
+            "summary": (summary or "").strip()[:400] or None,
+        }, run_id=run_id)
+        return following
+
+
 def complete_task(
     conn: sqlite3.Connection,
     task_id: str,
@@ -4050,6 +4151,10 @@ def complete_task(
     recompute_ready(conn)
     # Clean up the scratch workspace and any stale tmux session for the worker.
     _cleanup_workspace(conn, task_id)
+    _advance_workflow_after_completion(
+        conn, task_id, run_id=run_id,
+        summary=(summary if summary is not None else result),
+    )
     _done_task = get_task(conn, task_id)
     _fire_kanban_lifecycle_hook(
         "kanban_task_completed",

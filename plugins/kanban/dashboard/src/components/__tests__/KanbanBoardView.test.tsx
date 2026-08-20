@@ -96,7 +96,7 @@ function task(overrides: Partial<KanbanTask>): KanbanTask {
     workspace_kind: "scratch", workspace_path: null, claim_lock: null, claim_expires: null,
     tenant: null, branch_name: null, project_id: null, result: null, idempotency_key: null,
     consecutive_failures: 0, worker_pid: null, last_failure_error: null, max_runtime_seconds: null,
-    last_heartbeat_at: null, current_run_id: null, workflow_template_id: null, current_step_key: null,
+    last_heartbeat_at: null, current_run_id: null, workflow_template_id: null, current_step_key: null, workflow: null,
     skills: null, model_override: null, max_retries: null, goal_mode: false, goal_max_turns: null,
     session_id: null, block_kind: null, block_recurrences: 0,
     age: { created_age_seconds: 1, started_age_seconds: null, time_to_complete_seconds: null },
