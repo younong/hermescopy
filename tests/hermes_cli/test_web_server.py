@@ -1502,12 +1502,16 @@ class TestWebServerEndpoints:
             def get_connected_platforms(self):
                 return [_Platform("matrix")]
 
+            def get_home_channel(self, platform):
+                assert platform.value == "matrix"
+                return object()
+
         monkeypatch.setattr(
             gateway_config, "load_gateway_config", lambda: _GatewayConfig()
         )
         monkeypatch.setenv("MATRIX_HOME_ROOM", "!room:matrix.org")
 
-        resp = self.client.get("/api/cron/delivery-targets")
+        resp = self.client.get("/api/plugins/scheduled-tasks/delivery-targets")
 
         assert resp.status_code == 200
         targets = {t["id"]: t for t in resp.json()["targets"]}
@@ -3200,18 +3204,18 @@ class TestNewEndpoints:
         assert resp.status_code == 400
 
     def test_cron_list(self):
-        resp = self.client.get("/api/cron/jobs")
+        resp = self.client.get("/api/plugins/scheduled-tasks/jobs")
         assert resp.status_code == 200
         assert isinstance(resp.json(), list)
 
     def test_cron_job_not_found(self):
-        resp = self.client.get("/api/cron/jobs/nonexistent-id")
+        resp = self.client.get("/api/plugins/scheduled-tasks/jobs/nonexistent-id")
         assert resp.status_code == 404
 
     # --- Automation Blueprints ---
 
     def test_cron_blueprints_list(self):
-        resp = self.client.get("/api/cron/blueprints")
+        resp = self.client.get("/api/plugins/scheduled-tasks/blueprints")
         assert resp.status_code == 200
         blueprints = resp.json()["blueprints"]
         assert len(blueprints) >= 1
@@ -3222,7 +3226,7 @@ class TestNewEndpoints:
 
     def test_blueprint_instantiate_creates_job(self):
         resp = self.client.post(
-            "/api/cron/blueprints/instantiate",
+            "/api/plugins/scheduled-tasks/blueprints/instantiate",
             json={"blueprint": "morning-brief", "values": {"time": "07:30", "deliver": "local"}},
         )
         assert resp.status_code == 200
@@ -3232,14 +3236,14 @@ class TestNewEndpoints:
 
     def test_blueprint_instantiate_unknown_404(self):
         resp = self.client.post(
-            "/api/cron/blueprints/instantiate",
+            "/api/plugins/scheduled-tasks/blueprints/instantiate",
             json={"blueprint": "does-not-exist", "values": {}},
         )
         assert resp.status_code == 404
 
     def test_blueprint_instantiate_bad_value_422(self):
         resp = self.client.post(
-            "/api/cron/blueprints/instantiate",
+            "/api/plugins/scheduled-tasks/blueprints/instantiate",
             json={"blueprint": "morning-brief", "values": {"time": "99:99"}},
         )
         assert resp.status_code == 422
@@ -6258,14 +6262,14 @@ class TestAuthenticatedOwnerWorkerSessionProxy:
     @pytest.mark.parametrize(
         ("method", "path", "payload"),
         [
-            ("GET", "/api/cron/jobs", None),
-            ("POST", "/api/cron/jobs", {"schedule": "every 1h", "prompt": "owner task"}),
-            ("GET", "/api/cron/jobs/job-1", None),
-            ("PUT", "/api/cron/jobs/job-1", {"updates": {"name": "renamed"}}),
-            ("POST", "/api/cron/jobs/job-1/pause", None),
-            ("POST", "/api/cron/jobs/job-1/resume", None),
-            ("DELETE", "/api/cron/jobs/job-1", None),
-            ("GET", "/api/cron/delivery-targets", None),
+            ("GET", "/api/plugins/scheduled-tasks/jobs", None),
+            ("POST", "/api/plugins/scheduled-tasks/jobs", {"schedule": "every 1h", "prompt": "owner task"}),
+            ("GET", "/api/plugins/scheduled-tasks/jobs/job-1", None),
+            ("PUT", "/api/plugins/scheduled-tasks/jobs/job-1", {"updates": {"name": "renamed"}}),
+            ("POST", "/api/plugins/scheduled-tasks/jobs/job-1/pause", None),
+            ("POST", "/api/plugins/scheduled-tasks/jobs/job-1/resume", None),
+            ("DELETE", "/api/plugins/scheduled-tasks/jobs/job-1", None),
+            ("GET", "/api/plugins/scheduled-tasks/delivery-targets", None),
         ],
     )
     def test_authenticated_cron_routes_proxy_to_owner_worker(
@@ -6288,7 +6292,7 @@ class TestAuthenticatedOwnerWorkerSessionProxy:
                 owner_key=lease.owner_key,
                 content=content,
             )
-            response = {"targets": []} if request_path == "/api/cron/delivery-targets" else []
+            response = {"targets": []} if request_path == "/api/plugins/scheduled-tasks/delivery-targets" else []
             return httpx.Response(200, json=response)
 
         monkeypatch.setattr(owner_client.OwnerWorkerClient, "request", fake_request)

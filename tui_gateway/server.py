@@ -6635,6 +6635,9 @@ def _web_direct_employee(
     employee_id = str(raw_employee_id or "").strip()
     if not employee_id:
         return None, None, "employee ID is required"
+    if source == "cron":
+        # Cron employee jobs are resolved by _cron_employee below.
+        return None, None, None
     if source != "dashboard-gui":
         return None, None, "employee direct chat requires the dashboard GUI source"
     if _dashboard_attach_transport() is None:
@@ -6646,6 +6649,38 @@ def _web_direct_employee(
         return _resolve_current_web_direct_policy(service, employee_id), service, None
     except (TypeError, ValueError, RuntimeError) as exc:
         return None, None, str(exc)
+
+
+def _cron_employee(
+    params: dict,
+    *,
+    source: str,
+) -> tuple[dict | None, str | None]:
+    """Resolve the current policy for a cron job's pinned employee.
+
+    Only the Owner Worker's in-process cron dispatcher may attach an employee
+    identity to a ``source="cron"`` session: the dispatcher's transport carries
+    the server-side ``cron_internal`` marker that remote connections can never
+    hold. Unlike web direct chats, cron runs are one-shot sessions, so no
+    conversation binding is claimed.
+    """
+    raw_employee_id = params.get("employee_id")
+    if raw_employee_id is None or source != "cron":
+        return None, None
+    employee_id = str(raw_employee_id or "").strip()
+    if not employee_id:
+        return None, "employee ID is required"
+    if getattr(current_transport(), "cron_internal", False) is not True:
+        return None, "cron employee sessions require the internal cron dispatcher"
+    if current_owner_worker_gateway_runtime() is None:
+        return None, "cron employee sessions require an owner worker runtime"
+    try:
+        return (
+            _resolve_current_web_direct_policy(_collaboration_service(), employee_id),
+            None,
+        )
+    except (TypeError, ValueError, RuntimeError) as exc:
+        return None, str(exc)
 
 
 def _web_direct_collaboration_context(
@@ -7052,9 +7087,12 @@ def _session_create(rid, params: dict) -> dict:
     )
     if employee_error is not None:
         return _err(rid, 4002, employee_error)
+    cron_employee_policy, employee_error = _cron_employee(params, source=source)
+    if employee_error is not None:
+        return _err(rid, 4002, employee_error)
     if employee_policy is not None and direct_employee_policy is not None:
         return _err(rid, 4002, "employee session identity is ambiguous")
-    employee_policy = employee_policy or direct_employee_policy
+    employee_policy = employee_policy or direct_employee_policy or cron_employee_policy
     runtime_override_keys = ("model", "provider", "reasoning_effort", "fast", "cwd")
     if employee_policy is not None and any(key in params for key in runtime_override_keys):
         return _err(rid, 4002, "employee policy cannot be combined with runtime overrides")

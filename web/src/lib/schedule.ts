@@ -295,7 +295,7 @@ function parseTimeOfDay(value: string): { hour: number; minute: number } | null 
 
 /** Translation surface the human-readable describer needs. Passing it
  * in (instead of importing ``useI18n``) keeps the helper pure and
- * testable; the CronPage threads ``t.cron.scheduleDescribe`` through. */
+ * testable; each scheduled-task surface threads its translations through. */
 export interface ScheduleDescribeStrings {
   /** Display when no schedule can be resolved (e.g. legacy/blank job). */
   none: string;

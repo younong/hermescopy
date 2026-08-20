@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
+from typing import Any, Iterable
 
 from hermes_cli.dashboard_auth.public_paths import is_public_api_route
 
@@ -85,8 +86,6 @@ _EMPLOYEE_FEISHU_ACTION_METHODS: dict[str, frozenset[str]] = {
     "lifecycle": frozenset({"PUT"}),
     "test": frozenset({"POST"}),
 }
-_CRON_ITEM_METHODS: frozenset[str] = frozenset({"GET", "PUT", "DELETE"})
-_CRON_ACTIONS: frozenset[str] = frozenset({"pause", "resume", "trigger"})
 SESSION_READER_ROUTES: frozenset[tuple[str, str]] = frozenset({
     ("GET", "/api/sessions"),
     ("GET", "/api/sessions/search"),
@@ -102,15 +101,96 @@ _SESSION_ITEM_SUFFIXES: frozenset[str] = frozenset({
 TOKEN_AUTH_ONLY_PATHS: frozenset[str] = frozenset({
     "/api/cron/fire",
 })
-# Plugin names whose API routers are safe to expose behind cookie auth.
-# The host's /api/plugins/<name>/... router is mounted directly, not proxied
-# through an Owner Worker (see _mount_plugin_api_routes), so the gate must
-# explicitly accept these paths or the safe-by-default middleware will 403
-# every browser request. Add a name here only after reviewing the plugin's
-# own auth/session handling.
-PLUGIN_API_ALLOWED_NAMES: frozenset[str] = frozenset({
-    "kanban",
-})
+# Exact method/path inventory registered from validated, trusted dashboard plugin
+# routers at mount time. Dynamic path parameters are represented as segment
+# templates and matched one segment at a time; arbitrary plugin prefixes never
+# inherit access from another route.
+_PLUGIN_CONTROL_PLANE_ROUTES: dict[str, set[tuple[str, str]]] = {}
+_PLUGIN_OWNER_WORKER_ROUTES: dict[str, set[tuple[str, str]]] = {}
+_PLUGIN_WEBSOCKET_ROUTES: dict[str, set[str]] = {}
+
+
+def clear_plugin_api_routes() -> None:
+    """Clear mount-derived policy before rebuilding one Control Plane app."""
+    _PLUGIN_CONTROL_PLANE_ROUTES.clear()
+    _PLUGIN_OWNER_WORKER_ROUTES.clear()
+    _PLUGIN_WEBSOCKET_ROUTES.clear()
+
+
+def register_plugin_api_routes(
+    plugin_name: str,
+    *,
+    api_target: str,
+    routes: Iterable[Any],
+    prefix: str,
+) -> None:
+    """Register exact authenticated availability for one mounted plugin router."""
+    if api_target not in {"control-plane", "owner-worker"}:
+        raise ValueError("invalid dashboard plugin api_target")
+    expected_prefix = f"/api/plugins/{plugin_name}"
+    if prefix != expected_prefix:
+        raise ValueError("dashboard plugin prefix does not match its manifest name")
+    target_registry = (
+        _PLUGIN_OWNER_WORKER_ROUTES
+        if api_target == "owner-worker"
+        else _PLUGIN_CONTROL_PLANE_ROUTES
+    )
+    target: set[tuple[str, str]] = set()
+    websocket_routes: set[str] = set()
+    for route in routes:
+        route_path = getattr(route, "path", None)
+        if not isinstance(route_path, str) or not route_path.startswith("/"):
+            continue
+        full_path = f"{prefix}{route_path}"
+        methods = getattr(route, "methods", None)
+        if methods:
+            for method in methods:
+                target.add((str(method).upper(), full_path))
+        elif api_target == "control-plane":
+            websocket_routes.add(full_path)
+    target_registry[plugin_name] = target
+    _PLUGIN_WEBSOCKET_ROUTES[plugin_name] = websocket_routes
+
+
+def _route_template_matches(template: str, path: str) -> bool:
+    template_parts = template.split("/")
+    path_parts = path.split("/")
+    for index, template_part in enumerate(template_parts):
+        if index >= len(path_parts):
+            return False
+        if template_part == path_parts[index]:
+            continue
+        if not (
+            template_part.startswith("{")
+            and template_part.endswith("}")
+            and bool(path_parts[index])
+        ):
+            return False
+        converter = template_part[1:-1].partition(":")[2]
+        if converter == "path":
+            return index == len(template_parts) - 1
+    return len(template_parts) == len(path_parts)
+
+
+def registered_plugin_websocket_route(path: str) -> bool:
+    """Return whether path exactly matches a trusted mounted plugin WS route."""
+    return any(
+        _route_template_matches(template, path)
+        for routes in _PLUGIN_WEBSOCKET_ROUTES.values()
+        for template in routes
+    )
+
+
+def _registered_plugin_route(path: str, method: str) -> AuthenticatedApiBucket | None:
+    for routes in _PLUGIN_OWNER_WORKER_ROUTES.values():
+        for registered_method, template in routes:
+            if method == registered_method and _route_template_matches(template, path):
+                return AuthenticatedApiBucket.OWNER_WORKER
+    for routes in _PLUGIN_CONTROL_PLANE_ROUTES.values():
+        for registered_method, template in routes:
+            if method == registered_method and _route_template_matches(template, path):
+                return AuthenticatedApiBucket.PLUGIN_API
+    return None
 
 
 @dataclass(frozen=True)
@@ -161,31 +241,6 @@ def _employee_control_plane_route(path: str, method: str) -> bool:
     )
 
 
-def _cron_owner_worker_route(path: str, method: str) -> bool:
-    if path == "/api/cron/jobs":
-        return method in {"GET", "POST"}
-    if path == "/api/cron/delivery-targets":
-        return method == "GET"
-    parts = path.split("/")
-    if len(parts) == 5 and parts[:4] == ["", "api", "cron", "jobs"]:
-        return bool(parts[4]) and method in _CRON_ITEM_METHODS
-    return (
-        len(parts) == 6
-        and parts[:4] == ["", "api", "cron", "jobs"]
-        and bool(parts[4])
-        and parts[5] in _CRON_ACTIONS
-        and method == "POST"
-    )
-
-
-def _plugin_api_route(path: str) -> bool:
-    parts = path.split("/")
-    # "", "api", "plugins", "<name>", ...
-    if len(parts) < 5 or parts[:3] != ["", "api", "plugins"]:
-        return False
-    return bool(parts[3]) and parts[3] in PLUGIN_API_ALLOWED_NAMES
-
-
 def classify_authenticated_api(
     path: str,
     *,
@@ -220,12 +275,13 @@ def classify_authenticated_api(
         method == "GET" and _session_item_path(path)
     ):
         return AuthenticatedApiDecision(AuthenticatedApiBucket.SESSION_READER, True, "session-reader routed")
-    if (method, path) in OWNER_WORKER_ROUTES or _cron_owner_worker_route(path, method) or (
+    if (method, path) in OWNER_WORKER_ROUTES or (
         _session_item_path(path) and method in {"PATCH", "DELETE"}
     ):
         return AuthenticatedApiDecision(AuthenticatedApiBucket.OWNER_WORKER, True, "owner-worker routed")
-    if _plugin_api_route(path):
-        return AuthenticatedApiDecision(AuthenticatedApiBucket.PLUGIN_API, True, "plugin-api route")
+    plugin_bucket = _registered_plugin_route(path, method)
+    if plugin_bucket is not None:
+        return AuthenticatedApiDecision(plugin_bucket, True, "plugin-api route")
     if token_authenticated:
         return AuthenticatedApiDecision(AuthenticatedApiBucket.TOKEN_AUTH_ONLY, True, "token authenticated")
     return AuthenticatedApiDecision(

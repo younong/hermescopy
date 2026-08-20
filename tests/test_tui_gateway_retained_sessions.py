@@ -3539,3 +3539,119 @@ def test_collaboration_message_rejects_browser_attachment_paths(owner_gateway):
         "code": -32602,
         "message": "collaboration message params are invalid",
     }
+
+
+class _CronTransport:
+    cron_internal = True
+
+    def write(self, _obj):
+        return True
+
+    def close(self):
+        return None
+
+
+def _cron_employee_policy():
+    return {
+        "schema_version": 1,
+        "employee_id": "employee-cron",
+        "profile_revision": 1,
+        "source_profile_fingerprint": "sha256:" + "b" * 64,
+        "system_prompt": "Server-authoritative policy",
+        "model": {"provider": "openai", "model": "test-model"},
+        "toolsets": [],
+        "skills": [],
+        "mcp_servers": [],
+        "workspace_relative_path": "employees/analyst",
+        "knowledge_relative_paths": [],
+        "max_iterations": 20,
+    }
+
+
+def _bind_cron_employee_service(runtime, monkeypatch, policy):
+    from hermes_cli.collaboration.models import CollaborationMemberProfile
+    from hermes_cli.collaboration.resolver import ResolvedCollaborationEmployee
+
+    class _Resolver:
+        def resolve_current(self, employee_id):
+            assert employee_id == "employee-cron"
+            return ResolvedCollaborationEmployee(
+                member=CollaborationMemberProfile(
+                    "employee-cron", 1, "sha256:" + "b" * 64
+                ),
+                employee_policy=policy,
+                may_participate=False,
+                may_create_groups=False,
+                invite_quota=None,
+            )
+
+    class _Service:
+        resolver = _Resolver()
+
+    server.bind_collaboration_service(runtime, _Service())
+    monkeypatch.setattr(server, "_collaboration_service", lambda: _Service())
+
+
+def test_cron_employee_session_uses_server_resolved_policy(owner_gateway, monkeypatch):
+    _db, runtime, _workspace_root = owner_gateway
+    policy = _cron_employee_policy()
+    _bind_cron_employee_service(runtime, monkeypatch, policy)
+
+    response = server.dispatch(
+        {"id": "request", "method": "session.create", "params": {
+            "source": "cron",
+            "employee_id": "employee-cron",
+            "title": "Scheduled job",
+            "close_on_disconnect": True,
+        }},
+        transport=_CronTransport(),
+        runtime=runtime,
+    )
+
+    assert "error" not in response
+    session = runtime.mutable_state.sessions[response["result"]["session_id"]]
+    assert session["employee_policy"] == policy
+    assert session["collaboration_context"] is None
+    assert session["model_override"] == {
+        "model": "test-model",
+        "provider": "openai",
+        "base_url": None,
+        "api_mode": None,
+    }
+
+
+def test_cron_employee_session_rejects_remote_transport_and_overrides(
+    owner_gateway, monkeypatch,
+):
+    _db, runtime, _workspace_root = owner_gateway
+    policy = _cron_employee_policy()
+    _bind_cron_employee_service(runtime, monkeypatch, policy)
+
+    # A remote (non cron-internal) transport cannot attach an employee identity
+    # to a cron-source session.
+    forged = _dispatch(
+        runtime,
+        "session.create",
+        {"source": "cron", "employee_id": "employee-cron"},
+        purpose="interactive",
+    )
+    assert forged["error"] == {
+        "code": 4002,
+        "message": "cron employee sessions require the internal cron dispatcher",
+    }
+
+    # Runtime overrides stay mutually exclusive with an employee identity.
+    override = server.dispatch(
+        {"id": "request", "method": "session.create", "params": {
+            "source": "cron",
+            "employee_id": "employee-cron",
+            "model": "forged-model",
+        }},
+        transport=_CronTransport(),
+        runtime=runtime,
+    )
+    assert override["error"] == {
+        "code": 4002,
+        "message": "employee policy cannot be combined with runtime overrides",
+    }
+    assert runtime.mutable_state.sessions == {}

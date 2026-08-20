@@ -17,8 +17,8 @@ import {
 /**
  * Human-readable schedule picker for cron job create/edit flows.
  *
- * Replaces the raw "type a cron expression" input that lived inline in
- * ``CronPage``. The picker still emits a single backend-compatible
+ * Replaces the old raw "type a cron expression" input. The picker still
+ * emits a single backend-compatible
  * schedule string (see ``cron/jobs.py::parse_schedule``), but the user
  * fills out shape-appropriate inputs (time picker, weekday toggles,
  * datetime-local field) per mode.

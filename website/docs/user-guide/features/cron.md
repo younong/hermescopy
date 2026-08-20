@@ -61,6 +61,10 @@ Every morning at 9am, check Hacker News for AI news and send me a summary on Tel
 
 Hermes will use the unified `cronjob` tool internally.
 
+### From the Dashboard
+
+Open **Scheduled Tasks** in the Dashboard to create, edit, pause, resume, trigger, and remove jobs. This management page is supplied by the bundled `scheduled-tasks` Dashboard plugin. Disabling that plugin removes the page and its management API, but it does not disable the core scheduler, CLI, `/cron` command, or `cronjob` tool.
+
 ## Skill-backed cron jobs
 
 A cron job can load one or more skills before it runs the prompt.

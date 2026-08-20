@@ -33,6 +33,7 @@ const mocks = vi.hoisted(() => ({
   getMessagingPlatforms: vi.fn(),
   getEmployees: vi.fn(),
   getEmployeeCatalog: vi.fn(),
+  getPlugins: vi.fn(),
 }));
 
 vi.mock("@/lib/api", async (importOriginal) => {
@@ -53,6 +54,7 @@ vi.mock("@/lib/api", async (importOriginal) => {
       getMessagingPlatforms: mocks.getMessagingPlatforms,
       getEmployees: mocks.getEmployees,
       getEmployeeCatalog: mocks.getEmployeeCatalog,
+      getPlugins: mocks.getPlugins,
       logout: mocks.logout,
     },
   };
@@ -200,6 +202,21 @@ beforeEach(() => {
   mocks.getAuthMe.mockReset();
   mocks.getILinkEnrollment.mockReset();
   mocks.getSessionMessages.mockReset();
+  mocks.getPlugins.mockReset();
+  mocks.getPlugins.mockResolvedValue([
+    {
+      name: "scheduled-tasks",
+      label: "Scheduled Tasks",
+      description: "",
+      icon: "Clock",
+      version: "1.0.0",
+      tab: { path: "/cron" },
+      entry: "dist/index.js",
+      css: null,
+      has_api: true,
+      source: "bundled",
+    },
+  ]);
   mocks.getSessions.mockReset();
   mocks.getSessions.mockResolvedValue({ sessions: [], total: 0, limit: 20, offset: 0 });
   mocks.getEmptySessionsCount.mockReset();
@@ -1057,6 +1074,21 @@ describe("GuiChatShell", () => {
     expect(document.querySelector("[data-kanban-pane]")).not.toBeNull();
     expect(drawerButton?.getAttribute("aria-expanded")).toBe("false");
     expect(mobileSidebar?.className).toContain("-translate-x-full");
+  });
+
+  it("hides scheduled tasks when the plugin is disabled", async () => {
+    const connection = createConnection();
+    mocks.getAuthMe.mockResolvedValue(authIdentity());
+    mocks.getPlugins.mockResolvedValue([]);
+    mocks.connectGuiChat.mockReturnValue(connection);
+
+    await renderShell(<GuiChatShell />);
+
+    expect(
+      Array.from(document.querySelectorAll<HTMLButtonElement>("button")).some(
+        (button) => button.textContent?.includes("Scheduled Tasks"),
+      ),
+    ).toBe(false);
   });
 
   it("opens scheduled tasks without reconnecting the chat", async () => {

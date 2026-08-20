@@ -896,6 +896,7 @@ def create_job(
     workdir: Optional[str] = None,
     no_agent: bool = False,
     attach_to_session: Optional[bool] = None,
+    employee_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Create a new cron job.
@@ -935,6 +936,12 @@ def create_job(
                 and deliver its stdout directly. Empty stdout = silent (no
                 delivery). Requires ``script`` to be set. Ideal for classic
                 watchdogs and periodic alerts that don't need LLM reasoning.
+        employee_id: Optional AI employee to run the job as. The fire path
+                resolves the employee's current policy (model registration,
+                skills, toolsets, workspace) and creates the session under it,
+                so employee jobs cannot combine with the manual inference axes
+                (model/provider/base_url), skills, toolsets, script, no_agent,
+                or workdir.
 
     Returns:
         The created job dict
@@ -967,6 +974,7 @@ def create_job(
     normalized_workdir = _normalize_workdir(workdir)
     normalized_no_agent = bool(no_agent)
     normalized_attach = attach_to_session if isinstance(attach_to_session, bool) else None
+    normalized_employee_id = _normalize_job_optional_text(employee_id)
 
     # no_agent jobs are meaningless without a script — the script IS the job.
     # Surface this as a clear ValueError at create time so bad configs never
@@ -997,12 +1005,17 @@ def create_job(
 
     label_source = (prompt_text or (normalized_skills[0] if normalized_skills else None) or (normalized_script if normalized_no_agent else None)) or "cron job"
 
-    provider_snapshot, model_snapshot = _compute_provider_model_snapshots(
-        provider=normalized_provider,
-        model=normalized_model,
-        base_url=normalized_base_url,
-        no_agent=normalized_no_agent,
-    )
+    if normalized_employee_id:
+        # Employee jobs follow the employee's policy, not global config, so
+        # the unpinned-axis drift snapshots would be meaningless.
+        provider_snapshot, model_snapshot = None, None
+    else:
+        provider_snapshot, model_snapshot = _compute_provider_model_snapshots(
+            provider=normalized_provider,
+            model=normalized_model,
+            base_url=normalized_base_url,
+            no_agent=normalized_no_agent,
+        )
 
     job = {
         "id": job_id,
@@ -1042,6 +1055,7 @@ def create_job(
         "origin": origin,  # Tracks where job was created for "origin" delivery
         "enabled_toolsets": normalized_toolsets,
         "workdir": normalized_workdir,
+        "employee_id": normalized_employee_id,
     }
     # Only persist attach_to_session when explicitly set, so existing jobs and
     # the common case stay byte-identical (absent key => fall back to the
@@ -1165,15 +1179,21 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
                 if updated.get("state") != "paused":
                     updated["next_run_at"] = compute_next_run(updated_schedule)
 
-            if inference_fields_changed:
-                provider_snapshot, model_snapshot = _compute_provider_model_snapshots(
-                    provider=updated.get("provider"),
-                    model=updated.get("model"),
-                    base_url=updated.get("base_url"),
-                    no_agent=updated.get("no_agent"),
-                )
-                updated["provider_snapshot"] = provider_snapshot
-                updated["model_snapshot"] = model_snapshot
+            if inference_fields_changed or "employee_id" in updates:
+                if _normalize_job_optional_text(updated.get("employee_id")):
+                    # Employee jobs follow the employee's policy, not global
+                    # config — carry no unpinned-axis drift snapshots.
+                    updated["provider_snapshot"] = None
+                    updated["model_snapshot"] = None
+                else:
+                    provider_snapshot, model_snapshot = _compute_provider_model_snapshots(
+                        provider=updated.get("provider"),
+                        model=updated.get("model"),
+                        base_url=updated.get("base_url"),
+                        no_agent=updated.get("no_agent"),
+                    )
+                    updated["provider_snapshot"] = provider_snapshot
+                    updated["model_snapshot"] = model_snapshot
 
             if updated.get("enabled", True) and updated.get("state") != "paused" and not updated.get("next_run_at"):
                 updated["next_run_at"] = compute_next_run(updated["schedule"])

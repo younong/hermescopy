@@ -16,7 +16,6 @@ import base64
 import binascii
 from dataclasses import dataclass
 from datetime import datetime, timezone
-import importlib.util
 import json
 import logging
 import mimetypes
@@ -956,6 +955,11 @@ async def _authenticated_owner_control_plane_gate(request: Request, call_next):
     response = _authenticated_owner_control_plane_gate_response(request)
     if response is not None:
         return response
+    if (
+        _authenticated_owner_request(request)
+        and authenticated_owner_worker_api_allowed(request.url.path, method=request.method)
+    ):
+        return await _proxy_authenticated_owner_http(request)
     return await call_next(request)
 
 
@@ -8162,303 +8166,26 @@ async def get_logs(
 
 
 # ---------------------------------------------------------------------------
-# Cron job management endpoints
+# Core cron fire webhook and legacy local-profile resolution helpers
 # ---------------------------------------------------------------------------
 
 
-class CronJobCreate(BaseModel):
-    prompt: str = ""
-    schedule: str
-    name: str = ""
-    deliver: str = "local"
-    skills: Optional[List[str]] = None
-    model: Optional[str] = None
-    provider: Optional[str] = None
-    base_url: Optional[str] = None
-    script: Optional[str] = None
-    context_from: Optional[Any] = None
-    enabled_toolsets: Optional[List[str]] = None
-    workdir: Optional[str] = None
-    no_agent: bool = False
-
-
-class CronJobUpdate(BaseModel):
-    updates: dict
-
-
-def _cron_profile_dicts() -> List[Dict[str, Any]]:
-    """Return dashboard profile records, falling back to a directory scan."""
-    from hermes_cli import profiles as profiles_mod
-    try:
-        return [_profile_to_dict(p) for p in profiles_mod.list_profiles()]
-    except Exception:
-        _log.exception("Failed to list profiles for cron dashboard; falling back to directory scan")
-        return _fallback_profile_dicts(profiles_mod)
-
-
 def _cron_profile_home(profile: Optional[str]) -> Tuple[str, Path]:
-    """Resolve a profile query value to (profile_name, HERMES_HOME)."""
-    from hermes_cli import profiles as profiles_mod
+    """Resolve a local Dashboard profile to its Hermes home."""
+    from hermes_cli.cron_dashboard import profile_home
 
-    raw = (profile or "default").strip() or "default"
     try:
-        canon = profiles_mod.normalize_profile_name(raw)
-        profiles_mod.validate_profile_name(canon)
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-    if not profiles_mod.profile_exists(canon):
-        raise HTTPException(status_code=404, detail=f"Profile '{canon}' does not exist.")
-    return canon, profiles_mod.get_profile_dir(canon)
+        return profile_home(profile)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
 def _find_cron_job_profile(job_id: str) -> Optional[str]:
-    for profile in _cron_profile_dicts():
-        name = str(profile.get("name") or "")
-        if not name:
-            continue
-        from hermes_cli.cron_management import list_jobs
+    from hermes_cli.cron_dashboard import find_job_profile
 
-        _profile_name, profile_home = _cron_profile_home(name)
-        jobs = list_jobs(profile_home)
-        if any(j.get("id") == job_id or j.get("name") == job_id for j in jobs):
-            return name
-    return None
-
-
-@app.get("/api/cron/jobs")
-async def list_cron_jobs(request: Request = None, profile: str = "all"):
-    if request is not None and _authenticated_owner_request(request):
-        return await _proxy_authenticated_owner_http(request)
-
-    from hermes_cli.cron_management import list_jobs as list_managed_cron_jobs
-
-    requested = (profile or "all").strip()
-    if requested.lower() != "all":
-        profile_name, profile_home = _cron_profile_home(requested)
-        return list_managed_cron_jobs(profile_home, profile=profile_name)
-
-    jobs: List[Dict[str, Any]] = []
-    for item in _cron_profile_dicts():
-        name = str(item.get("name") or "")
-        if not name:
-            continue
-        try:
-            profile_name, profile_home = _cron_profile_home(name)
-            jobs.extend(list_managed_cron_jobs(profile_home, profile=profile_name))
-        except Exception:
-            _log.exception("Failed to list cron jobs for profile %s", name)
-    return jobs
-
-
-@app.get("/api/cron/jobs/{job_id}")
-async def get_cron_job(
-    job_id: str,
-    request: Request = None,
-    profile: Optional[str] = None,
-):
-    if request is not None and _authenticated_owner_request(request):
-        return await _proxy_authenticated_owner_http(request)
-    selected = profile or _find_cron_job_profile(job_id)
-    if not selected:
-        raise HTTPException(status_code=404, detail="Job not found")
-
-    from hermes_cli.cron_management import get_job as get_managed_cron_job
-
-    profile_name, profile_home = _cron_profile_home(selected)
-    job = get_managed_cron_job(profile_home, job_id, profile=profile_name)
-    if not job:
-        raise HTTPException(status_code=404, detail="Job not found")
-    return job
-
-
-@app.get("/api/cron/jobs/{job_id}/runs")
-async def list_cron_job_runs(job_id: str, profile: Optional[str] = None, limit: int = 20):
-    """Run sessions produced by a cron job, newest first.
-
-    Cron runs are stored as ordinary sessions whose id is
-    ``cron_{job_id}_{timestamp}`` (see cron/scheduler.run_job). A job's history
-    is therefore every session whose id carries that prefix; ``source='cron'``
-    narrows it and the id prefix binds it to this job. Powers the run-history
-    list under each job in the desktop cron detail. Same row shape as
-    ``/api/sessions`` so the frontend can reuse SessionInfo.
-
-    Backed by ``SessionDB.list_cron_job_runs`` — a bounded ``[prefix, hi)``
-    id-range scan, not the compression-chain CTE used for the recents list,
-    so the cost scales with the requested window and not the (unbounded) total
-    cron history.
-    """
-    selected = profile or _find_cron_job_profile(job_id)
-    # job_id may be a human name; resolve to the canonical id used in run-session ids.
-    canonical = job_id
-    if selected:
-        from hermes_cli.cron_management import get_job
-
-        _profile_name, profile_home = _cron_profile_home(selected)
-        job = get_job(profile_home, job_id)
-        if job and job.get("id"):
-            canonical = str(job["id"])
-
-    try:
-        limit_n = max(1, min(int(limit), 100))
-    except (TypeError, ValueError):
-        limit_n = 20
-
-    db = _open_session_db_for_profile(selected)
-    try:
-        runs = db.list_cron_job_runs(canonical, limit=limit_n, offset=0)
-        now = time.time()
-        for s in runs:
-            s["is_active"] = (
-                s.get("ended_at") is None
-                and (now - s.get("last_active", s.get("started_at", 0))) < 300
-            )
-            s["archived"] = bool(s.get("archived"))
-            if selected:
-                s["profile"] = selected
-        return {"runs": runs, "limit": limit_n}
-    finally:
-        db.close()
-
-
-@app.post("/api/cron/jobs")
-async def create_cron_job(
-    body: CronJobCreate,
-    request: Request = None,
-    profile: str = "default",
-):
-    if request is not None and _authenticated_owner_request(request):
-        return await _proxy_authenticated_owner_http(request)
-    try:
-        from hermes_cli.cron_management import create_job as create_managed_cron_job
-
-        profile_name, profile_home = _cron_profile_home(profile)
-        return create_managed_cron_job(
-            profile_home,
-            body.model_dump(),
-            profile=profile_name,
-        )
-    except HTTPException:
-        raise
-    except Exception as e:
-        _log.exception("POST /api/cron/jobs failed")
-        raise HTTPException(status_code=400, detail=str(e))
-
-
-@app.get("/api/cron/delivery-targets")
-async def get_cron_delivery_targets(
-    request: Request = None,
-    profile: str = "default",
-):
-    """Return cron delivery targets for the selected trusted home."""
-    if request is not None and _authenticated_owner_request(request):
-        return await _proxy_authenticated_owner_http(request)
-
-    from hermes_cli.cron_management import delivery_targets
-
-    _profile_name, profile_home = _cron_profile_home(profile)
-    return {"targets": delivery_targets(profile_home)}
-
-
-@app.put("/api/cron/jobs/{job_id}")
-async def update_cron_job(
-    job_id: str,
-    body: CronJobUpdate,
-    request: Request = None,
-    profile: Optional[str] = None,
-):
-    if request is not None and _authenticated_owner_request(request):
-        return await _proxy_authenticated_owner_http(request)
-    selected = profile or _find_cron_job_profile(job_id)
-    if not selected:
-        raise HTTPException(status_code=404, detail="Job not found")
-    try:
-        from hermes_cli.cron_management import update_job as update_managed_cron_job
-
-        profile_name, profile_home = _cron_profile_home(selected)
-        job = update_managed_cron_job(
-            profile_home,
-            job_id,
-            body.updates,
-            profile=profile_name,
-        )
-    except HTTPException:
-        raise
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    if not job:
-        raise HTTPException(status_code=404, detail="Job not found")
-    return job
-
-
-async def _mutate_cron_job(
-    job_id: str,
-    action: str,
-    request: Request | None,
-    profile: str | None,
-) -> Dict[str, Any] | Response:
-    if request is not None and _authenticated_owner_request(request):
-        return await _proxy_authenticated_owner_http(request)
-    selected = profile or _find_cron_job_profile(job_id)
-    if not selected:
-        raise HTTPException(status_code=404, detail="Job not found")
-
-    from hermes_cli.cron_management import mutate_job
-
-    profile_name, profile_home = _cron_profile_home(selected)
-    job = mutate_job(profile_home, job_id, action, profile=profile_name)
-    if not job:
-        raise HTTPException(status_code=404, detail="Job not found")
-    return job
-
-
-@app.post("/api/cron/jobs/{job_id}/pause")
-async def pause_cron_job(
-    job_id: str,
-    request: Request = None,
-    profile: Optional[str] = None,
-):
-    return await _mutate_cron_job(job_id, "pause", request, profile)
-
-
-@app.post("/api/cron/jobs/{job_id}/resume")
-async def resume_cron_job(
-    job_id: str,
-    request: Request = None,
-    profile: Optional[str] = None,
-):
-    return await _mutate_cron_job(job_id, "resume", request, profile)
-
-
-@app.post("/api/cron/jobs/{job_id}/trigger")
-async def trigger_cron_job(
-    job_id: str,
-    request: Request = None,
-    profile: Optional[str] = None,
-):
-    return await _mutate_cron_job(job_id, "trigger", request, profile)
-
-
-@app.delete("/api/cron/jobs/{job_id}")
-async def delete_cron_job(
-    job_id: str,
-    request: Request = None,
-    profile: Optional[str] = None,
-):
-    if request is not None and _authenticated_owner_request(request):
-        return await _proxy_authenticated_owner_http(request)
-    selected = profile or _find_cron_job_profile(job_id)
-    if not selected:
-        raise HTTPException(status_code=404, detail="Job not found")
-    try:
-        from hermes_cli.cron_management import delete_job as delete_managed_cron_job
-
-        _profile_name, profile_home = _cron_profile_home(selected)
-        removed = delete_managed_cron_job(profile_home, job_id)
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    if not removed:
-        raise HTTPException(status_code=404, detail="Job not found")
-    return {"ok": True}
+    return find_job_profile(job_id)
 
 
 def _fire_cron_job_for_profile(profile: str, job_id: str) -> bool:
@@ -8473,9 +8200,9 @@ def _fire_cron_job_for_profile(profile: str, job_id: str) -> bool:
     cron path above).
     """
     _profile_name, home = _cron_profile_home(profile)
-    from hermes_cli.cron_management import cron_home_scope
+    from cron.jobs import CronStore, use_store
 
-    with cron_home_scope(home):
+    with use_store(CronStore(home)):
         from cron.scheduler_provider import resolve_cron_scheduler
 
         provider = resolve_cron_scheduler()
@@ -8558,78 +8285,6 @@ async def cron_fire_webhook(request: Request):
         asyncio.to_thread(_fire_cron_job_for_profile, profile, job_id)
     )
     return JSONResponse({"status": "accepted", "job_id": job_id}, status_code=202)
-
-
-# ---------------------------------------------------------------------------
-# Automation Blueprints — parameterized automation blueprints. The dashboard renders the
-# slot schema as a form; submitting instantiates a real cron job via the same
-# create_job path. See cron/blueprint_catalog.py for the single source of truth.
-# ---------------------------------------------------------------------------
-class AutomationBlueprintInstantiate(BaseModel):
-    blueprint: str                      # blueprint key, e.g. "morning-brief"
-    values: Dict[str, Any] = {}      # filled slot values from the form
-
-
-@app.get("/api/cron/blueprints")
-async def list_cron_blueprints():
-    """Return the blueprint catalog as form schemas for the dashboard gallery.
-
-    The ``deliver`` slot's options are rewritten from the user's actually
-    configured gateway platforms (plus the universal origin/local/all), so the
-    form never offers a platform that isn't connected.
-    """
-    try:
-        from cron.blueprint_catalog import CATALOG, blueprint_catalog_entry
-
-        deliver_options = None
-        try:
-            from cron.scheduler import cron_delivery_targets
-
-            platforms = [t["id"] for t in cron_delivery_targets() if t.get("id")]
-            deliver_options = ["origin", "local", *platforms]
-        except Exception:
-            _log.debug("cron_delivery_targets unavailable; using static deliver options", exc_info=True)
-
-        entries = []
-        for r in CATALOG:
-            entry = blueprint_catalog_entry(r)
-            if deliver_options:
-                for f in entry.get("fields", []):
-                    if f.get("name") == "deliver":
-                        f["options"] = deliver_options
-            entries.append(entry)
-        return {"blueprints": entries}
-    except Exception as e:
-        _log.exception("GET /api/cron/blueprints failed")
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.post("/api/cron/blueprints/instantiate")
-async def instantiate_blueprint(body: AutomationBlueprintInstantiate, profile: str = "default"):
-    """Fill a blueprint's slots and create the cron job (form-submit path)."""
-    try:
-        from cron.blueprint_catalog import fill_blueprint, get_blueprint, BlueprintFillError
-
-        blueprint = get_blueprint(body.blueprint)
-        if blueprint is None:
-            raise HTTPException(status_code=404, detail=f"Unknown blueprint: {body.blueprint}")
-        try:
-            spec = fill_blueprint(blueprint, body.values)
-        except BlueprintFillError as exc:
-            # Field-level validation error — 422 so the form can show it inline.
-            raise HTTPException(status_code=422, detail=str(exc)) from exc
-        # Blueprint-created jobs deliver to the dashboard's configured target by
-        # default; the form's deliver slot overrides via spec["deliver"].
-        spec.pop("origin", None)
-        from hermes_cli.cron_management import create_job
-
-        profile_name, profile_home = _cron_profile_home(profile)
-        return create_job(profile_home, spec, profile=profile_name)
-    except HTTPException:
-        raise
-    except Exception as e:
-        _log.exception("POST /api/cron/blueprints/instantiate failed")
-        raise HTTPException(status_code=400, detail=str(e))
 
 
 # ---------------------------------------------------------------------------
@@ -10121,7 +9776,7 @@ def _profile_scope(profile: Optional[str]):
        reaches them (same pattern as ``_write_profile_model``).
     2. ``tools.skills_tool`` and ``tools.skill_manager_tool`` bind
        ``SKILLS_DIR`` at import time, so the override CANNOT reach them.
-       Like ``cron_home_scope`` does for cron's module globals, temporarily
+       Like ``cron.jobs.use_store`` does for cron storage, temporarily
        retarget both under a lock and restore them
        immediately after.
 
@@ -12612,145 +12267,9 @@ async def set_dashboard_font(body: FontSetBody):
 # Dashboard plugin system
 # ---------------------------------------------------------------------------
 
-def _safe_plugin_api_relpath(api_field: Any, *, dashboard_dir: Path) -> Optional[str]:
-    """Validate the manifest's ``api`` field for the plugin loader.
-
-    The web server later imports this file as a Python module via
-    ``importlib.util.spec_from_file_location`` (arbitrary code
-    execution by design — that's how plugins extend the backend).
-    Pre-#29156 the field was used as-is, which meant:
-
-    * An absolute path swallowed the plugin's dashboard directory
-      entirely — ``Path('safe/dashboard') / '/tmp/evil.py'`` resolves
-      to ``/tmp/evil.py``, so any attacker-controlled manifest could
-      point the import at any Python file on disk (GHSA-5qr3-c538-wm9j).
-    * A ``../..`` traversal could climb out of the plugin into
-      neighbouring directories on the search path.
-
-    Return the original string when the resolved path stays under
-    ``dashboard_dir``; return ``None`` (with a warning logged at the
-    call site) otherwise so the plugin still loads its static JS/CSS
-    but its backend ``api`` is rejected.
-    """
-    if not isinstance(api_field, str) or not api_field.strip():
-        return None
-    candidate = Path(api_field)
-    if candidate.is_absolute():
-        return None
-    try:
-        resolved = (dashboard_dir / candidate).resolve()
-        base = dashboard_dir.resolve()
-    except (OSError, RuntimeError):
-        return None
-    try:
-        resolved.relative_to(base)
-    except ValueError:
-        return None
-    return api_field
-
-
-def _discover_dashboard_plugins() -> list:
-    """Scan plugins/*/dashboard/manifest.json for dashboard extensions.
-
-    Checks three plugin sources (same as hermes_cli.plugins):
-    1. User plugins:    ~/.hermes/plugins/<name>/dashboard/manifest.json
-    2. Bundled plugins: <repo>/plugins/<name>/dashboard/manifest.json  (memory/, etc.)
-    3. Project plugins: ./.hermes/plugins/  (only if HERMES_ENABLE_PROJECT_PLUGINS)
-    """
-    plugins = []
-    seen_names: set = set()
-
-    from hermes_cli.plugins import get_bundled_plugins_dir
-    bundled_root = get_bundled_plugins_dir()
-    search_dirs = [
-        (get_hermes_home() / "plugins", "user"),
-        (bundled_root / "memory", "bundled"),
-        (bundled_root, "bundled"),
-    ]
-    # GHSA-5qr3-c538-wm9j (#29156): the previous ``os.environ.get(...)``
-    # check treated *any* non-empty string as truthy, so ``=0``, ``=false``,
-    # and ``=no`` — all of which the agent loader and operators correctly
-    # read as "disabled" — silently *enabled* the untrusted project source
-    # in the web server.  Combined with the absolute-path RCE primitive on
-    # the manifest's ``api`` field (now patched below), this turned the
-    # opt-in into a sticky always-on switch.  Use the shared truthy
-    # semantics (``1`` / ``true`` / ``yes`` / ``on``) so the gate matches
-    # ``hermes_cli/plugins.py`` and the documented user contract.
-    if env_var_enabled("HERMES_ENABLE_PROJECT_PLUGINS"):
-        search_dirs.append((Path.cwd() / ".hermes" / "plugins", "project"))
-
-    for plugins_root, source in search_dirs:
-        if not plugins_root.is_dir():
-            continue
-        for child in sorted(plugins_root.iterdir()):
-            if not child.is_dir():
-                continue
-            manifest_file = child / "dashboard" / "manifest.json"
-            if not manifest_file.exists():
-                continue
-            try:
-                data = json.loads(manifest_file.read_text(encoding="utf-8"))
-                name = data.get("name", child.name)
-                if name in seen_names:
-                    continue
-                seen_names.add(name)
-                # Tab options: ``path`` + ``position`` for a new tab, optional
-                # ``override`` to replace a built-in route, and ``hidden`` to
-                # register the plugin component/slots without adding a tab
-                # (useful for slot-only plugins like a header-crest injector).
-                raw_tab = data.get("tab", {}) if isinstance(data.get("tab"), dict) else {}
-                tab_info = {
-                    "path": raw_tab.get("path", f"/{name}"),
-                    "position": raw_tab.get("position", "end"),
-                }
-                override_path = raw_tab.get("override")
-                if isinstance(override_path, str) and override_path.startswith("/"):
-                    tab_info["override"] = override_path
-                if bool(raw_tab.get("hidden")):
-                    tab_info["hidden"] = True
-                # Slots: list of named slot locations this plugin populates.
-                # The frontend exposes ``registerSlot(pluginName, slotName, Component)``
-                # on window; plugins with non-empty slots call it from their JS bundle.
-                slots_src = data.get("slots")
-                slots: List[str] = []
-                if isinstance(slots_src, list):
-                    slots = [s for s in slots_src if isinstance(s, str) and s]
-                # Validate ``api`` at discovery time so the value cached
-                # on the plugin entry is already safe to feed into the
-                # importer.  An attacker-controlled manifest can name
-                # any absolute path or ``..`` traversal here — the
-                # web server then imports that file as a Python module
-                # (RCE, GHSA-5qr3-c538-wm9j).
-                raw_api = data.get("api")
-                dashboard_dir = child / "dashboard"
-                safe_api = _safe_plugin_api_relpath(raw_api, dashboard_dir=dashboard_dir)
-                if raw_api and safe_api is None:
-                    _log.warning(
-                        "Plugin %s: refusing unsafe api path %r (must be a "
-                        "relative file inside the plugin's dashboard/ "
-                        "directory); backend routes from this plugin will "
-                        "not be mounted",
-                        name, raw_api,
-                    )
-                plugins.append({
-                    "name": name,
-                    "label": data.get("label", name),
-                    "description": data.get("description", ""),
-                    "icon": data.get("icon", "Puzzle"),
-                    "version": data.get("version", "0.0.0"),
-                    "tab": tab_info,
-                    "slots": slots,
-                    "entry": data.get("entry", "dist/index.js"),
-                    "css": data.get("css"),
-                    "has_api": bool(safe_api),
-                    "source": source,
-                    "_dir": str(dashboard_dir),
-                    "_api_file": safe_api,
-                })
-            except Exception as exc:
-                _log.warning("Bad dashboard plugin manifest %s: %s", manifest_file, exc)
-                continue
-    return plugins
+# Shared validation/discovery is also used by Owner Workers so manifests have one
+# trust model and one api_target interpretation across both runtimes.
+from hermes_cli.dashboard_plugins import discover_dashboard_plugins as _discover_dashboard_plugins
 
 
 # Cache discovered plugins per-process (refresh on explicit re-scan).
@@ -13133,121 +12652,20 @@ async def serve_plugin_asset(plugin_name: str, file_path: str):
     )
 
 
+# Mount validated trusted plugin APIs before the SPA catch-all. Owner-worker
+# targets remain mounted here for local dashboards; authenticated requests are
+# classified by exact route and proxied to the owner's worker.
+from hermes_cli.dashboard_plugins import mount_dashboard_plugin_apis
+
+
 def _mount_plugin_api_routes():
-    """Import and mount backend API routes from plugins that declare them.
-
-    Each plugin's ``api`` field points to a Python file that must expose
-    a ``router`` (FastAPI APIRouter).  Routes are mounted under
-    ``/api/plugins/<name>/``.
-
-    Backend import is restricted to ``bundled`` and ``user`` sources.
-    Project plugins (``./.hermes/plugins/``) ship with the CWD and are
-    therefore attacker-controlled in any threat model where the user
-    opens a malicious repo; they can extend the dashboard UI via
-    static JS/CSS but their Python ``api`` file is never auto-imported
-    by the web server.  See GHSA-5qr3-c538-wm9j (#29156).
-
-    Additionally, user plugins must be explicitly enabled via the
-    ``plugins.enabled`` allow-list in config.yaml before their backend
-    code is imported. Without this gate, an installed-but-not-enabled
-    plugin's Python code would execute at dashboard startup — a code
-    execution vector that bypasses the user's intent. (#46435,
-    GHSA-mcfc-hp25-cjv7)
-    """
-    # Load the enabled/disabled sets once for the loop.
-    try:
-        from hermes_cli.plugins_cmd import _get_enabled_set, _get_disabled_set
-        enabled_set = _get_enabled_set()
-        disabled_set = _get_disabled_set()
-    except Exception:
-        enabled_set = set()
-        disabled_set = set()
-
-    for plugin in _get_dashboard_plugins():
-        api_file_name = plugin.get("_api_file")
-        if not api_file_name:
-            continue
-        plugin_name = plugin.get("name", "")
-        # Gate: user plugins must be in plugins.enabled and not in
-        # plugins.disabled before we import their Python code.
-        # Bundled plugins are trusted (they ship with the release) but
-        # still respect an explicit disable.
-        if plugin.get("source") == "user":
-            if plugin_name in disabled_set:
-                _log.debug(
-                    "Plugin %s: skipping API mount (explicitly disabled)",
-                    plugin_name,
-                )
-                continue
-            if plugin_name not in enabled_set:
-                _log.debug(
-                    "Plugin %s: skipping API mount (not in plugins.enabled)",
-                    plugin_name,
-                )
-                continue
-        elif plugin.get("source") == "bundled":
-            if plugin_name in disabled_set:
-                _log.debug(
-                    "Plugin %s: skipping API mount (explicitly disabled)",
-                    plugin_name,
-                )
-                continue
-        if plugin.get("source") == "project":
-            _log.warning(
-                "Plugin %s: ignoring backend api=%s (project plugins may "
-                "not auto-import Python code; move the plugin to "
-                "~/.hermes/plugins/ if you trust it)",
-                plugin["name"], api_file_name,
-            )
-            continue
-        dashboard_dir = Path(plugin["_dir"])
-        api_path = dashboard_dir / api_file_name
-        try:
-            resolved_api = api_path.resolve()
-            resolved_base = dashboard_dir.resolve()
-            resolved_api.relative_to(resolved_base)
-        except (OSError, RuntimeError, ValueError):
-            # Discovery already filters this, but re-check here in case
-            # ``_dir`` was tampered with after caching or a future caller
-            # bypasses the validator.  Defence in depth keeps the import
-            # primitive contained even if the upstream check regresses.
-            _log.warning(
-                "Plugin %s: refusing to import api file outside its "
-                "dashboard directory (%s)", plugin["name"], api_path,
-            )
-            continue
-        if not api_path.exists():
-            _log.warning("Plugin %s declares api=%s but file not found", plugin["name"], api_file_name)
-            continue
-        try:
-            module_name = f"hermes_dashboard_plugin_{plugin['name']}"
-            spec = importlib.util.spec_from_file_location(module_name, api_path)
-            if spec is None or spec.loader is None:
-                continue
-            mod = importlib.util.module_from_spec(spec)
-            # Register in sys.modules BEFORE exec_module so pydantic/FastAPI
-            # can resolve forward references (e.g. models defined in a file
-            # that uses `from __future__ import annotations`). Without this,
-            # TypeAdapter lazy-build fails at first request with
-            # "is not fully defined" because the module namespace isn't
-            # reachable by name for string-annotation resolution.
-            sys.modules[module_name] = mod
-            try:
-                spec.loader.exec_module(mod)
-            except Exception:
-                sys.modules.pop(module_name, None)
-                raise
-            router = getattr(mod, "router", None)
-            if router is None:
-                _log.warning("Plugin %s api file has no 'router' attribute", plugin["name"])
-                continue
-            app.include_router(router, prefix=f"/api/plugins/{plugin['name']}")
-            _log.info("Mounted plugin API routes: /api/plugins/%s/", plugin["name"])
-        except Exception as exc:
-            _log.warning("Failed to load plugin %s API routes: %s", plugin["name"], exc)
+    mount_dashboard_plugin_apis(
+        app,
+        _get_dashboard_plugins(),
+        runtime_target="control-plane",
+    )
 
 
-# Mount plugin API routes before the SPA catch-all.
 _mount_plugin_api_routes()
 
 # Mount the dashboard auth routes (/login, /auth/*, /api/auth/*) before the

@@ -5,10 +5,12 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "build": "tsc -b && vite build",
+    "build": "npm run build:plugins && tsc -b && vite build",
+    "build:plugins": "node scripts/build-dashboard-plugins.mjs build",
     "lint": "eslint .",
     "preview": "vite preview",
-    "typecheck": "tsc -p . --noEmit",
+    "typecheck": "npm run typecheck:plugins && tsc -p . --noEmit",
+    "typecheck:plugins": "tsc -p tsconfig.plugins.json --noEmit && node scripts/build-dashboard-plugins.mjs typecheck",
     "test": "vitest run",
     "pretest": "node scripts/check-test-layout.mjs"
   },

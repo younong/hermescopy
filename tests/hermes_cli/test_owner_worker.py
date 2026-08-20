@@ -2853,10 +2853,10 @@ def test_worker_cron_routes_are_capability_bound_and_owner_local(tmp_path, monke
             headers={"Authorization": f"Bearer {token}"},
         )
 
-    assert client.get("/api/cron/jobs").status_code == 401
+    assert client.get("/api/plugins/scheduled-tasks/jobs").status_code == 401
     created = request(
         "POST",
-        "/api/cron/jobs",
+        "/api/plugins/scheduled-tasks/jobs",
         {
             "name": "owner task",
             "schedule": "every 1h",
@@ -2870,11 +2870,11 @@ def test_worker_cron_routes_are_capability_bound_and_owner_local(tmp_path, monke
     assert owner_home.joinpath("cron/jobs.json").exists()
     assert not other_home.joinpath("cron/jobs.json").exists()
 
-    listed = request("GET", "/api/cron/jobs")
+    listed = request("GET", "/api/plugins/scheduled-tasks/jobs")
     assert listed.status_code == 200
     assert [row["id"] for row in listed.json()] == [job["id"]]
 
-    item_path = f"/api/cron/jobs/{job['id']}"
+    item_path = f"/api/plugins/scheduled-tasks/jobs/{job['id']}"
     updated = request("PUT", item_path, {"updates": {"name": "renamed"}})
     assert updated.status_code == 200, updated.text
     assert updated.json()["name"] == "renamed"
@@ -2889,7 +2889,7 @@ def test_worker_cron_routes_are_capability_bound_and_owner_local(tmp_path, monke
     deleted = request("DELETE", item_path)
     assert deleted.status_code == 200
     assert deleted.json() == {"ok": True}
-    assert request("GET", "/api/cron/jobs").json() == []
+    assert request("GET", "/api/plugins/scheduled-tasks/jobs").json() == []
 
 
 def test_worker_cron_routes_reject_external_owner_selectors(tmp_path, monkeypatch):
@@ -2917,12 +2917,15 @@ def test_worker_cron_routes_reject_external_owner_selectors(tmp_path, monkeypatc
             headers={"Authorization": f"Bearer {token}"},
         )
 
-    rejected_query = request("GET", "/api/cron/jobs?owner_key=other")
-    assert rejected_query.status_code == 400
+    for selector in ("owner=other", "owner_home=/tmp/other", "owner_key=other", "profile=other"):
+        rejected_query = request(
+            "GET", f"/api/plugins/scheduled-tasks/jobs?{selector}"
+        )
+        assert rejected_query.status_code == 400
 
     rejected_body = request(
         "POST",
-        "/api/cron/jobs",
+        "/api/plugins/scheduled-tasks/jobs",
         {
             "schedule": "every 1h",
             "script": "task.py",

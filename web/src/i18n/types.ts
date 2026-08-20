@@ -427,6 +427,7 @@ export interface GuiChatTranslations {
     deleteNamed: string;
     validationRequired: string;
     scriptRequired: string;
+    employeeRequired: string;
     editDescription: string;
     createDescription: string;
     editTask: string;
@@ -919,6 +920,31 @@ export interface Translations {
       webhook: string;
       needsHomeChannel?: string;
       noneConfigured?: string;
+    };
+    editor: {
+      modeLabel: string;
+      modeEmployee: string;
+      modeCustom: string;
+      employee: string;
+      employeePlaceholder: string;
+      employeesEmpty: string;
+      model: string;
+      modelDefault: string;
+      skills: string;
+      skillsEmpty: string;
+      skillsHint: string;
+      advanced: string;
+      baseUrl: string;
+      baseUrlPlaceholder: string;
+      noAgent: string;
+      script: string;
+      scriptPlaceholder: string;
+      workdir: string;
+      workdirPlaceholder: string;
+      contextFrom: string;
+      contextFromPlaceholder: string;
+      toolsets: string;
+      toolsetsEmpty: string;
     };
   };
 

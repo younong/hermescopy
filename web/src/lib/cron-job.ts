@@ -14,6 +14,7 @@ export interface CronJobFormState {
   context_from: string;
   enabled_toolsets: string[];
   workdir: string;
+  employee_id: string;
 }
 
 /** Split a comma/newline list (or array) into trimmed, non-empty items. */
@@ -28,8 +29,9 @@ export function splitCronList(value: unknown): string[] {
 
 /** Trim to a non-empty string, or null. Optionally strip trailing slashes
  * (base URLs). Mirrors the backend's `_cron_optional_text`. */
-function optionalText(value: string, stripTrailingSlash = false): string | null {
-  const text = stripTrailingSlash ? value.trim().replace(/\/+$/, "") : value.trim();
+function optionalText(value: string | undefined, stripTrailingSlash = false): string | null {
+  const raw = (value ?? "").trim();
+  const text = stripTrailingSlash ? raw.replace(/\/+$/, "") : raw;
   return text || null;
 }
 
@@ -63,6 +65,7 @@ export function buildCronJobPayload(form: CronJobFormState): CronJobMutation {
     context_from: contextFrom.length > 0 ? contextFrom : null,
     enabled_toolsets: enabledToolsets.length > 0 ? enabledToolsets : null,
     workdir: optionalText(form.workdir),
+    employee_id: optionalText(form.employee_id),
   };
 }
 
@@ -91,5 +94,6 @@ export function cronJobFormFromJob(job: CronJob): CronJobFormState {
     context_from: listToText(job.context_from),
     enabled_toolsets: splitCronList(job.enabled_toolsets),
     workdir: asString(job.workdir),
+    employee_id: asString(job.employee_id),
   };
 }

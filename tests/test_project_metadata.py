@@ -189,8 +189,15 @@ def test_dashboard_plugin_manifests_and_assets_are_packaged():
     plugin_data = package_data["plugins"]
 
     assert "*/dashboard/manifest.json" in plugin_data
+    assert "*/dashboard/plugin_api.py" in plugin_data
     assert "*/dashboard/dist/*" in plugin_data
     assert "*/dashboard/dist/**/*" in plugin_data
+
+    repo_root = Path(__file__).resolve().parents[1]
+    manifest = (repo_root / "MANIFEST.in").read_text(encoding="utf-8")
+    assert "*/dashboard/manifest.json" in manifest
+    assert "*/dashboard/plugin_api.py" in manifest
+    assert "*/dashboard/dist/*" in manifest
 
 
 def test_nested_bundled_plugin_metadata_is_packaged():

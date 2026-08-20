@@ -11,9 +11,9 @@ let testLocale: "en" | "zh" = "en";
 const mocks = vi.hoisted(() => ({
   createCronJob: vi.fn(),
   deleteCronJob: vi.fn(),
-  getCronDeliveryTargets: vi.fn(),
   getCronJobs: vi.fn(),
-  getModelOptions: vi.fn(),
+  getEmployees: vi.fn(),
+  getModelRegistrations: vi.fn(),
   getSkills: vi.fn(),
   getToolsets: vi.fn(),
   pauseCronJob: vi.fn(),
@@ -62,10 +62,10 @@ beforeEach(() => {
   (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
   Object.values(mocks).forEach((mock) => mock.mockReset());
   mocks.getCronJobs.mockResolvedValue(jobs);
-  mocks.getCronDeliveryTargets.mockResolvedValue({ targets: [] });
+  mocks.getEmployees.mockResolvedValue({ employees: [] });
   mocks.getSkills.mockResolvedValue([]);
   mocks.getToolsets.mockResolvedValue([]);
-  mocks.getModelOptions.mockResolvedValue(null);
+  mocks.getModelRegistrations.mockResolvedValue({ registrations: [] });
   mocks.pauseCronJob.mockResolvedValue({ ...jobs[0], enabled: false, state: "paused" });
   mocks.resumeCronJob.mockResolvedValue({ ...jobs[1], enabled: true, state: "scheduled" });
   mocks.updateCronJob.mockResolvedValue({ ...jobs[0], name: "Updated brief" });
