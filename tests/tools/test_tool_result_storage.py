@@ -341,6 +341,27 @@ class TestMaybePersistToolResult:
         # Should have persisted since 60K > 30K
         assert PERSISTED_OUTPUT_TAG in result or "Truncated" in result
 
+    def test_context_scaled_budget_controls_result_threshold(self):
+        """A small model window must lower the per-result persistence cap."""
+        from tools.budget_config import budget_for_context_window
+
+        config = budget_for_context_window(20_000)
+        assert config.default_result_size < DEFAULT_RESULT_SIZE_CHARS
+
+        env = MagicMock()
+        env.execute.return_value = {"output": "", "returncode": 0}
+        content = "x" * (config.default_result_size + 1)
+        result = maybe_persist_tool_result(
+            content=content,
+            tool_name="terminal",
+            tool_use_id="tc_scaled",
+            env=env,
+            config=config,
+        )
+
+        assert PERSISTED_OUTPUT_TAG in result
+        assert env.execute.call_args.kwargs["stdin_data"] == content
+
     def test_unicode_content_survives(self):
         env = MagicMock()
         env.execute.return_value = {"output": "", "returncode": 0}

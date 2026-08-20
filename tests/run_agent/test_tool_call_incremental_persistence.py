@@ -175,7 +175,9 @@ def test_execute_tool_calls_sequential_flushes_each_tool_result_before_next_disp
         patch("run_agent.handle_function_call", side_effect=_fake_dispatch) as disp,
         patch(
             "agent.tool_executor.maybe_persist_tool_result",
-            side_effect=lambda **kwargs: kwargs["content"],
+            side_effect=lambda **kwargs: (
+                f"<persisted-output>{kwargs['tool_use_id']}</persisted-output>"
+            ),
         ),
     ):
         agent._execute_tool_calls_sequential(assistant_message, messages, "task-1")
@@ -186,6 +188,9 @@ def test_execute_tool_calls_sequential_flushes_each_tool_result_before_next_disp
     # Both tool results landed, in order.
     assert [m["role"] for m in messages] == ["tool", "tool"]
     assert [m["tool_call_id"] for m in messages] == ["c1", "c2"]
+    assert all("<persisted-output>" in m["content"] for m in messages)
+    assert "result-c1" not in messages[0]["content"]
+    assert "result-c2" not in messages[1]["content"]
 
     # Ordering contract: each tool result is flushed AFTER its own dispatch
     # and BEFORE the next dispatch. Expected interleaving:
@@ -233,7 +238,9 @@ def test_execute_tool_calls_concurrent_flushes_each_tool_result_in_order():
         patch.object(agent, "_invoke_tool", side_effect=_fake_invoke) as inv,
         patch(
             "agent.tool_executor.maybe_persist_tool_result",
-            side_effect=lambda **kwargs: kwargs["content"],
+            side_effect=lambda **kwargs: (
+                f"<persisted-output>{kwargs['tool_use_id']}</persisted-output>"
+            ),
         ),
     ):
         agent._execute_tool_calls_concurrent(assistant_message, messages, "task-1")
@@ -244,6 +251,9 @@ def test_execute_tool_calls_concurrent_flushes_each_tool_result_in_order():
 
     # Results appended in deterministic order.
     assert [m["tool_call_id"] for m in messages] == ["c1", "c2"]
+    assert all("<persisted-output>" in m["content"] for m in messages)
+    assert "result-c1" not in messages[0]["content"]
+    assert "result-c2" not in messages[1]["content"]
 
     # Each tool result was flushed exactly once, in append order, with the
     # running tool count growing by one each time (1 then 2).  Removing either

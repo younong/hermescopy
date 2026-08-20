@@ -253,6 +253,51 @@ class TestRequestSelection:
         assert names[-3:] == ["tool_search", "tool_describe", "tool_call"]
         assert defs[0]["function"]["name"] == "write_file"
 
+    def test_selection_keeps_non_deferrable_tools_and_counts_hidden(self):
+        from tools.tool_search import ToolSearchConfig, select_request_tool_defs
+
+        defs = [
+            _td("write_file", "Write project files"),
+            _td("runtime_memory", "Injected memory provider"),
+            _td("read_file", "Read project files"),
+            _td("terminal", "Run shell commands"),
+        ]
+        result = select_request_tool_defs(
+            defs,
+            query="read the project source",
+            context_length=200_000,
+            config=ToolSearchConfig.from_raw({"enabled": "on", "search_default_limit": 1}),
+        )
+
+        names = [tool["function"]["name"] for tool in result.tool_defs]
+        assert "runtime_memory" in names
+        assert "read_file" in names
+        assert result.hidden_count == 2
+        assert result.activated is True
+
+    def test_selection_injects_exactly_one_bridge_schema_each(self):
+        from tools.tool_search import ToolSearchConfig, select_request_tool_defs
+
+        defs = [
+            _td("write_file", "Write project files"),
+            _td("read_file", "Read project files"),
+            _td("terminal", "Run shell commands"),
+        ]
+        result = select_request_tool_defs(
+            defs,
+            query="read the project source",
+            context_length=200_000,
+            config=ToolSearchConfig.from_raw({"enabled": "on", "search_default_limit": 1}),
+        )
+
+        bridge_names = [
+            tool["function"]["name"]
+            for tool in result.tool_defs
+            if tool["function"]["name"] in {"tool_search", "tool_describe", "tool_call"}
+        ]
+        assert bridge_names == ["tool_search", "tool_describe", "tool_call"]
+        assert len(bridge_names) == 3
+
     def test_selector_query_excludes_tool_protocol_payloads(self):
         from tools.tool_search import request_selector_query
 

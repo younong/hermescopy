@@ -28,6 +28,7 @@ import sys
 import tempfile
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from unittest.mock import patch
 
 import pytest
 
@@ -181,3 +182,72 @@ def test_unknown_nonempty_name_keeps_catalog(agent_env):
     assert "frobnicate_xyz" in joined
     assert "Available tools:" in joined
     assert "tool name was empty" not in joined
+
+
+def test_mock_provider_receives_projected_history_and_current_persisted_result(agent_env):
+    """The real conversation loop compresses old tool work, but keeps live output."""
+    agent, handler = agent_env
+    old_call = {
+        "id": "old-call",
+        "type": "function",
+        "function": {"name": "read_file", "arguments": '{"path":"old.txt"}'},
+    }
+    history = [
+        {"role": "user", "content": "old question"},
+        {"role": "assistant", "content": None, "tool_calls": [old_call]},
+        {
+            "role": "tool",
+            "tool_call_id": "old-call",
+            "content": "OLD_FULL_TOOL_RESULT_SHOULD_NOT_BE_SENT",
+        },
+        {"role": "assistant", "content": "old answer"},
+    ]
+    current_result = (
+        "<persisted-output>\n"
+        "Full output saved to: /tmp/hermes-results/current.txt\n"
+        "Preview: CURRENT_RESULT_PREVIEW\n"
+        "</persisted-output>"
+    )
+    handler.response_queue.append(_tc_resp("terminal", "{}"))
+    handler.response_queue.append(_text_resp("done"))
+
+    def _fake_execute(assistant_message, messages, effective_task_id, api_call_count=0):
+        messages.append({
+            "role": "tool",
+            "tool_call_id": assistant_message.tool_calls[0].id,
+            "content": current_result,
+        })
+
+    with (
+        patch.object(agent, "_execute_tool_calls", side_effect=_fake_execute),
+        patch.object(agent, "_persist_session"),
+        patch.object(agent, "_save_trajectory"),
+        patch.object(agent, "_cleanup_task_resources"),
+    ):
+        result = agent.run_conversation(
+            "continue with the current task",
+            conversation_history=history,
+            task_id="t",
+        )
+
+    assert result["final_response"] == "done"
+    provider_requests = [
+        request for request in handler.captured_requests if "messages" in request
+    ]
+    assert len(provider_requests) == 2
+    first_messages = provider_requests[0]["messages"]
+    second_messages = provider_requests[1]["messages"]
+
+    first_text = json.dumps(first_messages)
+    second_text = json.dumps(second_messages)
+    assert "OLD_FULL_TOOL_RESULT_SHOULD_NOT_BE_SENT" not in first_text
+    assert "OLD_FULL_TOOL_RESULT_SHOULD_NOT_BE_SENT" not in second_text
+    assert "Historical tool work: 1 call." in first_text
+    assert current_result not in first_text
+    assert "CURRENT_RESULT_PREVIEW" in second_text
+    second_tool_results = [
+        message.get("content", "")
+        for message in second_messages
+        if message.get("role") == "tool"
+    ]
+    assert any(current_result == content for content in second_tool_results)
