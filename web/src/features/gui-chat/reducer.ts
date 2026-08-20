@@ -22,6 +22,7 @@ import type {
 import {
   buildSessionFileDownloadUrl,
   normalizeSessionFileReference,
+  resolveSessionImageReference,
 } from "./files";
 import { textFromTranscriptMessage } from "./protocol";
 import {
@@ -539,18 +540,17 @@ function transcriptToMessageWithArtifacts(
   }
 
   const artifacts: ArtifactState[] = refs.map((ref, imageIndex): ArtifactState => {
-    const url = imagePreviewUrl(ref.url, cwd);
     const name = filenameFromPath(ref.url) || ref.title || "image";
+    const resolved = resolveSessionImageReference(ref.url, cwd, name);
     return {
-      downloadUrl: looksLikeFilesystemPath(ref.url)
-        ? buildSessionFileDownloadUrl(ref.url, cwd, name)
-        : undefined,
+      downloadUrl: resolved.downloadUrl,
       height: ref.height,
       id: `${id}-image-${imageIndex}`,
       messageId: id,
       mimeType: ref.mimeType ?? mimeTypeForImageSource(ref.url),
+      sourcePath: resolved.sourcePath,
       title: ref.title || "Historical image",
-      url,
+      url: resolved.previewUrl,
       width: ref.width,
     };
   });
@@ -596,17 +596,25 @@ function transcriptAttachments(
     const path = typeof value.path === "string" ? value.path : undefined;
     const dimensions = positiveImageDimensions(value.width, value.height);
     attachments.push({
-      downloadUrl: path ? buildSessionFileDownloadUrl(path, cwd, name) : undefined,
+      ...(kind === "image" && path
+        ? (() => {
+            const resolved = resolveSessionImageReference(path, cwd, name);
+            return {
+              downloadUrl: resolved.downloadUrl,
+              previewUrl: resolved.previewUrl,
+              sourcePath: resolved.sourcePath,
+            };
+          })()
+        : { downloadUrl: path ? buildSessionFileDownloadUrl(path, cwd, name) : undefined }),
       ...(kind === "image" && dimensions ? dimensions : {}),
       id: `${messageId}-attachment-${index}`,
       kind,
       mimeType: typeof value.mime_type === "string" ? value.mime_type : undefined,
       name,
       pagesAttached: finiteNonNegativeNumber(value.pages_attached),
-      previewUrl: kind === "image" && path ? imagePreviewUrl(path, cwd) : undefined,
       refText: typeof value.ref_text === "string" ? value.ref_text : undefined,
       sizeBytes: finiteNonNegativeNumber(value.size_bytes) ?? 0,
-      sourcePath: path,
+      ...(kind !== "image" ? { sourcePath: path } : {}),
     });
   }
   return attachments;
@@ -623,6 +631,19 @@ function attachmentSourcePaths(value: GatewayTranscriptAttachment): string[] {
     paths.push(...value.source_paths.filter((path): path is string => typeof path === "string"));
   }
   return paths;
+}
+
+function isRelativeFilesystemPath(source: string): boolean {
+  return (
+    !source.startsWith("~") &&
+    !source.startsWith("/") &&
+    !source.startsWith("\\\\") &&
+    !/^[A-Za-z]:[\\/]/.test(source)
+  );
+}
+
+function looksLikeFilesystemPath(source: string): boolean {
+  return source.startsWith("~") || /^[A-Za-z]:[\\/]/.test(source) || source.includes("/") || source.includes("\\");
 }
 
 function normalizeAttachmentSource(value: string, cwd?: string): string {
@@ -1277,7 +1298,12 @@ function refreshFileDownloadContext(state: GuiChatState, cwd: string): GuiChatSt
             ...artifact,
             downloadUrl: buildSessionFileDownloadUrl(artifact.sourcePath, cwd, artifact.name),
           }
-        : artifact,
+        : artifact.sourcePath
+          ? {
+              ...artifact,
+              ...resolveSessionImageReference(artifact.sourcePath, cwd, artifact.title),
+            }
+          : artifact,
     ]),
   );
   const messages = state.messages.map((message) => {
@@ -1681,38 +1707,7 @@ function firstString(...values: unknown[]): string | undefined {
 }
 
 function imagePreviewUrl(source: string, cwd?: string): string {
-  if (/^(https?:|data:|blob:)/i.test(source) || source.startsWith("/api/")) {
-    return source;
-  }
-  const generatedImageUrl = generatedImagePreviewUrl(source);
-  if (generatedImageUrl) return generatedImageUrl;
-  if (looksLikeFilesystemPath(source)) {
-    const pathParam = `path=${encodeURIComponent(source)}`;
-    const cwdParam = cwd && isRelativeFilesystemPath(source) ? `&cwd=${encodeURIComponent(cwd)}` : "";
-    return `/api/fs/read-data-url?${pathParam}${cwdParam}`;
-  }
-  return source;
-}
-
-function generatedImagePreviewUrl(source: string): string | null {
-  const path = source.split(/[?#]/, 1)[0] ?? source;
-  const match = path.match(/(?:^|[/\\])\.hermes[/\\]cache[/\\]images[/\\]([^/\\]+)$/);
-  if (!match?.[1]) return null;
-  return `/api/generated-images/${encodeURIComponent(match[1])}`;
-}
-
-function looksLikeFilesystemPath(source: string): boolean {
-  return source.startsWith("~") || /^[A-Za-z]:[\\/]/.test(source) || source.includes("/") || source.includes("\\");
-}
-
-function isRelativeFilesystemPath(source: string): boolean {
-  return (
-    !source.startsWith("~") &&
-    !source.startsWith("/") &&
-    !source.startsWith("\\\\") &&
-    !/^file:/i.test(source) &&
-    !/^[A-Za-z]:[\\/]/.test(source)
-  );
+  return resolveSessionImageReference(source, cwd).previewUrl;
 }
 
 function mimeTypeForImageSource(source: string): string | undefined {
@@ -1950,9 +1945,9 @@ function addImageArtifact(
         ? source.value
         : undefined);
   if (!rawUrl) return state;
-  const sourcePath = looksLikeFilesystemPath(rawUrl)
-    ? normalizeSessionFileReference(rawUrl) ?? rawUrl
-    : undefined;
+  const name = filenameFromPath(rawUrl) || payload?.title || "image";
+  const resolved = resolveSessionImageReference(rawUrl, state.cwd, name);
+  const sourcePath = resolved.sourcePath;
   const matchingArtifact = sourcePath
     ? Object.values(state.artifacts).find(
         (artifact): artifact is ImageArtifactState =>
@@ -1963,24 +1958,14 @@ function addImageArtifact(
       )
     : undefined;
   const id = matchingArtifact?.id ?? String(payload?.id ?? rawUrl ?? createClientId("artifact"));
-  const url = sourcePath
-    ? imagePreviewUrl(rawUrl, state.cwd)
-    : rawUrl.startsWith("/api/") ||
-        rawUrl.startsWith("http") ||
-        rawUrl.startsWith("data:") ||
-        rawUrl.startsWith("blob:")
-      ? rawUrl
-      : `/api/artifacts/${encodeURIComponent(rawUrl)}`;
+  const url = resolved.previewUrl;
   const messageId = payload?.messageId ?? payload?.message_id;
   const toolCallId = payload?.toolCallId ?? payload?.tool_call_id;
-  const name = filenameFromPath(rawUrl) || payload?.title || "image";
   const existing = state.artifacts[id];
   const existingImage = existing && existing.kind !== "file" ? existing : undefined;
   const dimensions = positiveImageDimensions(payload?.width, payload?.height);
   const artifact: ImageArtifactState = {
-    downloadUrl: looksLikeFilesystemPath(rawUrl)
-      ? buildSessionFileDownloadUrl(rawUrl, state.cwd, name)
-      : undefined,
+    downloadUrl: resolved.downloadUrl,
     height: dimensions?.height ?? existingImage?.height,
     id,
     messageId: messageId ?? existingImage?.messageId,

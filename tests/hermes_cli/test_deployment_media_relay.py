@@ -246,8 +246,9 @@ def test_custom_codex_real_path_validates_then_publishes(
             owner_home=owner,
         ))
         output = Path(result["image"])
-        assert output.parent == paths.default_workspace / "generated" / "images"
-        assert output.read_bytes() == handler.image_bytes
+        assert result["image"].startswith("generated/images/")
+        assert (paths.default_workspace / output).read_bytes() == handler.image_bytes
+        assert str(owner) not in json.dumps(result)
         assert len(handler.requests) == 1
         request_path, request_payload = handler.requests[0]
         assert request_path == "/v1/images/generations"
@@ -306,7 +307,9 @@ def test_custom_codex_real_path_accepts_non_native_matching_ratio(
             owner_home=owner,
         ))
         output = Path(result["image"])
-        assert output.read_bytes() == handler.image_bytes
+        assert result["image"].startswith("generated/images/")
+        assert (paths.default_workspace / output).read_bytes() == handler.image_bytes
+        assert str(owner) not in json.dumps(result)
         assert result["actual_dimensions"] == {"width": 1086, "height": 1448}
         assert result["actual_aspect_ratio"] == "3:4"
         assert result["actual_resolution"] is None
