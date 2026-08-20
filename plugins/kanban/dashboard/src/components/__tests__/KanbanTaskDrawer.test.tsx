@@ -80,7 +80,7 @@ const detail: KanbanTaskDetailResponse = {
     created_by: "test", created_at: 1, started_at: 2, completed_at: null, workspace_kind: "scratch", workspace_path: null,
     claim_lock: "lock", claim_expires: null, tenant: null, branch_name: null, project_id: null, result: null,
     idempotency_key: null, consecutive_failures: 0, worker_pid: 42, last_failure_error: null, max_runtime_seconds: null,
-    last_heartbeat_at: null, current_run_id: 7, workflow_template_id: null, current_step_key: null, skills: null,
+    last_heartbeat_at: null, current_run_id: 7, workflow_template_id: null, current_step_key: null, workflow: null, skills: null,
     model_override: null, max_retries: null, goal_mode: false, goal_max_turns: null, session_id: null, block_kind: null,
     block_recurrences: 0, age: { created_age_seconds: 1, started_age_seconds: 1, time_to_complete_seconds: null }, latest_summary: null,
     diagnostics: [{ kind: "stalled", severity: "warning", title: "Worker stalled", detail: "No heartbeat", actions: [], first_seen_at: 1, last_seen_at: 2, count: 1, run_id: 7, data: {} }],

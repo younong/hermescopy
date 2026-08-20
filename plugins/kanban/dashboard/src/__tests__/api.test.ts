@@ -65,6 +65,7 @@ describe("Kanban API", () => {
 
   it("uses exact JSON bodies for task, recovery, and orchestration mutations", async () => {
     await kanbanApi.createTask("default", { title: "Task", parents: ["p1"], goal_mode: true });
+    await kanbanApi.updateWorkflow("default", "t1", { steps: [{ key: "analysis", assignee: "researcher" }], auto_advance: true });
     await kanbanApi.bulkUpdate("default", { ids: ["t1"], archive: true });
     await kanbanApi.terminateRun("default", 4);
     await kanbanApi.reclaimTask("default", "t1");
@@ -74,6 +75,7 @@ describe("Kanban API", () => {
 
     expect(requestCalls().map(({ method, body }) => [method, body])).toEqual([
       ["POST", JSON.stringify({ title: "Task", parents: ["p1"], goal_mode: true })],
+      ["PATCH", JSON.stringify({ workflow: { steps: [{ key: "analysis", assignee: "researcher" }], auto_advance: true } })],
       ["POST", JSON.stringify({ ids: ["t1"], archive: true })],
       ["POST", JSON.stringify({ reason: null })],
       ["POST", JSON.stringify({ reason: null })],

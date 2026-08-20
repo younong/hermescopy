@@ -618,6 +618,7 @@ class CreateTaskBody(BaseModel):
     skills: Optional[list[str]] = None
     goal_mode: bool = False
     goal_max_turns: Optional[int] = None
+    workflow: Optional[dict[str, Any]] = None
 
 
 @router.post("/tasks")
@@ -642,6 +643,7 @@ def create_task(payload: CreateTaskBody, board: Optional[str] = Query(None)):
             skills=payload.skills,
             goal_mode=payload.goal_mode,
             goal_max_turns=payload.goal_max_turns,
+            workflow=payload.workflow,
         )
         task = kanban_db.get_task(conn, task_id)
         body: dict[str, Any] = {"task": _task_dict(task) if task else None}
@@ -842,6 +844,7 @@ class UpdateTaskBody(BaseModel):
     # complete --summary ... --metadata ...``.
     summary: Optional[str] = None
     metadata: Optional[dict] = None
+    workflow: Optional[dict[str, Any]] = None
 
 
 @router.patch("/tasks/{task_id}")
@@ -852,6 +855,25 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
         task = kanban_db.get_task(conn, task_id)
         if task is None:
             raise HTTPException(status_code=404, detail=f"task {task_id} not found")
+
+        # --- workflow -----------------------------------------------------
+        if payload.workflow is not None:
+            try:
+                normalized = kanban_db._normalize_workflow(payload.workflow)
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail=str(exc))
+            with kanban_db.write_txn(conn):
+                first = normalized["steps"][0]
+                conn.execute(
+                    "UPDATE tasks SET workflow = ?, workflow_template_id = ?, "
+                    "current_step_key = ?, assignee = ? WHERE id = ?",
+                    (json.dumps(normalized, ensure_ascii=False), "inline",
+                     first["key"], first["assignee"], task_id),
+                )
+                kanban_db._append_event(
+                    conn, task_id, "workflow_configured",
+                    {"steps": normalized["steps"], "auto_advance": normalized["auto_advance"]},
+                )
 
         # --- assignee ----------------------------------------------------
         if payload.assignee is not None:

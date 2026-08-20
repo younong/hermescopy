@@ -277,6 +277,18 @@ function Overview({
       <h3>{k.description}</h3>
       <div className="gui-chat-kanban-markdown">{task.body ? <Markdown content={task.body} /> : k.noDescription}</div>
     </section>
+    {task.workflow ? <section>
+      <h3>Workflow</h3>
+      <div className="gui-chat-kanban-workflow-steps">
+        {task.workflow.steps.map((step) => {
+          const active = step.key === task.current_step_key;
+          const completed = detail.runs.some((run) => run.step_key === step.key && run.outcome === "completed");
+          return <div className={active ? "is-active" : completed ? "is-complete" : ""} key={step.key}>
+            <strong>{step.key}</strong><span>{step.assignee}</span><small>{active ? "Current" : completed ? "Completed" : "Waiting"}</small>
+          </div>;
+        })}
+      </div>
+    </section> : null}
     {task.result || task.latest_summary ? <section>
       <h3>{k.result}</h3>
       <div className="gui-chat-kanban-markdown"><Markdown content={task.result || task.latest_summary || ""} /></div>

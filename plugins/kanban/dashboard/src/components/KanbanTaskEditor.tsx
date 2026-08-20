@@ -27,14 +27,22 @@ export function KanbanTaskEditor({
   const [tenant, setTenant] = useState(task?.tenant ?? "");
   const [workspacePath, setWorkspacePath] = useState(task?.workspace_path ?? "");
   const [skills, setSkills] = useState((task?.skills ?? []).join(", "));
+  const [workflowSteps, setWorkflowSteps] = useState(
+    (task?.workflow?.steps ?? []).map((step) => `${step.key}:${step.assignee}`).join(", "),
+  );
   const create = !task;
 
   const save = () => {
+    const steps = workflowSteps.split(",").map((item) => {
+      const [key, ...profile] = item.split(":");
+      return { key: key.trim(), assignee: profile.join(":").trim() };
+    }).filter((step) => step.key && step.assignee);
     const common = {
-      assignee: assignee || null,
+      assignee: assignee || (steps[0]?.assignee ?? null),
       body,
       priority,
       title: title.trim(),
+      workflow: steps.length ? { steps, auto_advance: true } : null,
     };
     if (create) {
       onSave({
@@ -74,6 +82,10 @@ export function KanbanTaskEditor({
         <label>
           <span>{k.priority}</span>
           <input onChange={(event) => setPriority(Number(event.target.value))} type="number" value={priority} />
+        </label>
+        <label className="is-wide">
+          <span>AI workflow (step:profile, comma separated)</span>
+          <input list="kanban-assignees" onChange={(event) => setWorkflowSteps(event.target.value)} placeholder="analysis:researcher, implementation:coder, review:reviewer" value={workflowSteps} />
         </label>
         {create ? <>
           <label>
