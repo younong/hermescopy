@@ -482,6 +482,7 @@ class SessionReaderSupervisor:
     def report_request_failure(
         self,
         lease: SessionReaderAuthorityLease,
+        reason: str = "other",
     ) -> bool:
         """Fence a failed Reader generation for lifecycle-only retirement."""
         with self._lock:
@@ -492,6 +493,19 @@ class SessionReaderSupervisor:
             handle.retire_pending = True
             handle.last_used_at = 0.0
             return True
+
+    def report_request_success(
+        self,
+        lease: SessionReaderAuthorityLease,
+    ) -> bool:
+        """Return whether a successful request belongs to the current Reader."""
+        with self._lock:
+            handle = self._handles.get(str(lease.owner_key))
+            return bool(
+                handle is not None
+                and handle.accepting
+                and self._lease_for_handle(handle) == lease
+            )
 
     def _reconcile_missing_local_reader(
         self,
