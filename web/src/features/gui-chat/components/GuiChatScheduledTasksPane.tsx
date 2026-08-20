@@ -114,7 +114,11 @@ export function GuiChatScheduledTasksPane() {
 
   const saveEditor = async () => {
     if (!editor) return;
-    if (editor.form.mode === "employee" && !editor.form.employee_id) {
+    if (
+      editor.form.mode === "employee" &&
+      !editor.form.employee_id &&
+      editor.form.target_employee_ids.length === 0
+    ) {
       setError(text.employeeRequired);
       return;
     }

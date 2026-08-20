@@ -851,7 +851,8 @@ class CollaborationScheduler:
     def _schedule_coordinator_if_terminal(self, turn_id: str) -> None:
         with self.db._lock:
             row = self.db._conn.execute(
-                "SELECT t.status, t.group_id, task.task_id FROM collaboration_turns t "
+                "SELECT t.status, t.group_id, task.task_id, task.source_kind "
+                "FROM collaboration_turns t "
                 "JOIN collaboration_groups g ON g.group_id=t.group_id "
                 "LEFT JOIN collaboration_tasks task ON task.group_id=t.group_id "
                 "WHERE t.turn_id=? AND g.owner_key=?",
@@ -860,6 +861,7 @@ class CollaborationScheduler:
         if (
             row is None
             or row["task_id"] is None
+            or str(row["source_kind"] or "") == "cron"
             or str(row["status"])
             not in {"completed", "partial", "failed", "ambiguous", "cancelled"}
         ):

@@ -25,6 +25,7 @@ function form(overrides: Partial<CronJobFormState> = {}): CronJobFormState {
     enabled_toolsets: [],
     workdir: "",
     employee_id: "",
+    target_employee_ids: [],
     ...overrides,
   };
 }
@@ -54,6 +55,13 @@ describe("buildCronJobPayload", () => {
       context_from: ["upstream-a", "upstream-b"],
       enabled_toolsets: ["web"],
     });
+  });
+
+  it("serializes selected target employees", () => {
+    const payload = buildCronJobPayload(
+      form({ target_employee_ids: ["employee-a", "employee-b"] }),
+    );
+    expect(payload.target_employee_ids).toEqual(["employee-a", "employee-b"]);
   });
 
   it("keeps clear operations explicit for update payloads", () => {
@@ -97,13 +105,16 @@ describe("cronJobFormFromJob", () => {
       schedule_display: "every 1h",
       context_from: ["upstream-a", "upstream-b"],
       enabled_toolsets: ["web"],
+      target_employee_ids: ["employee-a", "employee-b"],
     };
 
     expect(cronJobFormFromJob(job)).toMatchObject({
       schedule: "every 1h",
       context_from: "upstream-a\nupstream-b",
       enabled_toolsets: ["web"],
+      target_employee_ids: ["employee-a", "employee-b"],
     });
+    expect(cronJobFormFromJob(job).target_employee_ids).toEqual(["employee-a", "employee-b"]);
   });
 
   it("prefers one-shot run_at over the human display string", () => {
