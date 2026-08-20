@@ -1265,11 +1265,16 @@ IMAGE_GENERATE_SCHEMA = {
         "and additional paths as `reference_image_urls`; omit both for "
         "text-to-image. The underlying backend and model are user-configured "
         "and not selectable by the agent. Returns the result in the `image` "
-        "field — either a URL or an absolute file path. To show it to the user, "
-        "reference that path/URL in your response using the file-delivery "
-        "convention for the current platform. When the active terminal backend "
-        "has a different filesystem, successful local-file results may also "
-        "include `agent_visible_image` for follow-up terminal/file operations."
+        "field — for HTTP-backed providers it is an `http(s)://` URL; for "
+        "local sandbox outputs it is a workspace-relative path such as "
+        "`generated/images/cat.png`. Reference that value verbatim in your "
+        "response using the file-delivery convention for the current platform "
+        "(for example `MEDIA:<value>`). Do not prefix local paths with the "
+        "sandbox cwd alias `/workspace/` or any other leading directory — the "
+        "gateway needs the workspace-relative form to authenticate the "
+        "download. When the active terminal backend has a different "
+        "filesystem, successful local-file results may also include "
+        "`agent_visible_image` for follow-up terminal/file operations."
     ),
     "parameters": {
         "type": "object",
