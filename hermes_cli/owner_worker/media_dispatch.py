@@ -193,7 +193,7 @@ def dispatch_deployment_media(
             result["image_bytes"],
         )
         payload = {
-            "success": True, "image": str(output.diagnostic_path),
+            "success": True, "image": output.visible_path,
             "provider": result["provider"], "model": result["model"],
             "aspect_ratio": result["aspect_ratio"], "modality": result["modality"],
             "mime_type": result["mime_type"], **dict(result.get("metadata") or {}),
@@ -228,6 +228,6 @@ def dispatch_deployment_media(
         f"{descriptor.provider}_{secrets.token_hex(16)}.{suffix}",
         result["video_bytes"],
     )
-    payload["video"] = str(output.diagnostic_path)
+    payload["video"] = output.visible_path
     payload["mime_type"] = result["mime_type"]
     return json.dumps(payload)

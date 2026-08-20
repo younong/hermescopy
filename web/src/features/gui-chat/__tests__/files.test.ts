@@ -6,6 +6,7 @@ import {
   buildSessionFileDownloadUrl,
   downloadSessionFile,
   normalizeSessionFileReference,
+  resolveSessionImageReference,
   sessionFileType,
 } from "../files";
 
@@ -29,6 +30,25 @@ describe("session files", () => {
     expect(normalizeSessionFileReference("%E6%8A%A5%E5%91%8A.zip")).toBe("报告.zip");
     expect(normalizeSessionFileReference("https://example.com/report.zip")).toBeNull();
     expect(normalizeSessionFileReference("javascript:alert(1)")).toBeNull();
+  });
+
+  it("uses one authenticated source for workspace image preview and download", () => {
+    expect(resolveSessionImageReference("generated/images/cat.png", "/workspace", "cat.png")).toEqual({
+      sourcePath: "generated/images/cat.png",
+      previewUrl: "/api/fs/read-data-url?path=generated%2Fimages%2Fcat.png&cwd=%2Fworkspace",
+      downloadUrl: "/api/files/download?path=generated%2Fimages%2Fcat.png&cwd=%2Fworkspace&filename=cat.png",
+    });
+  });
+
+  it("maps workspace absolute artifact paths without basename guessing", () => {
+    const resolved = resolveSessionImageReference(
+      "/opt/hermes/shared/.hermes/users/owner/workspaces/default/generated/images/cat.png",
+    );
+    expect(resolved.sourcePath).toBe("generated/images/cat.png");
+    expect(resolved.previewUrl).toBe("/api/fs/read-data-url?path=generated%2Fimages%2Fcat.png");
+    expect(resolved.downloadUrl).toBe(
+      "/api/files/download?path=generated%2Fimages%2Fcat.png&filename=cat.png",
+    );
   });
 
   it.each([

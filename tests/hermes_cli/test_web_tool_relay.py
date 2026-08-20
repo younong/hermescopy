@@ -223,8 +223,9 @@ def test_owner_side_tts_publishes_workspace_audio_and_cleans_staging(tmp_path, m
     try:
         result = json.loads(dispatch_owner_tool_over_relay(broker.register(invocation), invocation))
         published = Path(result["file_path"])
-        assert published.parent == owner / "workspaces" / "default" / "generated" / "audio"
-        assert published.read_bytes() == b"ID3owner-audio"
+        assert result["file_path"].startswith("generated/audio/")
+        assert (owner / "workspaces" / "default" / published).read_bytes() == b"ID3owner-audio"
+        assert str(owner) not in json.dumps(result)
         assert result["media_tag"] == f"[[audio_as_voice]]\nMEDIA:{published}"
         assert staging_paths and not staging_paths[0].parent.exists()
         assert "HERMES_HOME" not in str(invocation.to_payload())
@@ -276,8 +277,9 @@ def test_owner_side_video_downloads_validates_and_publishes_workspace_video(tmp_
     try:
         result = json.loads(dispatch_owner_tool_over_relay(broker.register(invocation), invocation))
         published = Path(result["video"])
-        assert published.parent == owner / "workspaces" / "default" / "generated" / "videos"
-        assert published.read_bytes() == video_bytes
+        assert result["video"].startswith("generated/videos/")
+        assert (owner / "workspaces" / "default" / published).read_bytes() == video_bytes
+        assert str(owner) not in json.dumps(result)
         assert result["media_tag"] == f"MEDIA:{published}"
     finally:
         broker.close()
@@ -307,8 +309,8 @@ def test_owner_side_video_accepts_provider_cache_staging_and_removes_it(tmp_path
     try:
         result = json.loads(dispatch_owner_tool_over_relay(broker.register(invocation), invocation))
         published = Path(result["video"])
-        assert published.read_bytes() == b"\x00\x00\x00\x18ftypmp42cached-video"
-        assert published.parent == owner / "workspaces" / "default" / "generated" / "videos"
+        assert result["video"].startswith("generated/videos/")
+        assert (owner / "workspaces" / "default" / published).read_bytes() == b"\x00\x00\x00\x18ftypmp42cached-video"
         assert not cached.exists()
     finally:
         broker.close()
@@ -379,8 +381,9 @@ def test_owner_side_xai_video_tools_publish_workspace_video(
     try:
         result = json.loads(dispatch_owner_tool_over_relay(broker.register(invocation), invocation))
         published = Path(result["video"])
-        assert published.parent == owner / "workspaces" / "default" / "generated" / "videos"
-        assert published.read_bytes().endswith(b"xai-video")
+        assert result["video"].startswith("generated/videos/")
+        assert (owner / "workspaces" / "default" / published).read_bytes().endswith(b"xai-video")
+        assert str(owner) not in json.dumps(result)
         assert seen and seen[0]["prompt"] == arguments["prompt"]
     finally:
         broker.close()

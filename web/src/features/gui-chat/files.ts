@@ -48,6 +48,59 @@ export function normalizeSessionFileReference(value: string): string | null {
   return path && !path.includes("\0") ? path : null;
 }
 
+export interface SessionImageReference {
+  sourcePath?: string;
+  previewUrl: string;
+  downloadUrl?: string;
+}
+
+export function resolveSessionImageReference(
+  value: string,
+  cwd?: string,
+  filename?: string,
+): SessionImageReference {
+  const trimmed = value.trim().replace(/[.,;:!?。，、；：！？]+$/g, "");
+  if (/^(https?:|data:|blob:)/i.test(trimmed) || trimmed.startsWith("/api/")) {
+    return { previewUrl: trimmed };
+  }
+
+  const normalized = normalizeSessionFileReference(trimmed);
+  if (normalized && looksLikeFilesystemPath(normalized)) {
+    const workspacePath = workspaceVisiblePath(normalized);
+    const path = workspacePath ?? normalized;
+    const downloadName = filename ?? path.split(/[\\/]/).pop() ?? "image";
+    const params = `path=${encodeURIComponent(path)}`;
+    const cwdParam = cwd && isRelativeFilesystemPath(path)
+      ? `&cwd=${encodeURIComponent(cwd)}`
+      : "";
+    return {
+      downloadUrl: buildSessionFileDownloadUrl(path, cwd, downloadName),
+      previewUrl: `/api/fs/read-data-url?${params}${cwdParam}`,
+      sourcePath: path,
+    };
+  }
+
+  return {
+    previewUrl: trimmed.startsWith("/api/")
+      ? trimmed
+      : `/api/artifacts/${encodeURIComponent(trimmed)}`,
+  };
+}
+
+function workspaceVisiblePath(path: string): string | undefined {
+  const normalized = path.replaceAll("\\", "/");
+  const match = normalized.match(/(?:^|\/)workspaces\/.+\/(generated\/(?:images|audio|videos)\/[^/]+)$/);
+  return match?.[1];
+}
+
+function looksLikeFilesystemPath(value: string): boolean {
+  return value.startsWith("~") || /^[A-Za-z]:[\\/]/.test(value) || value.includes("/") || value.includes("\\");
+}
+
+function isRelativeFilesystemPath(value: string): boolean {
+  return !value.startsWith("~") && !value.startsWith("/") && !value.startsWith("\\\\") && !/^[A-Za-z]:[\\/]/.test(value);
+}
+
 export function sessionFileType(name: string, mimeType?: string): SessionFileType {
   const mime = (mimeType ?? "").toLowerCase().split(";", 1)[0];
   const extension = name.split(/[?#]/, 1)[0]?.match(/\.([^.\/\\]+)$/)?.[1]?.toLowerCase() ?? "";
