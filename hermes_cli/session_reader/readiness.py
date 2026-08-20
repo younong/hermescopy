@@ -21,6 +21,8 @@ class _ObservedOwner:
     last_observed_at: float
     failures: int = 0
     retry_at: float = 0.0
+    request_failures: int = 0
+    request_retry_at: float = 0.0
 
 
 class SessionReaderLifecycle:
@@ -66,23 +68,48 @@ class SessionReaderLifecycle:
         self._schedule_start(owner_key)
 
     def report_request_failure(self, lease: Any, reason: str) -> None:
-        """Wake maintenance only when the failed fence is still locally current."""
+        """Fence a failed Reader and back off its next background restart."""
         if not self._accepting:
             return
         owner_key = str(lease.owner_key)
         if not self.supervisor.report_request_failure(lease):
             return
+        observed = self._owners.get(owner_key)
+        if observed is not None:
+            observed.request_failures += 1
+            delay = min(
+                self.max_backoff,
+                self.initial_backoff * (2 ** min(observed.request_failures - 1, 8)),
+            )
+            observed.request_retry_at = max(
+                observed.request_retry_at,
+                time.monotonic() + delay,
+            )
+        else:
+            delay = 0.0
         _log.warning(
-            "session reader request failure owner=%s generation=%s reason=%s",
+            "session reader request failure owner=%s generation=%s reason=%s "
+            "attempt=%s retry_delay=%.3f",
             owner_key,
             lease.reader_generation,
             reason,
+            observed.request_failures if observed is not None else 0,
+            delay,
         )
         self._wake.set()
 
+    def report_request_success(self, lease: Any) -> None:
+        """Clear request-failure backoff only for the current Reader lease."""
+        if not self._accepting or not self.supervisor.report_request_success(lease):
+            return
+        observed = self._owners.get(str(lease.owner_key))
+        if observed is not None:
+            observed.request_failures = 0
+            observed.request_retry_at = 0.0
+
     def _schedule_start(self, owner_key: str) -> None:
         observed = self._owners.get(owner_key)
-        if observed is None or observed.retry_at > time.monotonic():
+        if observed is None or max(observed.retry_at, observed.request_retry_at) > time.monotonic():
             return
         existing = self._startups.get(owner_key)
         if existing is not None and not existing.done():
@@ -165,9 +192,10 @@ class SessionReaderLifecycle:
             for observed in self._owners.values()
         ]
         deadlines.extend(
-            observed.retry_at
+            deadline
             for observed in self._owners.values()
-            if observed.retry_at > now
+            for deadline in (observed.retry_at, observed.request_retry_at)
+            if deadline > now
         )
         next_maintenance = getattr(self.supervisor, "next_maintenance_delay", None)
         if callable(next_maintenance):
