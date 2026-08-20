@@ -1947,6 +1947,45 @@ def _resolve_nous_context_length(
     return None, ""
 
 
+def _deployment_relay_context_length(
+    model: str,
+    *,
+    provider: str = "",
+    api_key: str = "",
+) -> tuple[bool, int | None]:
+    """Resolve relay capabilities without probing the relay as a model API."""
+    try:
+        from hermes_cli.deployment_inference import (
+            is_deployment_inference_relay,
+            route_descriptors_from_control_plane,
+        )
+
+        if not is_deployment_inference_relay(api_key):
+            return False, None
+        routes = route_descriptors_from_control_plane()
+    except Exception:
+        return True, None
+
+    selected_model = _strip_provider_prefix(str(model or "").strip())
+    selected_provider = str(provider or "").strip().lower()
+    matches = [
+        route
+        for route in routes
+        if _strip_provider_prefix(str(getattr(route, "model", "") or "")) == selected_model
+        and (
+            not selected_provider
+            or selected_provider in {"auto", "custom"}
+            or str(getattr(route, "provider", "") or "").strip().lower() == selected_provider
+        )
+    ]
+    if len(matches) != 1:
+        return True, None
+    context_length = getattr(matches[0], "context_length", None)
+    if isinstance(context_length, int) and not isinstance(context_length, bool) and context_length > 0:
+        return True, context_length
+    return True, None
+
+
 def get_model_context_length(
     model: str,
     base_url: str = "",
@@ -1982,51 +2021,6 @@ def get_model_context_length(
     # 0. Explicit config override — user knows best
     if config_context_length is not None and isinstance(config_context_length, int) and config_context_length > 0:
         return config_context_length
-
-    # Deployment inference relays expose only the dedicated route metadata
-    # endpoint; never treat their virtual base URL as a generic /models API.
-    try:
-        from hermes_cli.deployment_inference import (
-            is_deployment_inference_relay,
-            route_descriptors_from_control_plane,
-        )
-        if is_deployment_inference_relay(api_key):
-            selected_model = _strip_provider_prefix(str(model or "").strip())
-            selected_provider = str(provider or "").strip().lower()
-            routes = route_descriptors_from_control_plane()
-            matches = [
-                route for route in routes
-                if _strip_provider_prefix(route.model) == selected_model
-                and (
-                    not selected_provider
-                    or selected_provider in {"auto", "custom"}
-                    or route.provider.lower() == selected_provider
-                )
-            ]
-            if len(matches) == 1:
-                context_length = matches[0].context_length
-                if context_length is not None:
-                    return context_length
-            model_lower = selected_model.lower()
-            for default_model, length in sorted(
-                DEFAULT_CONTEXT_LENGTHS.items(),
-                key=lambda item: len(item[0]),
-                reverse=True,
-            ):
-                if default_model in model_lower:
-                    return length
-            return DEFAULT_FALLBACK_CONTEXT
-    except Exception:
-        if api_key == "deployment-inference-relay":
-            model_lower = _strip_provider_prefix(str(model or "").strip()).lower()
-            for default_model, length in sorted(
-                DEFAULT_CONTEXT_LENGTHS.items(),
-                key=lambda item: len(item[0]),
-                reverse=True,
-            ):
-                if default_model in model_lower:
-                    return length
-            return DEFAULT_FALLBACK_CONTEXT
 
     # 0a. MoA virtual provider — ``model`` is a preset name, not a real model,
     # and ``base_url`` is the local virtual endpoint, so every probe below would
