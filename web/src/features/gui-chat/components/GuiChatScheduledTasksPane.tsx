@@ -25,6 +25,8 @@ import { guiChatTranslations, useI18n } from "@/i18n";
 import { describeSchedule, englishOrdinal } from "@/lib/schedule";
 import { GuiChatWorkspaceDialog } from "./GuiChatWorkspaceDialog";
 
+const MAX_SCHEDULED_TASKS = 10;
+
 const EMPTY_RESOURCES: CronJobFormResources = {
   availableSkills: [],
   availableToolsets: [],
@@ -123,6 +125,10 @@ export function GuiChatScheduledTasksPane() {
       return;
     }
     const payload = buildCronJobPayloadFromEditor(editor.form);
+    if (!editor.job && jobs.length >= MAX_SCHEDULED_TASKS) {
+      setError(text.limitReached);
+      return;
+    }
     if (!payload.schedule || (!payload.no_agent && !cronJobHasExecutionContent(payload))) {
       setError(text.validationRequired);
       return;
@@ -145,7 +151,11 @@ export function GuiChatScheduledTasksPane() {
       }
       setEditor(null);
     } catch (cause) {
-      setError(errorMessage(cause));
+      if (isQuotaError(cause)) {
+        void load().then(() => setError(text.limitReached));
+      } else {
+        setError(errorMessage(cause));
+      }
     } finally {
       setBusyJob(null);
     }
@@ -172,13 +182,15 @@ export function GuiChatScheduledTasksPane() {
       <header className="gui-chat-workspace-toolbar">
         <button
           className="gui-chat-workspace-primary-button"
+          disabled={jobs.length >= MAX_SCHEDULED_TASKS}
           onClick={() => {
             setResources(EMPTY_RESOURCES);
             setEditor({ job: null, form: emptyCronJobForm() });
           }}
           type="button"
         >
-          <Plus aria-hidden />{text.newTask}        </button>
+          <Plus aria-hidden />{text.newTask}
+        </button>
         <button
           aria-label={text.refresh}
           className="gui-chat-workspace-icon-button"
@@ -194,6 +206,11 @@ export function GuiChatScheduledTasksPane() {
         <div>
           <h1>{text.title}</h1>
           <p>{text.description}</p>
+          <p className="gui-chat-workspace-muted">{text.limitHint}</p>
+          <p className="gui-chat-workspace-muted">{text.countLabel.replace("{count}", String(jobs.length))}</p>
+          {jobs.length >= MAX_SCHEDULED_TASKS ? (
+            <p className="gui-chat-workspace-feedback is-error">{text.limitReached}</p>
+          ) : null}
         </div>
         <label className="gui-chat-workspace-search">
           <Search aria-hidden />
@@ -350,4 +367,10 @@ function formatTime(value: string | null | undefined, locale: string): string {
 
 function errorMessage(cause: unknown): string {
   return cause instanceof Error ? cause.message : String(cause);
+}
+
+function isQuotaError(cause: unknown): boolean {
+  return typeof cause === "object" && cause !== null && "status" in cause
+    ? Number((cause as { status?: unknown }).status) === 409
+    : errorMessage(cause).includes("Scheduled task limit reached");
 }

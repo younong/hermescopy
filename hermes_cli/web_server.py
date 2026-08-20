@@ -947,6 +947,7 @@ def _authenticated_owner_control_plane_gate_response(request: Request) -> Option
     method = request.method
     if (
         path.startswith("/api/plugins/")
+        and not path.startswith("/api/plugins/scheduled-tasks/")
         and _local_dashboard_account_role(request) == "member"
     ):
         return JSONResponse(

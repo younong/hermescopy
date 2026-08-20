@@ -102,6 +102,44 @@ def test_owner_worker_crud_notifies_provider_and_rejects_selectors(
         client.close()
 
 
+def test_owner_worker_enforces_ten_task_quota_and_allows_reuse_after_delete(
+    tmp_path, monkeypatch,
+):
+    owner_home = tmp_path / "owner"
+    owner_home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(owner_home))
+    monkeypatch.setattr("cron.scheduler._notify_provider_jobs_changed", lambda: None)
+    client, _module = _client(owner_worker=True)
+    try:
+        responses = [
+            client.post(
+                "/api/plugins/scheduled-tasks/jobs",
+                json={"prompt": f"task-{index}", "schedule": "every 1h"},
+            )
+            for index in range(10)
+        ]
+        assert all(response.status_code == 200 for response in responses)
+        job_ids = [response.json()["id"] for response in responses]
+
+        rejected = client.post(
+            "/api/plugins/scheduled-tasks/jobs",
+            json={"prompt": "task-10", "schedule": "every 1h"},
+        )
+        assert rejected.status_code == 409
+        assert "10" in rejected.json()["detail"]
+
+        assert client.delete(
+            f"/api/plugins/scheduled-tasks/jobs/{job_ids[0]}"
+        ).json() == {"ok": True}
+        reused = client.post(
+            "/api/plugins/scheduled-tasks/jobs",
+            json={"prompt": "reused", "schedule": "every 1h"},
+        )
+        assert reused.status_code == 200
+    finally:
+        client.close()
+
+
 def test_local_all_profile_list_preserves_profile_annotations(tmp_path, monkeypatch):
     from hermes_cli.cron_management import create_job
 
