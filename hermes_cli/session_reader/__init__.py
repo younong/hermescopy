@@ -7,6 +7,7 @@ __all__ = [
     "SessionReaderClient",
     "SessionReaderHandle",
     "SessionReaderHealthError",
+    "classify_session_reader_error",
     "SessionReaderStartupError",
     "SessionReaderSupervisor",
     "SessionReaderUnavailableError",
@@ -15,11 +16,16 @@ __all__ = [
 
 def __getattr__(name: str) -> Any:
     if name in {"SessionReaderClient", "SessionReaderHealthError"}:
-        from .client import SessionReaderClient, SessionReaderHealthError
+        from .client import (
+            SessionReaderClient,
+            SessionReaderHealthError,
+            classify_session_reader_error,
+        )
 
         return {
             "SessionReaderClient": SessionReaderClient,
             "SessionReaderHealthError": SessionReaderHealthError,
+            "classify_session_reader_error": classify_session_reader_error,
         }[name]
     if name in {
         "SessionReaderHandle",
