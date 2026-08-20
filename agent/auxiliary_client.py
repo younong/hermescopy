@@ -562,6 +562,64 @@ _OR_HEADERS_BASE = {
 _TRUTHY_ENV_VALUES = frozenset({"1", "true", "yes", "on"})
 
 
+def _deployment_relay_route(
+    api_key: object,
+    model: Optional[str],
+) -> Any | None:
+    """Return the worker-visible deployment route for a relay model."""
+    try:
+        from hermes_cli.deployment_inference import (
+            is_deployment_inference_relay,
+            route_descriptors_from_control_plane,
+        )
+        if not is_deployment_inference_relay(api_key):
+            return None
+        selected_model = str(model or "").strip()
+        if not selected_model:
+            return None
+        return next(
+            (candidate for candidate in route_descriptors_from_control_plane()
+             if candidate.model == selected_model),
+            None,
+        )
+    except Exception:
+        return None
+
+
+def _deployment_compression_route(
+    model: Optional[str],
+    task_config: Dict[str, Any],
+) -> Tuple[Optional[str], Optional[str], Optional[str], Optional[str]]:
+    """Resolve an automatic compression model through the worker relay."""
+    if str(task_config.get("provider") or "").strip().lower() not in {"", "auto"}:
+        return None, None, None, None
+    if str(task_config.get("model") or "").strip().lower() not in {"", "auto"}:
+        return None, None, None, None
+    try:
+        from hermes_cli.deployment_inference import route_descriptors_from_control_plane
+        from hermes_cli.runtime_provider import resolve_deployment_inference_runtime
+        routes = route_descriptors_from_control_plane()
+        route = next((candidate for candidate in routes if candidate.model == model), None)
+        if route is None:
+            return None, None, None, None
+        runtime = resolve_deployment_inference_runtime(
+            requested=route.provider,
+            target_model=model,
+            route_descriptors=routes,
+            allow_deployment_task="compression",
+        )
+        if runtime is None:
+            return None, None, None, None
+        return (
+            "custom",
+            str(runtime.get("base_url") or "").strip() or None,
+            runtime.get("api_key"),
+            str(runtime.get("api_mode") or "").strip() or None,
+        )
+    except Exception:
+        return None, None, None, None
+
+
 def _deployment_relay_headers(
     api_key: object,
     main_runtime: Optional[Dict[str, Any]],
@@ -570,10 +628,7 @@ def _deployment_relay_headers(
 ) -> dict[str, str]:
     """Return the exact model route selector required by the owner relay."""
     try:
-        from hermes_cli.deployment_inference import (
-            is_deployment_inference_relay,
-            route_descriptors_from_control_plane,
-        )
+        from hermes_cli.deployment_inference import is_deployment_inference_relay
 
         if not is_deployment_inference_relay(api_key):
             return {}
@@ -581,21 +636,9 @@ def _deployment_relay_headers(
         return {}
     runtime = _normalize_main_runtime(main_runtime)
     provider = str(runtime.get("provider") or "").strip().lower()
-    selected_model = str(model or "").strip()
-    if selected_model:
-        try:
-            route = next(
-                (
-                    candidate
-                    for candidate in route_descriptors_from_control_plane()
-                    if candidate.model == selected_model
-                ),
-                None,
-            )
-        except Exception:
-            route = None
-        if route is not None:
-            provider = route.provider
+    route = _deployment_relay_route(api_key, model)
+    if route is not None:
+        provider = route.provider
     if not provider:
         return {}
     return {"x-hermes-deployment-provider": provider}
@@ -1476,6 +1519,7 @@ def _maybe_wrap_anthropic(
     api_key: str,
     base_url: str,
     api_mode: Optional[str] = None,
+    default_headers: Optional[dict[str, str]] = None,
 ) -> Any:
     """Rewrap a plain OpenAI client in ``AnthropicAuxiliaryClient`` when
     the endpoint actually speaks Anthropic Messages.
@@ -1534,7 +1578,9 @@ def _maybe_wrap_anthropic(
         return client_obj
 
     try:
-        real_client = build_anthropic_client(api_key, base_url)
+        real_client = build_anthropic_client(
+            api_key, base_url, default_headers=default_headers
+        )
     except Exception as exc:
         logger.warning(
             "Failed to build Anthropic client for %s (%s) — falling back to "
@@ -3937,6 +3983,7 @@ def _resolve_single_provider(
 def _resolve_auto(
     main_runtime: Optional[Dict[str, Any]] = None,
     task: Optional[str] = None,
+    requested_model: Optional[str] = None,
 ) -> Tuple[Optional[OpenAI], Optional[str]]:
     """Full auto-detection chain.
 
@@ -3971,6 +4018,16 @@ def _resolve_auto(
         runtime_api_key = _RUNTIME_MAIN_API_KEY
     if not runtime_api_mode and _RUNTIME_MAIN_API_MODE:
         runtime_api_mode = _RUNTIME_MAIN_API_MODE
+
+    # Deployment compression may target a secondary route. Resolve that route
+    # after inheriting the process-local relay runtime, so its model/provider
+    # and API mode follow the selected summary model.
+    if task == "compression" and requested_model and runtime_api_key:
+        route = _deployment_relay_route(runtime_api_key, requested_model)
+        if route is not None:
+            runtime_provider = route.provider
+            runtime_model = requested_model
+            runtime_api_mode = route.api_mode
 
     # ── Warn once if OPENAI_BASE_URL is set but config.yaml uses a named
     #    provider (not 'custom').  This catches the common "env poisoning"
@@ -4308,7 +4365,8 @@ def resolve_provider_client(
         return False
 
     def _wrap_if_needed(client_obj, final_model_str: str, base_url_str: str = "",
-                        api_key_str: str = ""):
+                        api_key_str: str = "", *, api_mode: Optional[str] = None,
+                        default_headers: Optional[dict[str, str]] = None):
         """Wrap a plain OpenAI client in the correct transport adapter.
 
         Handles two cases:
@@ -4332,11 +4390,16 @@ def resolve_provider_client(
         # chat.completions.create() is translated to /v1/messages.
         return _maybe_wrap_anthropic(
             client_obj, final_model_str, api_key_str, base_url_str, api_mode,
+            default_headers=default_headers,
         )
 
     # ── Auto: try all providers in priority order ────────────────────
     if provider == "auto":
-        client, resolved = _resolve_auto(main_runtime=main_runtime, task=task)
+        client, resolved = _resolve_auto(
+            main_runtime=main_runtime,
+            task=task,
+            requested_model=model,
+        )
         if client is None:
             return None, None
         # When auto-detection lands on a non-OpenRouter provider (e.g. a
@@ -4489,7 +4552,11 @@ def resolve_provider_client(
             if _merged_custom:
                 extra["default_headers"] = _merged_custom
             client = _create_openai_client(api_key=custom_key, base_url=_clean_base, **extra)
-            client = _wrap_if_needed(client, final_model, custom_base, custom_key)
+            client = _wrap_if_needed(
+                client, final_model, custom_base, custom_key,
+                api_mode=api_mode,
+                default_headers=extra.get("default_headers"),
+            )
             return (_to_async_client(client, final_model, is_vision=is_vision) if async_mode
                     else (client, final_model))
         # Try custom first, then API-key providers (Codex excluded here:
@@ -5699,12 +5766,46 @@ def _resolve_task_provider_model(
     if cfg_model and cfg_model.lower() == "auto":
         cfg_model = None
 
-    resolved_model = (
-        get_compression_summary_model(model, task_config=task_config)
-        if task == "compression"
-        else model or cfg_model
+    deployment_model = os.getenv(
+        "HERMES_DEPLOYMENT_INFERENCE_COMPRESSION_MODEL", ""
+    ).strip()
+    deployment_model_selected = (
+        task == "compression"
+        and not model
+        and not cfg_model
+        and deployment_model
+        and (not cfg_provider or cfg_provider.lower() == "auto")
     )
+    resolved_model = (
+        deployment_model
+        if deployment_model_selected
+        else (
+            get_compression_summary_model(model, task_config=task_config)
+            if task == "compression"
+            else model or cfg_model
+        )
+    )
+    if task == "compression" and model:
+        deployment_model_selected = False
     resolved_api_mode = cfg_api_mode
+
+    if (
+        deployment_model_selected
+        and not provider
+        and not base_url
+        and not api_key
+    ):
+        relay_provider, relay_base_url, relay_api_key, relay_api_mode = (
+            _deployment_compression_route(resolved_model, task_config)
+        )
+        if relay_base_url and relay_api_key:
+            return (
+                relay_provider or "custom",
+                resolved_model,
+                relay_base_url,
+                relay_api_key,
+                relay_api_mode,
+            )
 
     # Convenience aliases for direct API-key endpoints that aren't first-class
     # providers (e.g. ``provider: openai`` → custom + api.openai.com/v1).
