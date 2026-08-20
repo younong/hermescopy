@@ -1,4 +1,5 @@
 from types import SimpleNamespace
+import zipfile
 
 from agent.turn_finalizer import finalize_turn
 
@@ -222,11 +223,44 @@ def test_unexpected_validation_error_fails_closed(monkeypatch):
     assert agent.persisted_messages[-1]["content"] == result["final_response"]
 
 
+def test_exhausted_zip_gate_does_not_deliver_loose_files(monkeypatch, tmp_path):
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_a, **_kw: [])
+    monkeypatch.setenv("TERMINAL_CWD", str(tmp_path))
+    (tmp_path / "a.txt").write_text("a", encoding="utf-8")
+    (tmp_path / "b.txt").write_text("b", encoding="utf-8")
+    agent = FakeAgent()
+    messages = [
+        {"role": "user", "content": "请给我 zip"},
+        {"role": "assistant", "content": "[a](a.txt)\n[b](b.txt)"},
+    ]
+
+    result = finalize_turn(
+        agent,
+        final_response="[a](a.txt)\n[b](b.txt)",
+        api_call_count=3,
+        interrupted=False,
+        failed=False,
+        messages=messages,
+        conversation_history=[],
+        effective_task_id="artifact-test",
+        turn_id="turn",
+        user_message="请给我 zip",
+        original_user_message="请给我 zip",
+        _should_review_memory=False,
+        _turn_exit_reason="text_response(stop)",
+    )
+
+    assert result["artifacts"] == []
+    assert "没有生成下载卡片" in result["final_response"]
+    assert "attachments" not in agent.persisted_messages[-1]
+
+
 def test_valid_declared_artifact_is_returned_for_gateway(monkeypatch, tmp_path):
     monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_a, **_kw: [])
     monkeypatch.setenv("TERMINAL_CWD", str(tmp_path))
     archive = tmp_path / "tool.zip"
-    archive.write_bytes(b"archive")
+    with zipfile.ZipFile(archive, "w") as bundle:
+        bundle.writestr("result.txt", "archive")
     agent = FakeAgent()
     messages = [
         {"role": "user", "content": "build it"},
@@ -251,14 +285,14 @@ def test_valid_declared_artifact_is_returned_for_gateway(monkeypatch, tmp_path):
 
     assert result["artifacts"][0]["path"] == str(archive)
     assert result["artifacts"][0]["name"] == "tool.zip"
-    assert result["artifacts"][0]["size_bytes"] == 7
+    assert result["artifacts"][0]["size_bytes"] == archive.stat().st_size
     assert agent.persisted_messages[-1]["attachments"] == [
         {
             "kind": "file",
             "mime_type": "application/zip",
             "name": "tool.zip",
             "path": str(archive),
-            "size_bytes": 7,
+            "size_bytes": archive.stat().st_size,
         }
     ]
 
