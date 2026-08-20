@@ -137,6 +137,27 @@ Notes:
 - **Avoid running Hermes from the bare repo root when using worktrees**
   - Prefer the worktree directories instead, so each agent has a clear scope.
 
+## Claude Code session isolation
+
+The repository's Claude Code hook enforces a stricter development boundary than
+ordinary Hermes worktree use:
+
+- Start the Claude session from the dedicated linked worktree, not the primary
+  checkout. `SessionStart`, directory changes, and context recovery fail closed
+  in the primary checkout or an unverifiable directory.
+- A session is bound to exactly one canonical worktree. The same worktree cannot
+  be claimed by another session, and a session cannot switch to a second one.
+- Existing `claude-task-owner.json` records are retained for compatibility and
+  are safely registered in the shared Git metadata when they match the session.
+- Absolute paths, `..` escapes, and symlink targets outside the bound worktree
+  are rejected by guarded file operations.
+
+The hook validates Claude's declared tool cwd before running Bash, Agent, or
+Workflow. It cannot sandbox arbitrary shell descendants after admission: a
+command can still attempt `cd`, `git -C`, an absolute-path write, or a child
+process. Use an OS/container sandbox or an externally launched restricted
+wrapper when syscall-level containment is required.
+
 ## Using `hermes -w` (Automatic Worktree Mode)
 
 Hermes has a built‑in `-w` flag that **automatically creates a disposable git worktree** with its own branch. You don't need to set up worktrees manually — just `cd` into your repo and run:
