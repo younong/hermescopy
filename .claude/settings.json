@@ -18,11 +18,7 @@
           },
           {
             "type": "command",
-            "command": "python",
-            "args": [
-              "-c",
-              "import os, runpy; runpy.run_path(os.path.join(os.environ['CLAUDE_PROJECT_DIR'], '.claude', 'hooks', 'require-development-worktree.py'), run_name='__main__')"
-            ],
+            "command": "python3 \"$CLAUDE_PROJECT_DIR/.claude/hooks/require-development-worktree.py\" || python \"$CLAUDE_PROJECT_DIR/.claude/hooks/require-development-worktree.py\"",
             "timeout": 5,
             "statusMessage": "Restoring worktree task ownership"
           }
@@ -34,11 +30,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python",
-            "args": [
-              "-c",
-              "import os, runpy; runpy.run_path(os.path.join(os.environ['CLAUDE_PROJECT_DIR'], '.claude', 'hooks', 'require-development-worktree.py'), run_name='__main__')"
-            ],
+            "command": "python3 \"$CLAUDE_PROJECT_DIR/.claude/hooks/require-development-worktree.py\" || python \"$CLAUDE_PROJECT_DIR/.claude/hooks/require-development-worktree.py\"",
             "timeout": 5,
             "statusMessage": "Restoring worktree task ownership"
           }
@@ -50,11 +42,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python",
-            "args": [
-              "-c",
-              "import os, runpy; runpy.run_path(os.path.join(os.environ['CLAUDE_PROJECT_DIR'], '.claude', 'hooks', 'require-development-worktree.py'), run_name='__main__')"
-            ],
+            "command": "python3 \"$CLAUDE_PROJECT_DIR/.claude/hooks/require-development-worktree.py\" || python \"$CLAUDE_PROJECT_DIR/.claude/hooks/require-development-worktree.py\"",
             "timeout": 5,
             "statusMessage": "Checking worktree task ownership"
           }
@@ -67,7 +55,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 \"$CLAUDE_PROJECT_DIR/.claude/hooks/block-review-agents.py\"",
+            "command": "python3 \"$CLAUDE_PROJECT_DIR/.claude/hooks/block-review-agents.py\" || python \"$CLAUDE_PROJECT_DIR/.claude/hooks/block-review-agents.py\"",
             "timeout": 5,
             "statusMessage": "Enforcing bounded review policy"
           }
@@ -78,11 +66,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python",
-            "args": [
-              "-c",
-              "import os, runpy; runpy.run_path(os.path.join(os.environ['CLAUDE_PROJECT_DIR'], '.claude', 'hooks', 'require-development-worktree.py'), run_name='__main__')"
-            ],
+            "command": "python3 \"$CLAUDE_PROJECT_DIR/.claude/hooks/require-development-worktree.py\" || python \"$CLAUDE_PROJECT_DIR/.claude/hooks/require-development-worktree.py\"",
             "timeout": 5,
             "statusMessage": "Enforcing worktree task ownership"
           }
@@ -95,11 +79,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python",
-            "args": [
-              "-c",
-              "import os, runpy; runpy.run_path(os.path.join(os.environ['CLAUDE_PROJECT_DIR'], '.claude', 'hooks', 'require-development-worktree.py'), run_name='__main__')"
-            ],
+            "command": "python3 \"$CLAUDE_PROJECT_DIR/.claude/hooks/require-development-worktree.py\" || python \"$CLAUDE_PROJECT_DIR/.claude/hooks/require-development-worktree.py\"",
             "timeout": 5,
             "statusMessage": "Registering worktree task ownership"
           }
