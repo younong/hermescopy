@@ -19,38 +19,27 @@ import {
   useNavigate,
 } from "react-router-dom";
 import {
-  Activity,
   BarChart3,
   BookOpen,
   Clock,
-  Code,
   Cpu,
-  Database,
   Download,
-  Eye,
-  FolderOpen,
   FileText,
-  Globe,
-  Heart,
+  FolderOpen,
   KeyRound,
   Menu,
   MessageSquare,
   Package,
-  PanelsTopLeft,
   PanelLeftClose,
   PanelLeftOpen,
   Plug,
   Puzzle,
   Radio,
   Settings,
-  Shield,
   ShieldCheck,
   Sparkles,
-  Star,
-  Terminal,
   Wrench,
   X,
-  Zap,
 } from "lucide-react";
 import { Button } from "@nous-research/ui/ui/components/button";
 import { SelectionSwitcher } from "@nous-research/ui/ui/components/selection-switcher";
@@ -84,7 +73,7 @@ import { LanguageSwitcher } from "@/components/LanguageSwitcher";
 import { ThemeSwitcher } from "@/components/ThemeSwitcher";
 import { useI18n } from "@/i18n";
 import type { Translations } from "@/i18n/types";
-import { PluginPage, PluginSlot, usePlugins } from "@/plugins";
+import { PluginPage, PluginSlot, resolvePluginIcon, usePlugins } from "@/plugins";
 import type { PluginManifest } from "@/plugins";
 import { useTheme } from "@/themes";
 import { api } from "@/lib/api";
@@ -164,36 +153,6 @@ const BUILTIN_NAV_REST: NavItem[] = [
   },
 ];
 
-const ICON_MAP: Record<string, ComponentType<{ className?: string }>> = {
-  Activity,
-  BarChart3,
-  Clock,
-  Cpu,
-  FileText,
-  FolderOpen,
-  KeyRound,
-  MessageSquare,
-  Package,
-  PanelsTopLeft,
-  Settings,
-  Puzzle,
-  Sparkles,
-  Terminal,
-  Globe,
-  Database,
-  Shield,
-  Wrench,
-  Zap,
-  Heart,
-  Star,
-  Code,
-  Eye,
-};
-
-function resolveIcon(name: string): ComponentType<{ className?: string }> {
-  return ICON_MAP[name] ?? Puzzle;
-}
-
 function buildNavItems(
   builtIn: NavItem[],
   manifests: PluginManifest[],
@@ -201,13 +160,14 @@ function buildNavItems(
   const items = [...builtIn];
 
   for (const manifest of manifests) {
+    if (!manifest.tab) continue;
     if (manifest.tab.override) continue;
     if (manifest.tab.hidden) continue;
 
     const pluginItem: NavItem = {
       path: manifest.tab.path,
       label: manifest.label,
-      icon: resolveIcon(manifest.icon),
+      icon: resolvePluginIcon(manifest.icon),
     };
 
     const pos = manifest.tab.position ?? "end";
@@ -257,6 +217,7 @@ function buildRoutes(
   const addons: PluginManifest[] = [];
 
   for (const m of manifests) {
+    if (!m.tab) continue;
     if (m.tab.override) {
       byOverride.set(m.tab.override, m);
     } else {
@@ -284,6 +245,7 @@ function buildRoutes(
   }
 
   for (const m of addons) {
+    if (!m.tab) continue;
     if (m.tab.hidden) continue;
     if (m.tab.path === "/plugins") continue;
     if (builtinRoutes[m.tab.path]) continue;
@@ -295,6 +257,7 @@ function buildRoutes(
   }
 
   for (const m of manifests) {
+    if (!m.tab) continue;
     if (!m.tab.hidden) continue;
     if (m.tab.path === "/plugins") continue;
     if (builtinRoutes[m.tab.path] || m.tab.override) continue;
@@ -376,16 +339,17 @@ export default function App() {
     () => buildRoutes(builtinRoutes, manifests),
     [builtinRoutes, manifests],
   );
-  const pluginTabMeta = useMemo(
-    () =>
-      manifests
-        .filter((m) => !m.tab.hidden)
-        .map((m) => ({
-          path: m.tab.override ?? m.tab.path,
-          label: m.label,
-        })),
-    [manifests],
-  );
+  const pluginTabMeta = useMemo(() => {
+    const tabs: Array<{ path: string; label: string }> = [];
+    for (const manifest of manifests) {
+      if (!manifest.tab || manifest.tab.hidden) continue;
+      tabs.push({
+        path: manifest.tab.override ?? manifest.tab.path,
+        label: manifest.label,
+      });
+    }
+    return tabs;
+  }, [manifests]);
 
   const layoutVariant = theme.layoutVariant ?? "standard";
 

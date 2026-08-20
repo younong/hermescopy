@@ -5,6 +5,7 @@ import { ForcedPasswordChangePage } from "@/components/ForcedPasswordChangePage"
 import { SystemActionsProvider } from "@/contexts/SystemActions";
 import { useDashboardAuthIdentity } from "@/lib/useDashboardAuthIdentity";
 import GuiChatPage from "@/pages/GuiChatPage";
+import { PluginProvider } from "@/plugins";
 
 export default function AuthenticatedApp() {
   const authIdentity = useDashboardAuthIdentity();
@@ -39,18 +40,22 @@ export default function AuthenticatedApp() {
 
   if (authIdentity.authRequired && authIdentity.authMe?.role === "member") {
     return (
-      <SystemActionsProvider>
-        <Routes>
-          <Route path="/chat/*" element={<GuiChatPage />} />
-          <Route path="*" element={<Navigate to="/chat" replace />} />
-        </Routes>
-      </SystemActionsProvider>
+      <PluginProvider mode="member">
+        <SystemActionsProvider>
+          <Routes>
+            <Route path="/chat/*" element={<GuiChatPage />} />
+            <Route path="*" element={<Navigate to="/chat" replace />} />
+          </Routes>
+        </SystemActionsProvider>
+      </PluginProvider>
     );
   }
 
   return (
-    <SystemActionsProvider>
-      <App />
-    </SystemActionsProvider>
+    <PluginProvider mode="admin">
+      <SystemActionsProvider>
+        <App />
+      </SystemActionsProvider>
+    </PluginProvider>
   );
 }

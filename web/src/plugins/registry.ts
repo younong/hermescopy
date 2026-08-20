@@ -17,6 +17,29 @@ import React, {
   useContext,
   createContext,
 } from "react";
+import { createPortal } from "react-dom";
+import {
+  AlertTriangle,
+  Archive,
+  CheckSquare2,
+  ChevronDown,
+  CirclePlus,
+  Download,
+  GripVertical,
+  MessageSquareText,
+  Network,
+  Paperclip,
+  Pencil,
+  Plus,
+  RefreshCw,
+  Search,
+  Settings2,
+  Trash2,
+  Upload,
+  WandSparkles,
+  X,
+  Zap,
+} from "lucide-react";
 import { api, fetchJSON, authedFetch, buildWsUrl, buildWsAuthParam } from "@/lib/api";
 import { cn, timeAgo, isoTimeAgo } from "@/lib/utils";
 import { Badge } from "@nous-research/ui/ui/components/badge";
@@ -43,6 +66,7 @@ import { useConfirmDelete } from "@nous-research/ui/hooks/use-confirm-delete";
 import { useToast } from "@nous-research/ui/hooks/use-toast";
 import { usePageHeader } from "@/contexts/usePageHeader";
 import { useI18n } from "@/i18n";
+import { Markdown } from "@/components/Markdown";
 import { registerSlot, PluginSlot } from "./slots";
 
 // ---------------------------------------------------------------------------
@@ -52,10 +76,13 @@ import { registerSlot, PluginSlot } from "./slots";
 type RegistryListener = () => void;
 
 const _registered: Map<string, React.ComponentType> = new Map();
+const _registeredWorkspaces: Map<string, React.ComponentType> = new Map();
 const _loadErrors: Map<string, string> = new Map();
 const _listeners: Set<RegistryListener> = new Set();
+let _registryRevision = 0;
 
 function _notify() {
+  _registryRevision += 1;
   for (const fn of _listeners) {
     try { fn(); } catch { /* ignore */ }
   }
@@ -68,13 +95,40 @@ function registerPlugin(name: string, component: React.ComponentType) {
   _notify();
 }
 
+/** Register a Chat workspace component declared by a plugin manifest. */
+function registerPluginWorkspace(
+  pluginName: string,
+  workspaceId: string,
+  component: React.ComponentType,
+) {
+  _loadErrors.delete(pluginName);
+  _registeredWorkspaces.set(workspaceKey(pluginName, workspaceId), component);
+  _notify();
+}
+
 /** Get a registered component by plugin name. */
 export function getPluginComponent(name: string): React.ComponentType | undefined {
   return _registered.get(name);
 }
 
+/** Get a registered Chat workspace component. */
+export function getPluginWorkspaceComponent(
+  pluginName: string,
+  workspaceId: string,
+): React.ComponentType | undefined {
+  return _registeredWorkspaces.get(workspaceKey(pluginName, workspaceId));
+}
+
+function workspaceKey(pluginName: string, workspaceId: string): string {
+  return `${pluginName}:${workspaceId}`;
+}
+
 export function getPluginLoadError(name: string): string | undefined {
   return _loadErrors.get(name);
+}
+
+export function getPluginRegistryRevision(): number {
+  return _registryRevision;
 }
 
 export function setPluginLoadError(name: string, message: string) {
@@ -113,6 +167,7 @@ export const SDK_CONTRACT_VERSION = "1.2.0";
 export function exposePluginSDK() {
   window.__HERMES_PLUGINS__ = {
     register: registerPlugin,
+    registerWorkspace: registerPluginWorkspace,
     registerSlot,
   };
 
@@ -122,6 +177,7 @@ export function exposePluginSDK() {
     sdkVersion: SDK_CONTRACT_VERSION,
     // React core — plugins use these instead of importing react
     React,
+    reactDom: { createPortal },
     hooks: {
       useState,
       useEffect,
@@ -143,7 +199,7 @@ export function exposePluginSDK() {
     // Build a ws(s):// URL with the correct auth param for the active mode
     // (single-use ticket in gated mode, token in loopback). Use this for any
     // plugin WebSocket instead of hand-assembling the URL.
-    buildWsUrl,
+    buildWsUrl: (path, params, options) => buildWsUrl(path, params, undefined, options?.signal),
     // Lower-level: resolve just the [authParamName, authParamValue] pair, for
     // plugins that need to build the WS URL themselves.
     buildWsAuthParam,
@@ -175,6 +231,30 @@ export function exposePluginSDK() {
       TabsList,
       TabsTrigger,
       Toast,
+      Markdown,
+    },
+
+    icons: {
+      AlertTriangle,
+      Archive,
+      CheckSquare2,
+      ChevronDown,
+      CirclePlus,
+      Download,
+      GripVertical,
+      MessageSquareText,
+      Network,
+      Paperclip,
+      Pencil,
+      Plus,
+      RefreshCw,
+      Search,
+      Settings2,
+      Trash2,
+      Upload,
+      WandSparkles,
+      X,
+      Zap,
     },
 
     // Utilities

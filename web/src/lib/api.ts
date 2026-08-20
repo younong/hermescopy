@@ -2702,15 +2702,27 @@ export interface PluginManifestResponse {
   description: string;
   icon: string;
   version: string;
-  tab: {
+  tab?: {
     path: string;
     position?: string;
     override?: string;
     hidden?: boolean;
   };
+  chat?: {
+    workspaces: Array<{
+      id: string;
+      path: string;
+      label: string;
+      description: string;
+      icon: string;
+      position: string | number;
+      admin_only: boolean;
+    }>;
+  };
   slots?: string[];
   entry: string;
   css?: string | null;
+  integrity?: string;
   has_api: boolean;
   source: string;
 }

@@ -61,6 +61,32 @@ router = APIRouter()
 # existing plugin-bypass; this is documented above).
 # ---------------------------------------------------------------------------
 
+def _plugin_is_active() -> bool:
+    """Apply the dashboard's runtime activation policy to WebSockets too."""
+    try:
+        from hermes_cli import web_server
+        from hermes_cli.plugins_cmd import _get_disabled_set, _get_enabled_set
+
+        discover = getattr(web_server, "_get_dashboard_plugins", None)
+        if not callable(discover):
+            return True
+        plugin = next(
+            (item for item in discover() if item.get("name") == "kanban"),
+            None,
+        )
+        if plugin is None:
+            return False
+        disabled = _get_disabled_set()
+        if "kanban" in disabled:
+            return False
+        return plugin.get("source") != "user" or "kanban" in _get_enabled_set()
+    except ImportError:
+        # Bare plugin tests do not mount the dashboard runtime policy.
+        return True
+    except Exception:
+        return False
+
+
 def _ws_upgrade_authorized(ws: "WebSocket") -> bool:
     """Authorize a WebSocket upgrade by delegating to the dashboard's canonical
     WS auth gate (``hermes_cli.web_server._ws_auth_ok``).
@@ -2383,7 +2409,7 @@ async def stream_events(ws: WebSocket):
     # single-use ticket / server-internal credential). Browsers can't set
     # Authorization on a WS upgrade, so the credential rides in the query
     # string — the browser SDK's buildWsUrl() assembles it.
-    if not _ws_upgrade_authorized(ws):
+    if not _plugin_is_active() or not _ws_upgrade_authorized(ws):
         await ws.close(code=http_status.WS_1008_POLICY_VIOLATION)
         return
     await ws.accept()
@@ -2402,7 +2428,8 @@ async def stream_events(ws: WebSocket):
         try:
             ws_board = kanban_db._normalize_board_slug(ws_board_raw) if ws_board_raw else None
         except ValueError:
-            ws_board = None
+            await ws.close(code=http_status.WS_1008_POLICY_VIOLATION)
+            return
 
         def _fetch_new(cursor_val: int) -> tuple[int, list[dict]]:
             conn = kanban_db.connect(board=ws_board)

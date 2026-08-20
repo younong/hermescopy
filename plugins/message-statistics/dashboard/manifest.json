@@ -1,0 +1,22 @@
+{
+  "name": "message-statistics",
+  "label": "Message statistics",
+  "description": "Message totals, source mix, and session composition for Chat",
+  "icon": "PieChart",
+  "version": "1.0.0",
+  "entry": "dist/index.js",
+  "css": "dist/style.css",
+  "chat": {
+    "workspaces": [
+      {
+        "id": "statistics",
+        "path": "/chat/statistics",
+        "label": "Statistics",
+        "description": "Message totals and composition",
+        "icon": "PieChart",
+        "position": "after:contacts",
+        "admin_only": false
+      }
+    ]
+  }
+}

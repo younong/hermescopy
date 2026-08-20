@@ -917,6 +917,7 @@ def test_ws_events_swallows_cancellation_on_shutdown(tmp_path, monkeypatch):
     # Short-circuit the auth check — this test is about the cancellation
     # path, not auth.
     import plugins.kanban.dashboard.plugin_api as pa
+    monkeypatch.setattr(pa, "_plugin_is_active", lambda: True)
     monkeypatch.setattr(pa, "_ws_upgrade_authorized", lambda ws: True)
 
     class _FakeWS:
@@ -953,6 +954,33 @@ def test_ws_events_swallows_cancellation_on_shutdown(tmp_path, monkeypatch):
     # The bug symptom was a traceback; we don't assert on stderr because
     # capturing asyncio's internal "exception was never retrieved" logging
     # is flaky. The assertion that matters is: no CancelledError escaped.
+
+
+def test_ws_events_rejects_invalid_board(tmp_path, monkeypatch):
+    import asyncio
+    import plugins.kanban.dashboard.plugin_api as pa
+
+    monkeypatch.setattr(pa, "_plugin_is_active", lambda: True)
+    monkeypatch.setattr(pa, "_ws_upgrade_authorized", lambda ws: True)
+
+    class _FakeWS:
+        query_params = {"board": "../outside", "since": "0"}
+
+        def __init__(self):
+            self.accepted = False
+            self.close_code = None
+
+        async def accept(self):
+            self.accepted = True
+
+        async def close(self, code=None):
+            self.close_code = code
+
+    ws = _FakeWS()
+    asyncio.run(pa.stream_events(ws))
+
+    assert ws.accepted is True
+    assert ws.close_code == 1008
 
 
 # ---------------------------------------------------------------------------

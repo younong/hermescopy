@@ -7,6 +7,8 @@ graft locales
 # built from the sdist (e.g. Homebrew, downstream packagers). package-data
 # below covers the wheel; this covers the sdist. See #34034 / #28149.
 recursive-include plugins plugin.yaml plugin.yml
-recursive-include plugins */dashboard/manifest.json */dashboard/plugin_api.py */dashboard/dist/*
+# Dashboard plugin bundles are prebuilt before creating the sdist. Shipping
+# manifest + dist keeps downstream source installs Node-free.
+recursive-include plugins */dashboard/manifest.json */dashboard/plugin_api.py */dashboard/dist/* memory/*/dashboard/manifest.json memory/*/dashboard/dist/*
 global-exclude __pycache__
 global-exclude *.py[cod]

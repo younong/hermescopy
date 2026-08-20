@@ -1,8 +1,21 @@
+import json
 from pathlib import Path
 from unittest.mock import patch
 
-from hermes_cli.dashboard_owner_payloads import active_dashboard_plugin_payload
-from hermes_cli.dashboard_plugins import discover_dashboard_plugins
+import pytest
+
+from hermes_cli.dashboard_owner_payloads import (
+    active_dashboard_plugin_payload,
+    discover_dashboard_plugins,
+    normalize_dashboard_plugin_manifest,
+)
+
+
+def _write_manifest(root: Path, directory: str, manifest: dict) -> Path:
+    dashboard_dir = root / directory / "dashboard"
+    dashboard_dir.mkdir(parents=True)
+    (dashboard_dir / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+    return dashboard_dir
 
 
 def _plugin(dashboard_dir: Path, name: str, **overrides):
@@ -15,6 +28,198 @@ def _plugin(dashboard_dir: Path, name: str, **overrides):
     }
     plugin.update(overrides)
     return plugin
+
+
+def test_manifest_normalizer_preserves_legacy_tab_defaults(tmp_path):
+    plugin = normalize_dashboard_plugin_manifest(
+        {"name": "legacy", "tab": {}},
+        default_name="fallback",
+        dashboard_dir=tmp_path / "dashboard",
+        source="bundled",
+    )
+
+    assert plugin["tab"] == {"path": "/legacy", "position": "end"}
+    assert "chat" not in plugin
+
+
+@pytest.mark.parametrize(
+    ("tab", "message"),
+    [
+        ({"path": "settings"}, "absolute normalized route"),
+        ({"path": "/settings/"}, "absolute normalized route"),
+        ({"path": "/settings", "position": 1}, "non-empty string"),
+        ({"path": "/settings", "position": "start"}, "tab.position"),
+        ({"path": "/settings", "override": "settings"}, "absolute normalized route"),
+        ({"path": "/settings", "hidden": "yes"}, "boolean"),
+    ],
+)
+def test_manifest_normalizer_rejects_malformed_tabs(tmp_path, tab, message):
+    with pytest.raises(ValueError, match=message):
+        normalize_dashboard_plugin_manifest(
+            {"name": "bad", "tab": tab},
+            default_name="bad",
+            dashboard_dir=tmp_path / "dashboard",
+            source="user",
+        )
+
+
+def test_manifest_normalizer_accepts_chat_workspaces_without_dashboard_tab(tmp_path):
+    dashboard_dir = tmp_path / "dashboard"
+    plugin = normalize_dashboard_plugin_manifest(
+        {
+            "name": "chat-tools",
+            "label": "Chat tools",
+            "entry": "dist/index.js",
+            "chat": {
+                "workspaces": [
+                    {
+                        "id": "kanban",
+                        "path": "/chat/kanban",
+                        "label": "Board",
+                        "description": "Plan collaborative work",
+                        "icon": "SquareKanban",
+                        "position": 0,
+                    },
+                    {
+                        "id": "statistics",
+                        "path": "/chat/statistics",
+                        "position": "after:kanban",
+                    },
+                ],
+            },
+        },
+        default_name="fallback",
+        dashboard_dir=dashboard_dir,
+        source="bundled",
+    )
+
+    assert "tab" not in plugin
+    assert plugin["chat"] == {
+        "workspaces": [
+            {
+                "id": "kanban",
+                "path": "/chat/kanban",
+                "label": "Board",
+                "description": "Plan collaborative work",
+                "icon": "SquareKanban",
+                "position": 0,
+                "admin_only": False,
+            },
+            {
+                "id": "statistics",
+                "path": "/chat/statistics",
+                "label": "statistics",
+                "description": "",
+                "icon": "Puzzle",
+                "position": "after:kanban",
+                "admin_only": False,
+            },
+        ],
+    }
+
+
+@pytest.mark.parametrize(
+    ("workspaces", "message"),
+    [
+        ([], "non-empty list"),
+        ([{"id": "Bad Id", "path": "/chat/bad"}], "lowercase letters"),
+        ([{"id": "bad-path", "path": "/settings"}], "under /chat"),
+        ([{"id": "bad-position", "path": "/chat/bad-position", "position": "start"}], "position must be"),
+        ([{"id": "bad-position", "path": "/chat/bad-position", "position": -1}], "non-negative"),
+        ([{"id": "self", "path": "/chat/self", "position": "after:self"}], "position must be"),
+        (
+            [
+                {"id": "same", "path": "/chat/one"},
+                {"id": "same", "path": "/chat/two"},
+            ],
+            "duplicate ids",
+        ),
+        (
+            [
+                {"id": "one", "path": "/chat/same"},
+                {"id": "two", "path": "/chat/same"},
+            ],
+            "duplicate paths",
+        ),
+    ],
+)
+def test_manifest_normalizer_rejects_malformed_or_duplicate_workspaces(
+    tmp_path, workspaces, message
+):
+    with pytest.raises(ValueError, match=message):
+        normalize_dashboard_plugin_manifest(
+            {"name": "bad", "chat": {"workspaces": workspaces}},
+            default_name="bad",
+            dashboard_dir=tmp_path / "dashboard",
+            source="user",
+        )
+
+
+def test_owner_discovery_rejects_entire_malformed_manifest_deterministically(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.delenv("HERMES_ENABLE_PROJECT_PLUGINS", raising=False)
+    _write_manifest(
+        tmp_path / "plugins",
+        "a-invalid",
+        {
+            "name": "a-invalid",
+            "entry": "dist/index.js",
+            "chat": {
+                "workspaces": [
+                    {"id": "duplicate", "path": "/chat/one"},
+                    {"id": "duplicate", "path": "/chat/two"},
+                ]
+            },
+        },
+    )
+    valid_dir = _write_manifest(
+        tmp_path / "plugins",
+        "b-valid",
+        {
+            "name": "b-valid",
+            "entry": "dist/index.js",
+            "chat": {"workspaces": [{"id": "board", "path": "/chat/board"}]},
+        },
+    )
+
+    with patch("hermes_cli.plugins.get_bundled_plugins_dir", return_value=tmp_path / "bundled"):
+        plugins = discover_dashboard_plugins()
+
+    assert [plugin["name"] for plugin in plugins] == ["b-valid"]
+    assert plugins[0]["_dir"] == str(valid_dir)
+    assert "tab" not in plugins[0]
+
+
+def test_manifest_without_tab_or_chat_workspace_is_rejected(tmp_path):
+    with pytest.raises(ValueError, match="must declare tab or chat.workspaces"):
+        normalize_dashboard_plugin_manifest(
+            {"name": "asset-only"},
+            default_name="asset-only",
+            dashboard_dir=tmp_path / "dashboard",
+            source="user",
+        )
+
+
+def test_discovery_keeps_first_plugin_name_by_sorted_source_precedence(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.delenv("HERMES_ENABLE_PROJECT_PLUGINS", raising=False)
+    first_dir = _write_manifest(
+        tmp_path / "plugins",
+        "a-first",
+        {"name": "duplicate", "tab": {"path": "/first"}, "entry": "dist/index.js"},
+    )
+    _write_manifest(
+        tmp_path / "plugins",
+        "z-second",
+        {"name": "duplicate", "tab": {"path": "/second"}, "entry": "dist/index.js"},
+    )
+
+    with patch("hermes_cli.plugins.get_bundled_plugins_dir", return_value=tmp_path / "bundled"):
+        plugins = discover_dashboard_plugins()
+
+    duplicate = next(plugin for plugin in plugins if plugin["name"] == "duplicate")
+    assert duplicate["tab"]["path"] == "/first"
+    assert duplicate["_dir"] == str(first_dir)
 
 
 def test_active_dashboard_plugins_require_declared_assets(tmp_path):

@@ -2,7 +2,12 @@
   "extends": "./tsconfig.app.json",
   "compilerOptions": {
     "rootDir": "..",
+    "jsx": "react",
     "tsBuildInfoFile": "./node_modules/.tmp/tsconfig.plugins.tsbuildinfo"
   },
-  "include": ["../plugins/*/dashboard/src/**/*", "src/plugins/sdk.d.ts"]
+  "include": [
+    "src/plugins/sdk.d.ts",
+    "../plugins/*/dashboard/src/**/*",
+    "../plugins/memory/*/dashboard/src"
+  ]
 }
