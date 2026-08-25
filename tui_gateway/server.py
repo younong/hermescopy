@@ -1073,8 +1073,16 @@ def write_json(obj: dict) -> bool:
     """Emit one JSON frame through a session or request-bound transport."""
     if obj.get("method") == "event":
         sid = ((obj.get("params") or {}).get("session_id")) or ""
-        if sid and (t := (_sessions.get(sid) or {}).get("transport")) is not None:
-            return t.write(obj)
+        if sid:
+            with _sessions_lock:
+                session = _sessions.get(sid)
+                transport = (session or {}).get("transport")
+            # Delayed worker callbacks can outlive the browser transport. Never
+            # fall back to an ambient request transport: a stale event must not
+            # be delivered to an unrelated peer.
+            if transport is None:
+                return False
+            return transport.write(obj)
 
     transport = current_transport()
     if transport is None:
