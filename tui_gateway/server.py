@@ -5975,13 +5975,21 @@ def _resolve_checkpoint_hash(mgr, cwd: str, ref: str) -> str:
     raise ValueError(f"Invalid checkpoint number. Use 1-{len(checkpoints)}.")
 
 
+class _AttachedAttachmentError(RuntimeError):
+    """Raised when an attachment cannot be delivered to the model."""
+
+
+class _AttachedImageError(_AttachedAttachmentError):
+    """Raised when an attached image cannot be delivered to vision processing."""
+
+
 def _model_visible_image_path(path: Path) -> str:
     visible = _authenticated_visible_path(path)
     return f"/workspace/{visible}" if visible is not None else str(path)
 
 
 def _enrich_with_attached_images(user_text: str, image_paths: list[str]) -> str:
-    """Pre-analyze attached images via vision and prepend descriptions to user text."""
+    """Pre-analyze attached images, failing closed if any image is unavailable."""
     import asyncio, json as _json
     from tools.vision_tools import vision_analyze_tool
 
@@ -5994,22 +6002,29 @@ def _enrich_with_attached_images(user_text: str, image_paths: list[str]) -> str:
     parts: list[str] = []
     for path in image_paths:
         p = Path(path)
-        if not p.exists():
-            continue
+        if not p.exists() or not p.is_file():
+            logger.warning("attached image is unavailable: %s", path)
+            raise _AttachedImageError(
+                "Attached image is unavailable; please upload it again."
+            )
         hint_path = _model_visible_image_path(p)
         hint = f"[You can examine it with vision_analyze using image_url: {hint_path}]"
         try:
             r = _json.loads(
                 asyncio.run(vision_analyze_tool(image_url=str(p), user_prompt=prompt))
             )
-            desc = r.get("analysis", "") if r.get("success") else None
-            parts.append(
-                f"[The user attached an image:\n{desc}]\n{hint}"
-                if desc
-                else f"[The user attached an image but analysis failed.]\n{hint}"
-            )
         except Exception:
-            parts.append(f"[The user attached an image but analysis failed.]\n{hint}")
+            logger.exception("attached image vision analysis failed: %s", path)
+            raise _AttachedImageError(
+                "Attached image could not be analyzed; please retry."
+            ) from None
+        desc = r.get("analysis", "") if r.get("success") else ""
+        if not isinstance(desc, str) or not desc.strip():
+            logger.warning("attached image vision analysis returned no result: %s", path)
+            raise _AttachedImageError(
+                "Attached image could not be analyzed; please retry."
+            )
+        parts.append(f"[The user attached an image:\n{desc}]\n{hint}")
 
     text = user_text or ""
     prefix = "\n\n".join(parts)
@@ -11684,6 +11699,24 @@ def _run_prompt_submit(
             streamer = make_stream_renderer(cols)
             prompt = text
 
+            file_attachments = [
+                attachment
+                for attachment in attachments
+                if isinstance(attachment, dict)
+                and attachment.get("kind") == "file"
+            ]
+            file_refs = [
+                str(attachment.get("ref_text") or "")
+                for attachment in file_attachments
+            ]
+            if file_attachments and (
+                not isinstance(prompt, str)
+                or any(not ref or ref not in prompt for ref in file_refs)
+            ):
+                raise _AttachedAttachmentError(
+                    "File attachment could not be delivered; please retry."
+                )
+
             if isinstance(prompt, str) and "@" in prompt:
                 from agent.context_references import preprocess_context_references
                 from agent.model_metadata import get_model_context_length
@@ -11722,6 +11755,10 @@ def _run_prompt_submit(
                     summarize_chunk=reference_summarizer,
                 )
                 if ctx.blocked:
+                    if attachments:
+                        raise _AttachedAttachmentError(
+                            "File attachment could not be delivered; please retry."
+                        )
                     _emit(
                         "error",
                         sid,
@@ -11731,6 +11768,19 @@ def _run_prompt_submit(
                         },
                     )
                     return
+                attachment_refs = {
+                    str(attachment.get("ref_text") or "")
+                    for attachment in attachments
+                    if isinstance(attachment, dict) and attachment.get("ref_text")
+                }
+                if attachment_refs and any(
+                    ref in warning
+                    for ref in attachment_refs
+                    for warning in ctx.warnings
+                ):
+                    raise _AttachedAttachmentError(
+                        "File attachment could not be delivered; please retry."
+                    )
                 prompt = ctx.message
 
             # Decide image routing per-turn based on active provider/model.
@@ -11790,21 +11840,30 @@ def _run_prompt_submit(
                                 _model_visible_image_path(Path(path)) for path in images
                             ],
                         )
-                        if _skipped:
+                        _image_parts = [
+                            part for part in _parts if part.get("type") == "image_url"
+                        ]
+                        if _skipped or len(_image_parts) != len(images):
                             print(
-                                f"[tui_gateway] native image attachment skipped {len(_skipped)} unreadable path(s)",
+                                "[tui_gateway] native image attachment incomplete; "
+                                f"skipped={len(_skipped)} expected={len(images)} "
+                                f"attached={len(_image_parts)}",
                                 file=sys.stderr,
                             )
-                        if any(p.get("type") == "image_url" for p in _parts):
-                            run_message = _parts
-                        else:
-                            run_message = _enrich_with_attached_images(prompt, images)
+                            raise _AttachedImageError(
+                                "Image attachment could not be delivered; please retry."
+                            )
+                        run_message = _parts
+                    except _AttachedImageError:
+                        raise
                     except Exception as _img_exc:
                         print(
-                            f"[tui_gateway] native attach failed, falling back to text: {_img_exc}",
+                            f"[tui_gateway] native image attachment failed: {_img_exc}",
                             file=sys.stderr,
                         )
-                        run_message = _enrich_with_attached_images(prompt, images)
+                        raise _AttachedImageError(
+                            "Image attachment could not be delivered; please retry."
+                        ) from None
                 else:
                     run_message = _enrich_with_attached_images(prompt, images)
 
@@ -12085,6 +12144,21 @@ def _run_prompt_submit(
                     logger.warning("voice TTS skipped: hermes_cli.voice unavailable")
                 except Exception as e:
                     logger.warning("voice TTS dispatch failed: %s", e)
+        except _AttachedAttachmentError as e:
+            logger.warning("attachment turn rejected: %s", e)
+            raw = str(e)
+            _complete_prompt_turn_receipt(
+                session,
+                generation,
+                result_text=raw,
+                result_status="error",
+                strict=False,
+            )
+            _emit(
+                "message.complete",
+                sid,
+                {"text": raw, "usage": _get_usage(agent), "status": "error"},
+            )
         except Exception as e:
             import traceback
 
@@ -13233,16 +13307,50 @@ def _(rid, params: dict) -> dict:
                 },
             )
 
-        text = f"[User attached file: {drop_path}]" + (
-            f"\n{remainder}" if remainder else ""
+        if drop_path.suffix.lower() == ".pdf":
+            pdf_params = dict(params)
+            pdf_params["path"] = str(drop_path)
+            pdf_response = _methods["pdf.attach"](rid, pdf_params)
+            if "error" in pdf_response:
+                return pdf_response
+            pdf_result = pdf_response.get("result")
+            if isinstance(pdf_result, dict) and remainder:
+                pdf_result["text"] = f"{pdf_result.get('text', '')}\n{remainder}".strip()
+            return pdf_response
+
+        stored_path, uploaded = _stage_session_file_attachment(
+            session,
+            raw_path=str(drop_path),
+            data_url="",
+            name=drop_path.name,
         )
+        ref_path = _attachment_ref_path(session, stored_path)
+        ref_text = f"@file:{_format_ref_value(ref_path)}"
+        import mimetypes
+
+        _queue_attachment_metadata(
+            session,
+            {
+                "kind": "file",
+                "name": stored_path.name,
+                "mime_type": mimetypes.guess_type(stored_path.name)[0],
+                "size_bytes": stored_path.stat().st_size,
+                "path": str(stored_path),
+                "ref_text": ref_text,
+            },
+        )
+        text = ref_text + (f"\n{remainder}" if remainder else "")
         return _ok(
             rid,
             {
                 "matched": True,
                 "is_image": False,
-                "path": str(drop_path),
-                "name": drop_path.name,
+                "attach_method": "file.attach",
+                "path": ref_path,
+                "name": stored_path.name,
+                "ref_path": ref_path,
+                "ref_text": ref_text,
+                "uploaded": uploaded,
                 "text": text,
             },
         )
