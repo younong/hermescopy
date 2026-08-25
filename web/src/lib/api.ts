@@ -1582,6 +1582,7 @@ export interface EmployeePolicy extends EmployeePolicyDraft {
 export interface EmployeeCollaborationPolicy {
   may_participate: boolean;
   may_create_groups: boolean;
+  may_create_scheduled_tasks: boolean;
   invite_quota: number | null;
 }
 

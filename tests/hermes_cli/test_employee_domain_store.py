@@ -418,9 +418,11 @@ def test_employee_crud_profiles_policy_and_owner_security(store):
         employee_id=employee.employee_id,
         may_participate=False,
         may_create_groups=True,
+        may_create_scheduled_tasks=True,
         invite_quota=None,
     )
     assert policy.employee_id == employee.employee_id
+    assert policy.may_create_scheduled_tasks is True
     assert policy.invite_quota is None
 
     suspended = set_employee_status(

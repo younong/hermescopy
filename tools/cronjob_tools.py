@@ -589,6 +589,8 @@ def _format_job(job: Dict[str, Any]) -> Dict[str, Any]:
         "state": job.get("state", "scheduled" if job.get("enabled", True) else "paused"),
         "paused_at": job.get("paused_at"),
         "paused_reason": job.get("paused_reason"),
+        "employee_id": job.get("employee_id"),
+        "target_employee_ids": list(job.get("target_employee_ids") or []),
     }
     if job.get("script"):
         result["script"] = job["script"]
@@ -726,52 +728,33 @@ def cronjob(
                             success=False,
                         )
 
-            if target_employee_ids and collaboration_context is None:
-                return tool_error(
-                    "target_employee_ids require a trusted source employee context",
-                    success=False,
-                )
-            if target_employee_ids and collaboration_context is not None:
-                if getattr(collaboration_context, "role", "") != "source":
+            employee_scheduling_requested = bool(employee_id or target_employee_ids)
+            if employee_scheduling_requested:
+                if collaboration_context is None:
                     return tool_error(
-                        "scheduled employee tasks require a source employee context",
-                        success=False,
-                    )
-                if int(getattr(collaboration_context, "source_depth", 0)) != 0:
-                    return tool_error(
-                        "nested collaboration employees cannot create scheduled employee tasks",
-                        success=False,
-                    )
-                if not getattr(collaboration_context, "may_create_authorized", False):
-                    return tool_error(
-                        "employee is not authorized to create scheduled employee tasks",
-                        success=False,
-                    )
-                if getattr(collaboration_context, "source_task_id", None) is not None:
-                    return tool_error(
-                        "collaboration task employees cannot create scheduled employee tasks",
+                        "employee scheduled tasks require a trusted employee context",
                         success=False,
                     )
                 service = getattr(collaboration_context, "service", None)
-                if service is None:
+                creator_employee_id = str(
+                    getattr(collaboration_context, "creator_employee_id", "") or ""
+                ).strip()
+                if service is None or not creator_employee_id:
                     return tool_error(
                         "employee scheduling authority is unavailable",
                         success=False,
                     )
-                service.resolver.resolve_current(
-                    str(collaboration_context.creator_employee_id)
-                )
-                for target_id in target_employee_ids:
-                    resolved_target = service.resolver.resolve_current(str(target_id))
-                    if not resolved_target.may_participate:
-                        raise RuntimeError("target employee participation is revoked")
+                creator = service.resolver.resolve_current(creator_employee_id)
+                if not creator.may_create_scheduled_tasks:
+                    return tool_error(
+                        "employee is not authorized to create scheduled tasks",
+                        success=False,
+                    )
 
             cron_origin = _origin_from_env()
-            if target_employee_ids and collaboration_context is not None:
+            if employee_scheduling_requested:
                 cron_origin = dict(cron_origin or {})
-                cron_origin["creator_employee_id"] = str(
-                    collaboration_context.creator_employee_id
-                )
+                cron_origin["creator_employee_id"] = creator_employee_id
             job = create_job(
                 prompt=prompt or "",
                 schedule=schedule,
@@ -897,6 +880,10 @@ def cronjob(
 
         if normalized == "update":
             updates: Dict[str, Any] = {}
+            if employee_id is not None:
+                updates["employee_id"] = _normalize_optional_job_value(employee_id)
+            if target_employee_ids is not None:
+                updates["target_employee_ids"] = target_employee_ids or None
             if prompt is not None:
                 scan_error = _scan_cron_prompt(prompt)
                 if scan_error:
@@ -1010,7 +997,7 @@ def cronjob(
 
 CRONJOB_SCHEMA = {
     "name": "cronjob",
-    "description": """Manage scheduled cron jobs with a single compressed tool.
+    "description": """Manage scheduled tasks with a single compressed tool.
 
 Use action='create' to schedule a new job from a prompt or one or more skills.
 Use action='list' to inspect jobs.
@@ -1026,7 +1013,7 @@ NOTE: The agent's final response is auto-delivered to the target. Put the primar
 user-facing content in the final response. Cron jobs run autonomously with no user
 present — they cannot ask questions or request clarification.
 
-Important safety rule: cron-run sessions should not recursively schedule more cron jobs.""",
+Important safety rule: cron-run sessions should not recursively schedule more scheduled tasks.""",
     "parameters": {
         "type": "object",
         "properties": {
@@ -1106,7 +1093,7 @@ Important safety rule: cron-run sessions should not recursively schedule more cr
                 "description": (
                     "Optional job ID or list of job IDs whose most recent completed output is "
                     "injected into the prompt as context before each run. "
-                    "Use this to chain cron jobs: job A collects data, job B processes it. "
+                    "Use this to chain scheduled tasks: job A collects data, job B processes it. "
                     "Each entry must be a valid job ID (from cronjob action='list'). "
                     "Note: injects the most recent completed output — does not wait for "
                     "upstream jobs running in the same tick. "

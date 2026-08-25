@@ -226,7 +226,9 @@ def _normalize_employee_ids(value: Any) -> List[str]:
     """Normalize explicit employee targets while preserving their order."""
     if value is None:
         return []
-    raw_items = [value] if isinstance(value, str) else list(value)
+    raw_items = [value] if isinstance(value, str) else (
+        list(value) if isinstance(value, (list, tuple, set)) else [value]
+    )
     normalized: List[str] = []
     for item in raw_items:
         text = str(item or "").strip()

@@ -244,6 +244,10 @@ def create_job(
     allowed_workdir_root: Path | None = None,
 ) -> dict[str, Any]:
     store = _store(home)
+    if values.get("target_employee_ids"):
+        raise ValueError(
+            "target_employee_ids require a trusted employee scheduling context"
+        )
     normalized = _normalize_updates(
         values, store.owner_home, allowed_workdir_root=allowed_workdir_root
     )

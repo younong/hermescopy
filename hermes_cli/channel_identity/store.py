@@ -13,7 +13,7 @@ from typing import Iterator
 
 from .crypto import ChannelCrypto
 
-SCHEMA_VERSION = 17
+SCHEMA_VERSION = 18
 ACCOUNT_CREDENTIAL_AAD_TABLE = "ilink_accounts"
 EMPLOYEE_PROFILE_AAD_TABLE = "employee_profiles"
 _DB_FILENAME = "channel_identities.sqlite3"
@@ -157,6 +157,8 @@ CREATE TABLE IF NOT EXISTS employee_collaboration_policies (
         CHECK(may_participate IN (0, 1)),
     may_create_groups INTEGER NOT NULL DEFAULT 0
         CHECK(may_create_groups IN (0, 1)),
+    may_create_scheduled_tasks INTEGER NOT NULL DEFAULT 0
+        CHECK(may_create_scheduled_tasks IN (0, 1)),
     invite_quota INTEGER DEFAULT 5
         CHECK(invite_quota IS NULL OR invite_quota >= 0),
     updated_by_owner_key TEXT,
@@ -552,6 +554,9 @@ class ChannelIdentityStore:
                         elif version == 16:
                             self._migrate_v16_to_v17(conn)
                             version = 17
+                        elif version == 17:
+                            self._migrate_v17_to_v18(conn)
+                            version = 18
                         else:
                             raise RuntimeError(
                                 "channel identity database schema is older than supported"
@@ -1292,6 +1297,24 @@ class ChannelIdentityStore:
         )
         conn.execute(
             "UPDATE channel_identity_meta SET value='17' WHERE key='schema_version'"
+        )
+
+    @staticmethod
+    def _migrate_v17_to_v18(conn: sqlite3.Connection) -> None:
+        columns = {
+            row["name"]
+            for row in conn.execute(
+                "PRAGMA table_info(employee_collaboration_policies)"
+            )
+        }
+        if "may_create_scheduled_tasks" not in columns:
+            conn.execute(
+                "ALTER TABLE employee_collaboration_policies ADD COLUMN "
+                "may_create_scheduled_tasks INTEGER NOT NULL DEFAULT 0 "
+                "CHECK(may_create_scheduled_tasks IN (0, 1))"
+            )
+        conn.execute(
+            "UPDATE channel_identity_meta SET value='18' WHERE key='schema_version'"
         )
 
     @staticmethod

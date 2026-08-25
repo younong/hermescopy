@@ -65,6 +65,7 @@ class ResolvedCollaborationEmployee:
     employee_policy: dict[str, Any]
     may_participate: bool
     may_create_groups: bool = False
+    may_create_scheduled_tasks: bool = False
     may_manage_employees: bool = False
     invite_quota: int | None = 5
 
@@ -275,6 +276,7 @@ class CollaborationEmployeeResolver:
             employee_policy=policy,
             may_participate=True,
             may_create_groups=True,
+            may_create_scheduled_tasks=True,
             may_manage_employees=True,
             invite_quota=None,
         )
@@ -312,6 +314,7 @@ class CollaborationEmployeeResolver:
             employee_policy=employee_policy,
             may_participate=managed.collaboration_policy.may_participate,
             may_create_groups=managed.collaboration_policy.may_create_groups,
+            may_create_scheduled_tasks=managed.collaboration_policy.may_create_scheduled_tasks,
             may_manage_employees=False,
             invite_quota=managed.collaboration_policy.invite_quota,
         )

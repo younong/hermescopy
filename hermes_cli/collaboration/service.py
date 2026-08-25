@@ -597,7 +597,6 @@ class CollaborationService:
         task = self.store.ai_task(task_id)
         if str(task.get("source_kind") or "") != "cron":
             raise RuntimeError("cron task source is invalid")
-        self._recheck_creator_authorization(task)
         result, changed = self.store.complete_ai_task(
             task_id,
             summary=summary,

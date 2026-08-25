@@ -1,6 +1,8 @@
 """Tests for tools/cronjob_tools.py — prompt scanning, schedule/list/remove dispatchers."""
 
 import json
+from types import SimpleNamespace
+
 import pytest
 
 from tools.cronjob_tools import (
@@ -246,6 +248,50 @@ class TestUnifiedCronjobTool:
         monkeypatch.setattr("cron.jobs.CRON_DIR", tmp_path / "cron")
         monkeypatch.setattr("cron.jobs.JOBS_FILE", tmp_path / "cron" / "jobs.json")
         monkeypatch.setattr("cron.jobs.OUTPUT_DIR", tmp_path / "cron" / "output")
+
+    def test_employee_scheduled_task_requires_permission(self, monkeypatch):
+        resolver = SimpleNamespace(
+            resolve_current=lambda _employee_id: SimpleNamespace(
+                may_create_scheduled_tasks=False
+            )
+        )
+        context = SimpleNamespace(
+            service=SimpleNamespace(resolver=resolver),
+            creator_employee_id="employee-a",
+        )
+        result = json.loads(
+            cronjob(
+                action="create",
+                prompt="Check server status",
+                schedule="every 1h",
+                employee_id="employee-a",
+                collaboration_context=context,
+            )
+        )
+        assert result["success"] is False
+        assert "not authorized" in result["error"]
+
+    def test_employee_scheduled_task_uses_dedicated_permission(self):
+        resolver = SimpleNamespace(
+            resolve_current=lambda _employee_id: SimpleNamespace(
+                may_create_scheduled_tasks=True
+            )
+        )
+        context = SimpleNamespace(
+            service=SimpleNamespace(resolver=resolver),
+            creator_employee_id="employee-a",
+        )
+        created = json.loads(
+            cronjob(
+                action="create",
+                prompt="Check server status",
+                schedule="every 1h",
+                employee_id="employee-a",
+                collaboration_context=context,
+            )
+        )
+        assert created["success"] is True
+        assert created["job"]["employee_id"] == "employee-a"
 
     def test_create_and_list(self):
         created = json.loads(

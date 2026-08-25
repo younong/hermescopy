@@ -518,6 +518,8 @@ export interface GuiChatTranslations {
     allowCollaborationHint: string;
     allowCreateGroups: string;
     allowCreateGroupsHint: string;
+    allowCreateScheduledTasks: string;
+    allowCreateScheduledTasksHint: string;
     inviteQuota: string;
     inviteQuotaFor: string;
     unlimited: string;

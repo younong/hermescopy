@@ -1102,6 +1102,8 @@ export const en: Translations = {
       allowCollaborationHint: "Can join internal groups",
       allowCreateGroups: "Allow group creation",
       allowCreateGroupsHint: "Can invite other employees",
+      allowCreateScheduledTasks: "Allow scheduled tasks",
+      allowCreateScheduledTasksHint: "Can create scheduled tasks",
       inviteQuota: "Invite quota",
       inviteQuotaFor: "Invite quota for {name}",
       unlimited: "Unlimited",

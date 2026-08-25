@@ -1397,7 +1397,7 @@ def create_app(
             return complete_job_run(
                 job,
                 success=success,
-                output=f"# Cron Job: {job.get('name') or job['id']}\\n\\n{aggregate}\\n",
+                output=f"# Cron Job: {job.get('name') or job['id']}\n\n{aggregate}\n",
                 final_response=aggregate,
                 error=None if success else "one or more employee targets failed",
                 fire_id=fire_id,
