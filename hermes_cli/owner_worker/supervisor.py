@@ -612,13 +612,44 @@ class OwnerWorkerSupervisor:
                 claim = self.authority_store.claim_worker_start(owner_key, worker_id=uuid.uuid4().hex)
         generation = claim.generation
         socket_path = self.socket_path_for(owner, generation.worker_generation)
-        env = self._env_for(owner, generation, claim.lease)
+        env = self._env_for(owner, generation, claim.lease, process_token=claim.process_token)
+        heartbeat_stop = threading.Event()
+        heartbeat_failure: list[BaseException] = []
+
+        def _startup_heartbeat() -> None:
+            interval = max(0.25, min(1.0, self.poll_interval or 0.5))
+            while not heartbeat_stop.wait(interval):
+                try:
+                    self.authority_store.renew_worker_heartbeat(
+                        claim.lease, process_token=claim.process_token,
+                    )
+                except BaseException as exc:
+                    heartbeat_failure.append(exc)
+                    heartbeat_stop.set()
+                    return
+
+        heartbeat_thread = threading.Thread(
+            target=_startup_heartbeat,
+            name=f"owner-worker-heartbeat-{generation.worker_generation}",
+            daemon=True,
+        )
+        heartbeat_thread.start()
+
+        def _stop_startup_heartbeat() -> None:
+            heartbeat_stop.set()
+            heartbeat_thread.join(timeout=max(1.0, self.poll_interval + 1.0))
+
+        def _ensure_startup_heartbeat() -> None:
+            if heartbeat_failure:
+                raise OwnerWorkerStartupError("owner worker startup lease heartbeat failed") from heartbeat_failure[0]
+
         relay_fd = None
         media_relay_fd = None
         resource_broker_fd = None
         worker_resource_scope = None
         resource_started_at = time.monotonic()
         try:
+            _ensure_startup_heartbeat()
             if self.resource_manager is not None:
                 worker_resource_scope = self.resource_manager.admit_worker(claim.lease)
             if self.deployment_inference_broker is not None:
@@ -656,6 +687,7 @@ class OwnerWorkerSupervisor:
                 self.deployment_resource_broker.revoke(claim.lease)
             if worker_resource_scope is not None:
                 worker_resource_scope.cleanup()
+            _stop_startup_heartbeat()
             try:
                 self.authority_store.transition_worker_lease(
                     claim.lease, state=WorkerLeaseState.REVOKED,
@@ -697,6 +729,7 @@ class OwnerWorkerSupervisor:
                 self.deployment_resource_broker.revoke(claim.lease)
             if worker_resource_scope is not None:
                 worker_resource_scope.cleanup()
+            _stop_startup_heartbeat()
             try:
                 self.authority_store.transition_worker_lease(
                     claim.lease, state=WorkerLeaseState.REVOKED,
@@ -860,6 +893,7 @@ class OwnerWorkerSupervisor:
             if worker_resource_scope is not None:
                 worker_resource_scope.cleanup()
                 worker_resource_scope = None
+            _stop_startup_heartbeat()
             self._try_cleanup_generation_runtime(owner_home, generation.worker_generation)
             self._audit_generation(AuthorityAuditReason.GENERATION_START_FAILED, claim.lease)
             try:
@@ -896,7 +930,9 @@ class OwnerWorkerSupervisor:
                 worker_id=generation.worker_id,
                 lease=claim.lease,
                 deadline=deadline,
+                process_token=claim.process_token,
             )
+            _ensure_startup_heartbeat()
             self._chmod_private_file(socket_path)
             self._verify_socket_path(socket_path, owner_home, generation.worker_generation)
             observe_latency_stage(
@@ -910,6 +946,7 @@ class OwnerWorkerSupervisor:
                 state=WorkerLeaseState.ACTIVE,
                 generation_state=WorkerGenerationState.ACTIVE,
             )
+            _stop_startup_heartbeat()
         except Exception as exc:
             observe_latency_stage(
                 stage=(
@@ -930,6 +967,7 @@ class OwnerWorkerSupervisor:
             if worker_resource_scope is not None:
                 worker_resource_scope.cleanup()
                 worker_resource_scope = None
+            _stop_startup_heartbeat()
             self._audit_generation(AuthorityAuditReason.GENERATION_START_FAILED, claim.lease)
             try:
                 self.authority_store.transition_worker_lease(
@@ -1051,6 +1089,18 @@ class OwnerWorkerSupervisor:
             WorkerLeaseState.DRAINING,
         }:
             return False
+        if lease.state is WorkerLeaseState.STARTING:
+            binding = self.authority_store.read_owner_worker_process_binding(owner_key)
+            if binding is None or not binding.process_token_digest or binding.heartbeat_at <= 0:
+                return False
+            stale_before = int((time.time() - max(2.0, self.startup_timeout * 2.0)) * 1000)
+            if binding.heartbeat_at >= stale_before:
+                return False
+            return self.authority_store.reclaim_stale_worker_lease(
+                lease,
+                process_token_digest=binding.process_token_digest,
+                stale_before=stale_before,
+            )
         socket_path = owner_worker_socket_path(owner_home, lease.worker_generation)
         if not canonical_unix_peer_is_absent(socket_path):
             return False
@@ -1059,11 +1109,7 @@ class OwnerWorkerSupervisor:
             # protects against an authority replacement racing this supervisor.
             lease = self.authority_store.assert_worker_lease(lease)
             if lease.state is WorkerLeaseState.STARTING:
-                self.authority_store.transition_worker_lease(
-                    lease,
-                    state=WorkerLeaseState.REVOKED,
-                    generation_state=WorkerGenerationState.FAILED,
-                )
+                return False
             elif lease.state is WorkerLeaseState.ACTIVE:
                 draining = self.authority_store.transition_worker_lease(
                     lease,
@@ -1618,9 +1664,19 @@ class OwnerWorkerSupervisor:
         worker_id: str,
         lease: OwnerWorkerAuthorityLease,
         deadline: float,
+        process_token: str = "",
     ) -> dict[str, Any]:
         last_error: Exception | None = None
+        last_heartbeat = 0.0
         while time.monotonic() < deadline:
+            if process_token and time.monotonic() - last_heartbeat >= max(self.poll_interval, 0.5):
+                try:
+                    self.authority_store.renew_worker_heartbeat(
+                        lease, process_token=process_token,
+                    )
+                    last_heartbeat = time.monotonic()
+                except AuthorizationRejected as exc:
+                    raise OwnerWorkerStartupError("owner worker startup lease heartbeat failed") from exc
             if process.poll() is not None:
                 raise OwnerWorkerStartupError(
                     f"owner worker exited during startup with code {process.returncode}"
@@ -1679,6 +1735,8 @@ class OwnerWorkerSupervisor:
         owner: Any,
         generation: WorkerGeneration,
         lease: OwnerWorkerAuthorityLease,
+        *,
+        process_token: str = "",
     ) -> dict[str, str]:
         keep = _OWNER_WORKER_ENV_ALLOW | _OWNER_WORKER_ENV_EXPLICIT_KEEP | _configured_env_allowlist()
         env = {key: value for key, value in os.environ.items() if key in keep}
@@ -1695,6 +1753,7 @@ class OwnerWorkerSupervisor:
                 worker_id=generation.worker_id,
                 lease_version=lease.lease_version,
                 recovery_generation=lease.recovery_generation,
+                process_token=process_token,
                 capability_issuer=verifier["HERMES_OWNER_WORKER_CAPABILITY_ISSUER"],
                 capability_public_key=verifier["HERMES_OWNER_WORKER_CAPABILITY_PUBLIC_KEY"],
                 capability_retained_public_keys=verifier[

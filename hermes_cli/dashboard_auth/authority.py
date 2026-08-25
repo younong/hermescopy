@@ -34,7 +34,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 
-_SCHEMA_VERSION = 9
+_SCHEMA_VERSION = 10
 _DB_NAME = "authority.sqlite3"
 _RECOVERY_MARKER_SUFFIX = ".recovery-required.json"
 
@@ -358,6 +358,16 @@ class OwnerWorkerAuthorityLease:
 class WorkerStartClaim:
     generation: WorkerGeneration
     lease: OwnerWorkerAuthorityLease
+    process_token: str
+
+
+@dataclass(frozen=True)
+class WorkerProcessBinding:
+    process_token_digest: str
+    pid: int | None
+    process_start_time: int | None
+    heartbeat_at: int
+    heartbeat_seq: int
 
 
 @dataclass(frozen=True)
@@ -443,18 +453,20 @@ class AuthorityStore:
             dir=self.control_home,
         )
         try:
-            os.fchmod(fd, 0o600)
+            if hasattr(os, "fchmod"):
+                os.fchmod(fd, 0o600)
             with os.fdopen(fd, "w", encoding="utf-8") as handle:
                 json.dump(marker, handle, sort_keys=True, separators=(",", ":"))
                 handle.write("\n")
                 handle.flush()
                 os.fsync(handle.fileno())
             os.replace(temporary, self.recovery_marker_path)
-            directory_fd = os.open(self.control_home, os.O_RDONLY)
-            try:
-                os.fsync(directory_fd)
-            finally:
-                os.close(directory_fd)
+            if os.name != "nt":
+                directory_fd = os.open(self.control_home, os.O_RDONLY)
+                try:
+                    os.fsync(directory_fd)
+                finally:
+                    os.close(directory_fd)
         finally:
             try:
                 os.unlink(temporary)
@@ -734,6 +746,63 @@ class AuthorityStore:
             )
             version = 9
             conn.execute("UPDATE authority_meta SET value=? WHERE key='schema_version'", (version,))
+        if version == 9:
+            columns = {
+                str(row[1])
+                for row in conn.execute("PRAGMA table_info(owner_worker_leases)").fetchall()
+            }
+            additions = (
+                ("process_token_digest", "TEXT"),
+                ("pid", "INTEGER"),
+                ("process_start_time", "INTEGER"),
+                ("heartbeat_at", "INTEGER NOT NULL DEFAULT 0"),
+                ("heartbeat_seq", "INTEGER NOT NULL DEFAULT 0"),
+            )
+            for name, definition in additions:
+                if name not in columns:
+                    conn.execute(f"ALTER TABLE owner_worker_leases ADD COLUMN {name} {definition}")
+            legacy_starting = conn.execute(
+                "SELECT owner_key, worker_generation, worker_id, lease_version, recovery_generation "
+                "FROM owner_worker_leases WHERE state=? AND "
+                "(process_token_digest IS NULL OR heartbeat_at <= 0)",
+                (WorkerLeaseState.STARTING.value,),
+            ).fetchall()
+            for owner_key, worker_generation, worker_id, lease_version, recovery_generation in legacy_starting:
+                conn.execute(
+                    "UPDATE owner_worker_generations SET state=? "
+                    "WHERE owner_key=? AND worker_generation=? AND state=?",
+                    (
+                        WorkerGenerationState.FAILED.value,
+                        owner_key,
+                        worker_generation,
+                        WorkerGenerationState.STARTING.value,
+                    ),
+                )
+                conn.execute(
+                    "UPDATE owner_worker_leases SET state=? WHERE owner_key=? AND lease_version=? AND state=?",
+                    (
+                        WorkerLeaseState.REVOKED.value,
+                        owner_key,
+                        lease_version,
+                        WorkerLeaseState.STARTING.value,
+                    ),
+                )
+                conn.execute(
+                    "INSERT INTO owner_worker_changes("
+                    "owner_key, worker_generation, worker_id, lease_version, recovery_generation, "
+                    "lease_state, generation_state) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        owner_key,
+                        worker_generation,
+                        worker_id,
+                        lease_version,
+                        recovery_generation,
+                        WorkerLeaseState.REVOKED.value,
+                        WorkerGenerationState.FAILED.value,
+                    ),
+                )
+            version = 10
+            conn.execute("UPDATE authority_meta SET value=? WHERE key='schema_version'", (version,))
         if version == _SCHEMA_VERSION:
             owners = conn.execute(
                 "SELECT name FROM sqlite_master WHERE type='table' AND name='authenticated_owners'"
@@ -851,6 +920,27 @@ class AuthorityStore:
             )
         except (IndexError, TypeError, ValueError) as exc:
             raise AuthorityUnavailable("owner worker lease record is invalid") from exc
+
+    @staticmethod
+    def _worker_binding_from_row(row: tuple[object, ...]) -> WorkerProcessBinding:
+        try:
+            return WorkerProcessBinding(
+                process_token_digest=str(row[6] or ""),
+                pid=None if row[7] is None else int(row[7]),
+                process_start_time=None if row[8] is None else int(row[8]),
+                heartbeat_at=int(row[9] or 0),
+                heartbeat_seq=int(row[10] or 0),
+            )
+        except (IndexError, TypeError, ValueError) as exc:
+            raise AuthorityUnavailable("owner worker process binding is invalid") from exc
+
+    @staticmethod
+    def _worker_lease_select() -> str:
+        return (
+            "SELECT owner_key, worker_generation, worker_id, state, lease_version, "
+            "recovery_generation, process_token_digest, pid, process_start_time, "
+            "heartbeat_at, heartbeat_seq FROM owner_worker_leases "
+        )
 
     @staticmethod
     def _require_worker_owner_key(owner_key: str) -> str:
@@ -1023,7 +1113,8 @@ class AuthorityStore:
                 conn.execute("BEGIN IMMEDIATE")
                 recovery_generation = self._recovery_generation(conn)
                 existing_row = conn.execute(
-                    "SELECT owner_key, worker_generation, worker_id, state, lease_version, recovery_generation "
+                    "SELECT owner_key, worker_generation, worker_id, state, lease_version, recovery_generation, "
+                    "process_token_digest, pid, process_start_time, heartbeat_at, heartbeat_seq "
                     "FROM owner_worker_leases WHERE owner_key=?",
                     (owner_key,),
                 ).fetchone()
@@ -1046,23 +1137,195 @@ class AuthorityStore:
                     "owner_key, worker_generation, worker_id, state, recovery_generation) VALUES (?, ?, ?, ?, ?)",
                     (owner_key, generation, instance_id, WorkerGenerationState.STARTING.value, recovery_generation),
                 )
+                process_token = secrets.token_urlsafe(32)
+                now = int(time.time() * 1000)
+                token_digest = hashlib.sha256(process_token.encode("utf-8")).hexdigest()
                 conn.execute(
                     "INSERT INTO owner_worker_leases("
-                    "owner_key, worker_generation, worker_id, state, lease_version, recovery_generation) VALUES (?, ?, ?, ?, ?, ?) "
+                    "owner_key, worker_generation, worker_id, state, lease_version, recovery_generation, "
+                    "process_token_digest, heartbeat_at, heartbeat_seq) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) "
                     "ON CONFLICT(owner_key) DO UPDATE SET worker_generation=excluded.worker_generation, "
                     "worker_id=excluded.worker_id, state=excluded.state, lease_version=excluded.lease_version, "
-                    "recovery_generation=excluded.recovery_generation",
-                    (owner_key, generation, instance_id, WorkerLeaseState.STARTING.value, next_lease_version, recovery_generation),
+                    "recovery_generation=excluded.recovery_generation, process_token_digest=excluded.process_token_digest, "
+                    "pid=NULL, process_start_time=NULL, heartbeat_at=excluded.heartbeat_at, heartbeat_seq=excluded.heartbeat_seq",
+                    (owner_key, generation, instance_id, WorkerLeaseState.STARTING.value, next_lease_version,
+                     recovery_generation, token_digest, now, 0),
                 )
                 conn.commit()
                 return WorkerStartClaim(
                     WorkerGeneration(owner_key, generation, instance_id, WorkerGenerationState.STARTING, recovery_generation),
                     OwnerWorkerAuthorityLease(owner_key, generation, instance_id, WorkerLeaseState.STARTING, next_lease_version, recovery_generation),
+                    process_token,
                 )
         except AuthorizationRejected:
             raise
         except sqlite3.IntegrityError as exc:
             raise AuthorizationRejected("worker_generation_conflict") from exc
+        except (sqlite3.Error, OSError) as exc:
+            raise self._availability_error(exc) from exc
+
+    @staticmethod
+    def _process_token_digest(process_token: str) -> str:
+        value = str(process_token or "")
+        if not value:
+            raise ValueError("process_token is required")
+        return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+    def bind_worker_process(
+        self,
+        lease: OwnerWorkerAuthorityLease,
+        *,
+        process_token: str,
+        pid: int,
+        process_start_time: int | None = None,
+        now: int | None = None,
+    ) -> WorkerProcessBinding:
+        """Bind an exact starting lease to its worker process and renew it."""
+        digest = self._process_token_digest(process_token)
+        if int(pid) < 1:
+            raise ValueError("pid is invalid")
+        timestamp = int(time.time() * 1000) if now is None else int(now)
+        self._ensure_ready()
+        try:
+            with self._connect() as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                current = self._recovery_generation(conn)
+                row = conn.execute(
+                    self._worker_lease_select() + "WHERE owner_key=?", (lease.owner_key,)
+                ).fetchone()
+                if row is None:
+                    raise AuthorizationRejected("worker_lease_not_found")
+                actual = self._worker_lease_from_row(row)
+                if actual != lease or actual.recovery_generation != current:
+                    raise AuthorizationRejected("worker_lease_stale")
+                stored_digest = str(row[6] or "")
+                if actual.state is not WorkerLeaseState.STARTING or stored_digest != digest:
+                    raise AuthorizationRejected("worker_process_identity_mismatch")
+                seq = int(row[10] or 0) + 1
+                conn.execute(
+                    "UPDATE owner_worker_leases SET pid=?, process_start_time=?, heartbeat_at=?, heartbeat_seq=? "
+                    "WHERE owner_key=? AND lease_version=?",
+                    (int(pid), None if process_start_time is None else int(process_start_time), timestamp, seq,
+                     lease.owner_key, lease.lease_version),
+                )
+                conn.commit()
+                return WorkerProcessBinding(digest, int(pid), process_start_time, timestamp, seq)
+        except AuthorizationRejected:
+            raise
+        except (sqlite3.Error, OSError) as exc:
+            raise self._availability_error(exc) from exc
+
+    def renew_worker_heartbeat(
+        self,
+        lease: OwnerWorkerAuthorityLease,
+        *,
+        process_token: str,
+        now: int | None = None,
+    ) -> WorkerProcessBinding:
+        """Renew a worker process heartbeat without changing its lifecycle state."""
+        digest = self._process_token_digest(process_token)
+        timestamp = int(time.time() * 1000) if now is None else int(now)
+        self._ensure_ready()
+        try:
+            with self._connect() as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                current = self._recovery_generation(conn)
+                row = conn.execute(
+                    self._worker_lease_select() + "WHERE owner_key=?", (lease.owner_key,)
+                ).fetchone()
+                if row is None:
+                    raise AuthorizationRejected("worker_lease_not_found")
+                actual = self._worker_lease_from_row(row)
+                if (
+                    actual.owner_key != lease.owner_key
+                    or actual.worker_generation != lease.worker_generation
+                    or actual.worker_id != lease.worker_id
+                    or actual.lease_version != lease.lease_version
+                    or actual.recovery_generation != lease.recovery_generation
+                    or actual.recovery_generation != current
+                ):
+                    raise AuthorizationRejected("worker_lease_stale")
+                if actual.state not in {WorkerLeaseState.STARTING, WorkerLeaseState.ACTIVE, WorkerLeaseState.DRAINING}:
+                    raise AuthorizationRejected("worker_lease_state_mismatch")
+                if str(row[6] or "") != digest:
+                    raise AuthorizationRejected("worker_process_identity_mismatch")
+                timestamp = max(timestamp, int(row[9] or 0))
+                seq = int(row[10] or 0) + 1
+                conn.execute(
+                    "UPDATE owner_worker_leases SET heartbeat_at=?, heartbeat_seq=? "
+                    "WHERE owner_key=? AND lease_version=?",
+                    (timestamp, seq, lease.owner_key, lease.lease_version),
+                )
+                conn.commit()
+                return WorkerProcessBinding(
+                    digest, None if row[7] is None else int(row[7]),
+                    None if row[8] is None else int(row[8]), timestamp, seq,
+                )
+        except AuthorizationRejected:
+            raise
+        except (sqlite3.Error, OSError) as exc:
+            raise self._availability_error(exc) from exc
+
+    def reclaim_stale_worker_lease(
+        self,
+        lease: OwnerWorkerAuthorityLease,
+        *,
+        process_token_digest: str,
+        stale_before: int,
+    ) -> bool:
+        """Atomically revoke a lease whose process heartbeat has expired."""
+        self._ensure_ready()
+        try:
+            with self._connect() as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                current_recovery = self._recovery_generation(conn)
+                row = conn.execute(
+                    self._worker_lease_select() + "WHERE owner_key=?", (lease.owner_key,)
+                ).fetchone()
+                if row is None:
+                    return False
+                actual = self._worker_lease_from_row(row)
+                if actual != lease or actual.recovery_generation != current_recovery:
+                    return False
+                if str(row[6] or "") != str(process_token_digest) or int(row[9] or 0) >= int(stale_before):
+                    return False
+                generation_row = conn.execute(
+                    "SELECT owner_key, worker_generation, worker_id, state, recovery_generation "
+                    "FROM owner_worker_generations WHERE owner_key=? AND worker_generation=?",
+                    (lease.owner_key, lease.worker_generation),
+                ).fetchone()
+                if generation_row is None:
+                    return False
+                generation = self._worker_generation_from_row(generation_row)
+                if generation.state is not WorkerGenerationState.STARTING or actual.state is not WorkerLeaseState.STARTING:
+                    return False
+                conn.execute(
+                    "UPDATE owner_worker_generations SET state=? WHERE owner_key=? AND worker_generation=?",
+                    (WorkerGenerationState.FAILED.value, lease.owner_key, lease.worker_generation),
+                )
+                conn.execute(
+                    "UPDATE owner_worker_leases SET state=? WHERE owner_key=? AND lease_version=?",
+                    (WorkerLeaseState.REVOKED.value, lease.owner_key, lease.lease_version),
+                )
+                conn.execute(
+                    "INSERT INTO owner_worker_changes(owner_key, worker_generation, worker_id, lease_version, recovery_generation, lease_state, generation_state) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (lease.owner_key, lease.worker_generation, lease.worker_id, lease.lease_version,
+                     current_recovery, WorkerLeaseState.REVOKED.value, WorkerGenerationState.FAILED.value),
+                )
+                conn.commit()
+                return True
+        except (sqlite3.Error, OSError) as exc:
+            raise self._availability_error(exc) from exc
+
+    def read_owner_worker_process_binding(self, owner_key: str) -> WorkerProcessBinding | None:
+        owner_key = self._require_worker_owner_key(owner_key)
+        self._ensure_ready()
+        try:
+            with self._connect() as conn:
+                row = conn.execute(
+                    self._worker_lease_select() + "WHERE owner_key=?", (owner_key,)
+                ).fetchone()
+                return None if row is None else self._worker_binding_from_row(row)
         except (sqlite3.Error, OSError) as exc:
             raise self._availability_error(exc) from exc
 
@@ -1073,7 +1336,8 @@ class AuthorityStore:
         try:
             with self._connect() as conn:
                 row = conn.execute(
-                    "SELECT owner_key, worker_generation, worker_id, state, lease_version, recovery_generation "
+                    "SELECT owner_key, worker_generation, worker_id, state, lease_version, recovery_generation, "
+                    "process_token_digest, pid, process_start_time, heartbeat_at, heartbeat_seq "
                     "FROM owner_worker_leases WHERE owner_key=?", (owner_key,)
                 ).fetchone()
                 return None if row is None else self._worker_lease_from_row(row)
@@ -1089,7 +1353,8 @@ class AuthorityStore:
             with self._connect() as conn:
                 current = self._recovery_generation(conn)
                 row = conn.execute(
-                    "SELECT owner_key, worker_generation, worker_id, state, lease_version, recovery_generation "
+                    "SELECT owner_key, worker_generation, worker_id, state, lease_version, recovery_generation, "
+                    "process_token_digest, pid, process_start_time, heartbeat_at, heartbeat_seq "
                     "FROM owner_worker_leases WHERE owner_key=?", (lease.owner_key,)
                 ).fetchone()
                 if row is None:
@@ -1115,7 +1380,8 @@ class AuthorityStore:
                 conn.execute("BEGIN IMMEDIATE")
                 current_recovery = self._recovery_generation(conn)
                 row = conn.execute(
-                    "SELECT owner_key, worker_generation, worker_id, state, lease_version, recovery_generation "
+                    "SELECT owner_key, worker_generation, worker_id, state, lease_version, recovery_generation, "
+                    "process_token_digest, pid, process_start_time, heartbeat_at, heartbeat_seq "
                     "FROM owner_worker_leases WHERE owner_key=?", (lease.owner_key,)
                 ).fetchone()
                 if row is None:
@@ -1891,7 +2157,8 @@ class AuthorityStore:
                     raise AuthorityUnavailable("authority replay continuity is unavailable")
                 recovery_generation = self._recovery_generation(conn)
                 row = conn.execute(
-                    "SELECT owner_key, worker_generation, worker_id, state, lease_version, recovery_generation "
+                    "SELECT owner_key, worker_generation, worker_id, state, lease_version, recovery_generation, "
+                    "process_token_digest, pid, process_start_time, heartbeat_at, heartbeat_seq "
                     "FROM owner_worker_leases WHERE owner_key=?",
                     (lease.owner_key,),
                 ).fetchone()
