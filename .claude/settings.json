@@ -96,6 +96,18 @@
           }
         ]
       }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"$CLAUDE_PROJECT_DIR/.claude/hooks/auto-submit-pr.py\" || python \"$CLAUDE_PROJECT_DIR/.claude/hooks/auto-submit-pr.py\"",
+            "timeout": 120,
+            "statusMessage": "Submitting completed work as a GitHub PR"
+          }
+        ]
+      }
     ]
   }
 }
