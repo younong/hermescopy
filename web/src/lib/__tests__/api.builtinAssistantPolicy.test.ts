@@ -89,6 +89,7 @@ function employeeBase() {
     collaboration_policy: {
       invite_quota: null,
       may_create_groups: true,
+      may_create_scheduled_tasks: true,
       may_participate: true,
     },
     employee_id: "employee-a",

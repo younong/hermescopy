@@ -1820,6 +1820,7 @@ function employee(overrides: {
     collaboration_policy: {
       invite_quota: 5,
       may_create_groups: true,
+      may_create_scheduled_tasks: true,
       may_participate: false,
     },
     employee_id: employeeId,
@@ -1855,6 +1856,7 @@ function builtinEmployee(overrides: Partial<Extract<Employee, { employee_kind: "
     collaboration_policy: {
       invite_quota: null,
       may_create_groups: true,
+      may_create_scheduled_tasks: true,
       may_participate: true,
     },
     employee_id: "employee-a",

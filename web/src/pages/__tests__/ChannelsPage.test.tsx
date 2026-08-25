@@ -106,6 +106,7 @@ function employee(
     collaboration_policy: {
       invite_quota: 5,
       may_create_groups: false,
+      may_create_scheduled_tasks: false,
       may_participate: true,
     },
     employee_id: employeeId,
