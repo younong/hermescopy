@@ -22,7 +22,7 @@ The security model has seven layers:
 
 ## Dangerous Command Approval
 
-Before executing any command, Hermes checks it against a curated list of dangerous patterns. If a match is found, the user must explicitly approve it.
+Before executing a command, Hermes checks it against a curated list of dangerous patterns. CLI and explicitly approval-enabled flows ask the user when a match is found; ordinary agent turns in the TUI/Web gateway already run inside the user's authenticated conversation and skip this duplicate prompt.
 
 ### Approval Modes
 
@@ -51,7 +51,7 @@ The full set of keys:
 |------|----------|
 | **manual** (default) | Always prompt the user for approval on dangerous commands |
 | **smart** | Use an auxiliary LLM to assess risk. Low-risk commands (e.g., `python -c "print('hello')"`) are auto-approved. Genuinely dangerous commands are auto-denied. Uncertain cases escalate to a manual prompt. |
-| **off** | Disable all approval checks — equivalent to running with `--yolo`. All commands execute without prompts. |
+| **off** | Disable all ordinary approval checks — equivalent to running with `--yolo`. The hardline blocklist and sudo-stdin floor still apply. |
 
 :::warning
 Setting `approvals.mode: off` disables all safety prompts. Use only in trusted environments (CI/CD, containers, etc.).
