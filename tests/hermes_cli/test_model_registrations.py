@@ -398,6 +398,7 @@ def test_admin_registrations_are_stable_resolvable_and_immutable(monkeypatch):
         "provider": "apiyi",
         "model": "nano-banana-2",
         "use_gateway": False,
+        "registration_id": image["id"],
     }
 
 
@@ -451,6 +452,7 @@ def test_media_activation_updates_only_matching_kind_section():
         "provider": "image-test",
         "model": "image-v1",
         "use_gateway": False,
+        "registration_id": image["id"],
     }
     assert config["video_gen"] == {
         "provider": "video-old",
@@ -464,11 +466,13 @@ def test_media_activation_updates_only_matching_kind_section():
         "provider": "video-test",
         "model": "video-v1",
         "use_gateway": False,
+        "registration_id": video["id"],
     }
     assert config["image_gen"] == {
         "provider": "image-test",
         "model": "image-v1",
         "use_gateway": False,
+        "registration_id": image["id"],
     }
 
 
@@ -497,6 +501,7 @@ def test_catalog_media_crud_activation_and_active_delete_guard():
         "provider": "image-test",
         "model": "image-v1",
         "use_gateway": False,
+        "registration_id": created["id"],
     }
     with pytest.raises(model_registrations.ModelRegistrationConflict):
         model_registrations.delete_model_registration(created["id"])
@@ -541,6 +546,7 @@ def test_voice_and_vector_catalog_registration_crud_and_activation():
         "provider": "voice-test",
         "model": "voice-v1",
         "use_gateway": False,
+        "registration_id": voice["id"],
     }
     payload = model_registrations.get_model_registrations_payload()
     assert payload["active"]["voice"] == {
@@ -797,6 +803,7 @@ def test_code_registration_has_independent_catalog_and_activation(monkeypatch):
     assert config["code_agent"] == {
         "provider": "openai-codex",
         "model": "gpt-5.3-codex",
+        "registration_id": created["id"],
     }
     assert config["model"] == ""
     assert model_registrations.resolve_code_model_registration(created["id"]) == {
@@ -931,8 +938,6 @@ def test_payload_is_lightweight_and_catalog_is_safe(monkeypatch):
         "kind": "vector",
         "providers": [],
     }
-    with pytest.raises(
-        model_registrations.ModelRegistrationError,
-        match="Only code, image, video, voice, and vector",
-    ):
-        model_registrations.activate_model_registration(chat["id"])
+    activated = model_registrations.activate_model_registration(chat["id"])
+    assert activated["kind"] == "chat"
+    assert load_config()["model"]["registration_id"] == chat["id"]

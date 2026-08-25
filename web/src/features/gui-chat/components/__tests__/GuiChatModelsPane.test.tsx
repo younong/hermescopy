@@ -89,13 +89,16 @@ describe("GuiChatModelsPane", () => {
     expect(document.body.textContent).toContain("No matching models");
   });
 
-  it("does not route Code models through the Chat switch callback", async () => {
+  it("activates Code models through the registration endpoint", async () => {
     const onSelectChat = vi.fn();
-    const onActivateCode = vi.fn().mockResolvedValue(undefined);
-    await renderPane({ onSelectChat, onActivateCode });
+    vi.mocked(api.getModelRegistrations).mockResolvedValue({
+      ...payload,
+      active: { ...payload.active, code: { model: "", provider: "", registration_id: null } },
+    });
+    await renderPane({ onSelectChat });
     await clickButton("Code", true);
-    await clickWithin(rowFor("Codex model"), "Default", true);
-    expect(onActivateCode).toHaveBeenCalledWith(expect.objectContaining({ id: "code-codex", kind: "code" }));
+    await clickWithin(rowFor("Codex model"), "Use as Code model", true);
+    expect(api.activateModelRegistration).toHaveBeenCalledWith("code-codex");
     expect(onSelectChat).not.toHaveBeenCalled();
   });
 
@@ -118,23 +121,14 @@ describe("GuiChatModelsPane", () => {
 
   it("selects chat models locally and confirms an explicit global default", async () => {
     const onSelectChat = vi.fn();
-    const onSetDefaultChat = vi.fn()
-      .mockResolvedValueOnce({ confirm_message: "High price", confirm_required: true, value: "default-model" })
-      .mockResolvedValueOnce({ confirm_required: false, value: "default-model" });
-    await renderPane({ onSelectChat, onSetDefaultChat });
+    await renderPane({ onSelectChat });
 
     const defaultRow = rowFor("Default model");
     await clickWithin(defaultRow, "Use", true);
     expect(onSelectChat).toHaveBeenCalledWith(expect.objectContaining({ id: "chat-default" }));
-    expect(onSetDefaultChat).not.toHaveBeenCalled();
 
     await clickWithin(rowFor("Current model"), "Use as default", true);
-    expect(document.body.textContent).toContain("High price");
-    await clickButton("Switch anyway", true);
-    expect(onSetDefaultChat).toHaveBeenLastCalledWith(
-      expect.objectContaining({ id: "chat-current" }),
-      true,
-    );
+    expect(api.activateModelRegistration).toHaveBeenCalledWith("chat-current");
   });
 
   it("keeps CRUD available without a live conversation and activates media models", async () => {
@@ -151,33 +145,19 @@ describe("GuiChatModelsPane", () => {
     expect(api.deleteModelRegistration).toHaveBeenCalledWith("video-a");
   });
 
-  it("creates voice and vector registrations without activation controls", async () => {
+  it("supports voice and vector catalog registrations and activation", async () => {
     await renderPane();
 
     await clickButton("Voice", true);
     expect(document.body.textContent).toContain("Voice model");
-    expect(buttonWithin(rowFor("Voice model"), "Activate", true)).toBeUndefined();
+    await clickWithin(rowFor("Voice model"), "Activate", true);
+    expect(api.activateModelRegistration).toHaveBeenCalledWith("voice-a");
     await clickButton("Add model", true);
     const sourceSelect = document.querySelector<HTMLSelectElement>('select[aria-label="Source"]');
-    expect(sourceSelect?.disabled).toBe(true);
-    expect(sourceSelect?.value).toBe("manual");
-    expect(sourceSelect?.selectedOptions[0]?.textContent).toBe("Manual");
-    await setLabeledInput("Name", "New voice model");
-    await setLabeledInput("Provider", "openai");
-    await setLabeledInput("Model", "gpt-4o-mini-tts");
-    await clickButton("Save model", true);
-    expect(api.getModelRegistrationCatalog).not.toHaveBeenCalledWith("voice");
-    expect(api.createModelRegistration).toHaveBeenCalledWith({
-      kind: "voice",
-      model: "gpt-4o-mini-tts",
-      name: "New voice model",
-      provider: "openai",
-      source: "manual",
-    });
-
+    expect(sourceSelect?.disabled).toBe(false);
+    expect(sourceSelect?.value).toBe("catalog");
     await clickButton("Vector", true);
     expect(document.body.textContent).toContain("Vector model");
-    expect(buttonWithin(rowFor("Vector model"), "Activate", true)).toBeUndefined();
   });
 
   it("creates catalog models through the existing registration API", async () => {
@@ -258,7 +238,6 @@ async function renderPane(
         currentModel="current-model"
         currentProvider="current-provider"
         onSelectChat={vi.fn()}
-        onSetDefaultChat={vi.fn().mockResolvedValue({ confirm_required: false, value: "default-model" })}
         {...overrides}
       /></I18nProvider>,
     );

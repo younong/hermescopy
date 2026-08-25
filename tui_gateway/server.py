@@ -2678,6 +2678,11 @@ def _resolve_model() -> str:
     # the fallback for profiles that have not selected a Chat model yet.
     m = _load_cfg().get("model", "")
     if isinstance(m, dict):
+        registration_id = str(m.get("registration_id") or "").strip()
+        if registration_id:
+            from hermes_cli.model_registrations import resolve_chat_model_registration
+
+            return resolve_chat_model_registration(registration_id)["model"]
         configured = str(m.get("default", "") or "").strip()
         if configured:
             return configured
@@ -2717,8 +2722,16 @@ def _config_model_target() -> tuple[str, str]:
     model = ""
     provider = ""
     if isinstance(cfg_model, dict):
-        model = str(cfg_model.get("default", "") or "").strip()
-        provider = str(cfg_model.get("provider") or "").strip()
+        registration_id = str(cfg_model.get("registration_id") or "").strip()
+        if registration_id:
+            from hermes_cli.model_registrations import resolve_chat_model_registration
+
+            resolved = resolve_chat_model_registration(registration_id)
+            model = resolved["model"]
+            provider = resolved["provider"]
+        else:
+            model = str(cfg_model.get("default", "") or "").strip()
+            provider = str(cfg_model.get("provider") or "").strip()
         if provider.lower() == "auto":
             provider = ""
     elif isinstance(cfg_model, str):
@@ -2734,8 +2747,16 @@ def _resolve_code_startup_runtime(params: dict | None = None) -> tuple[str, str 
     cfg = _load_cfg()
     selection = cfg.get("code_agent") if isinstance(cfg, dict) else None
     selection = selection if isinstance(selection, dict) else {}
-    provider_name = str(params.get("provider") or selection.get("provider") or "").strip()
-    model = str(params.get("model") or selection.get("model") or "").strip()
+    registration_id = str(params.get("registration_id") or selection.get("registration_id") or "").strip()
+    if registration_id and not params.get("model") and not params.get("provider"):
+        from hermes_cli.model_registrations import resolve_code_model_registration
+
+        resolved = resolve_code_model_registration(registration_id)
+        provider_name = resolved["provider"]
+        model = resolved["model"]
+    else:
+        provider_name = str(params.get("provider") or selection.get("provider") or "").strip()
+        model = str(params.get("model") or selection.get("model") or "").strip()
     try:
         from hermes_cli.model_plane.capability import get_capability_provider
 
@@ -2757,16 +2778,22 @@ def _resolve_startup_runtime() -> tuple[str, str | None]:
     cfg_model = _load_cfg().get("model", "")
     configured_model = ""
     configured_provider = ""
+    configured_selection = False
     if isinstance(cfg_model, dict):
-        configured_model = str(cfg_model.get("default", "") or "").strip()
-        configured_provider = str(cfg_model.get("provider") or "").strip()
+        configured_selection = bool(
+            str(cfg_model.get("registration_id") or "").strip()
+            or str(cfg_model.get("default") or "").strip()
+        )
+        if configured_selection:
+            configured_model, configured_provider = _config_model_target()
     elif isinstance(cfg_model, str):
         configured_model = cfg_model.strip()
+        configured_selection = bool(configured_model)
 
     # A configured Chat selection is authoritative for new sessions. In
     # particular, do not let deployment seed variables or HERMES_TUI_PROVIDER
     # replace a user's profile selection.
-    if configured_model:
+    if configured_selection and configured_model:
         if configured_provider.lower() == "auto":
             configured_provider = ""
         return configured_model, configured_provider or None
@@ -13770,6 +13797,10 @@ def _(rid, params: dict) -> dict:
                     parsed_flags=parsed_flags,
                     trusted_selection=trusted_selection,
                 )
+                if trusted_selection and persist_global:
+                    from hermes_cli.config import set_config_value
+
+                    set_config_value("model.registration_id", registration_id)
             else:
                 result = _apply_model_switch(
                     "",

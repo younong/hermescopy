@@ -901,31 +901,6 @@ export function GuiChatShell() {
       .catch((error: Error) => dispatch({ type: "error", message: error.message }));
   }, [state.sessionId]);
 
-  const activateCodeModel = useCallback(
-    async (registration: { model: string; provider: string }) => {
-      const coordinator = switchCoordinatorRef.current;
-      if (!coordinator) throw new Error(copy.shell.connectionNotReady);
-      historyAbortRef.current?.abort();
-      setAttachmentsToQueue([]);
-      reconnectLifecycleRef.current?.cancelRecovery();
-      setResumeNotice(null);
-      skipClearedRouteRef.current = true;
-      updateSearchParams((prev) => {
-        const next = new URLSearchParams(prev);
-        next.delete("resume");
-        next.delete("group");
-        return next;
-      }, { replace: true });
-      const generation = coordinator.start(null, undefined, {
-        kind: "code",
-        codeProvider: registration.provider,
-        codeModel: registration.model,
-      });
-      dispatch({ type: "session.selected", generation, sessionId: null });
-    },
-    [copy.shell.connectionNotReady, updateSearchParams],
-  );
-
   const selectChatModel = useCallback((registration: GuiChatModelRegistration) => {
     setSelectedChatRegistration({
       id: registration.id,
@@ -933,24 +908,6 @@ export function GuiChatShell() {
       provider: registration.provider,
     });
   }, []);
-
-  const setDefaultChatModel = useCallback(
-    async (
-      registration: GuiChatModelRegistration,
-      confirmExpensiveModel = false,
-    ) => {
-      const sessionId = state.sessionId;
-      const connection = connectionRef.current;
-      if (!sessionId || !connection) throw new Error(copy.shell.noActiveConversation);
-      if (state.isGenerating) {
-        throw new Error(copy.shell.stopBeforeSwitchingModels);
-      }
-      return connection.setDefaultModel(sessionId, registration, {
-        confirmExpensiveModel,
-      });
-    },
-    [copy.shell.noActiveConversation, copy.shell.stopBeforeSwitchingModels, state.isGenerating, state.sessionId],
-  );
 
   const loadEarlier = useCallback(async () => {
     const sessionId = state.historySessionId;
@@ -1430,9 +1387,7 @@ export function GuiChatShell() {
             canSwitchChat={Boolean(state.sessionId && state.connection === "open")}
             currentModel={selectedChatRegistration?.model ?? state.model}
             currentProvider={selectedChatRegistration?.provider ?? state.provider}
-            onActivateCode={activateCodeModel}
             onSelectChat={selectChatModel}
-            onSetDefaultChat={setDefaultChatModel}
           />
         ) : groupId ? (
           <GroupChatView
