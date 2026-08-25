@@ -1084,10 +1084,7 @@ class OwnerWorkerSupervisor:
         # A STARTING fence may belong to a concurrent supervisor between
         # claim and socket bind. Without a durable process identity/liveness
         # witness, leave it fail-closed rather than racing that startup.
-        if lease is None or lease.state not in {
-            WorkerLeaseState.ACTIVE,
-            WorkerLeaseState.DRAINING,
-        }:
+        if lease is None:
             return False
         if lease.state is WorkerLeaseState.STARTING:
             binding = self.authority_store.read_owner_worker_process_binding(owner_key)
@@ -1101,6 +1098,11 @@ class OwnerWorkerSupervisor:
                 process_token_digest=binding.process_token_digest,
                 stale_before=stale_before,
             )
+        if lease.state not in {
+            WorkerLeaseState.ACTIVE,
+            WorkerLeaseState.DRAINING,
+        }:
+            return False
         socket_path = owner_worker_socket_path(owner_home, lease.worker_generation)
         if not canonical_unix_peer_is_absent(socket_path):
             return False
