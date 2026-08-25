@@ -20,8 +20,7 @@ import hashlib
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from hermes_constants import get_hermes_home
-from hermes_cli.profiles import _get_default_hermes_home
+from hermes_constants import get_default_hermes_root, get_hermes_home
 from plugins.plugin_utils import SingletonSlot
 from typing import Any, TYPE_CHECKING
 
@@ -64,12 +63,10 @@ def resolve_active_host() -> str:
         return explicit
 
     try:
-        from hermes_cli.profiles import get_active_profile_name
-        profile = get_active_profile_name()
-        return profile_host_key(profile)
+        from hermes_cli.cron_dashboard import active_profile_name
+        return profile_host_key(active_profile_name())
     except Exception:
-        pass
-    return HOST
+        return HOST
 
 
 def resolve_global_config_path() -> Path:
@@ -92,7 +89,7 @@ def resolve_config_path() -> Path:
         return local_path
 
     # Default profile's config — host blocks accumulate here via setup/clone
-    default_path = _get_default_hermes_home() / "honcho.json"
+    default_path = get_default_hermes_root() / "honcho.json"
     if default_path != local_path and default_path.exists():
         return default_path
 

@@ -37,17 +37,17 @@ def _scope_to_profile(profile: Optional[str]):
         yield
         return
 
-    from hermes_cli import profiles as profiles_mod
+    from hermes_cli.cron_dashboard import profile_home
     from hermes_constants import reset_hermes_home_override, set_hermes_home_override
 
     try:
-        profiles_mod.validate_profile_name(requested)
+        _, profile_dir = profile_home(requested)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
-    if not profiles_mod.profile_exists(requested):
+    except FileNotFoundError:
         raise HTTPException(status_code=404, detail=f"Profile '{requested}' does not exist.")
 
-    token = set_hermes_home_override(str(profiles_mod.get_profile_dir(requested)))
+    token = set_hermes_home_override(str(profile_dir))
     try:
         yield
     finally:

@@ -9405,9 +9405,9 @@ def _profile_cli_args(profile: Optional[str]) -> List[str]:
     requested = (profile or "").strip()
     if not requested or requested.lower() in {"current", "default"}:
         return []
-    from hermes_cli import profiles as profiles_mod
+    from hermes_cli.cron_dashboard import normalize_profile_name
     _resolve_profile_dir(requested)
-    return ["-p", profiles_mod.normalize_profile_name(requested)]
+    return ["-p", normalize_profile_name(requested)]
 
 
 @app.post("/api/skills/hub/install")

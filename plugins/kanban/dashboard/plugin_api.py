@@ -1809,8 +1809,8 @@ def _configured_home_channels() -> list[dict]:
 def _active_profile_name() -> str:
     """Return the current Hermes profile name for notify-sub ownership."""
     try:
-        from hermes_cli.profiles import get_active_profile_name
-        return get_active_profile_name() or "default"
+        from hermes_cli.cron_dashboard import active_profile_name
+        return active_profile_name() or "default"
     except Exception:
         return "default"
 
@@ -2160,6 +2160,32 @@ class DescribeAutoBody(BaseModel):
     overwrite: bool = False
 
 
+def _profile_metadata(profile_dir: Path) -> dict:
+    """Read the lightweight profile metadata file, if present."""
+    path = profile_dir / "profile.yaml"
+    if not path.is_file():
+        return {}
+    try:
+        import yaml
+        loaded = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+        return loaded if isinstance(loaded, dict) else {}
+    except Exception:
+        return {}
+
+
+def _write_profile_description(profile_dir: Path, description: str) -> None:
+    """Update only the dashboard-owned description fields in profile.yaml."""
+    import yaml
+
+    metadata = _profile_metadata(profile_dir)
+    metadata["description"] = description.strip()
+    metadata["description_auto"] = False
+    (profile_dir / "profile.yaml").write_text(
+        yaml.safe_dump(metadata, sort_keys=False, default_flow_style=False),
+        encoding="utf-8",
+    )
+
+
 @router.get("/profiles")
 def list_profile_roster():
     """Return every installed profile with its description.
@@ -2170,22 +2196,22 @@ def list_profile_roster():
     just less precisely.
     """
     try:
-        from hermes_cli import profiles as profiles_mod
-        profiles = profiles_mod.list_profiles()
+        from hermes_cli.cron_dashboard import profile_homes
+        profiles = profile_homes()
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"failed to list profiles: {exc}")
     return {
         "profiles": [
             {
-                "name": p.name,
-                "is_default": bool(p.is_default),
-                "model": p.model or "",
-                "provider": p.provider or "",
-                "description": p.description or "",
-                "description_auto": bool(p.description_auto),
-                "skill_count": int(p.skill_count or 0),
+                "name": name,
+                "is_default": name == "default",
+                "model": "",
+                "provider": "",
+                "description": "",
+                "description_auto": False,
+                "skill_count": 0,
             }
-            for p in profiles
+            for name, _home in profiles
         ],
     }
 
@@ -2200,24 +2226,14 @@ def update_profile_description(profile_name: str, payload: DescribeBody):
     ``--overwrite``.
     """
     try:
-        from hermes_cli import profiles as profiles_mod
-        canon = profiles_mod.normalize_profile_name(profile_name)
-        if canon == "default":
-            from hermes_constants import get_hermes_home  # type: ignore
-            from pathlib import Path as _Path
-            profile_dir = _Path(get_hermes_home())
-        else:
-            profile_dir = profiles_mod.get_profile_dir(canon)
-        if not profile_dir.is_dir():
-            raise HTTPException(status_code=404, detail=f"profile '{profile_name}' not found")
+        from hermes_cli.cron_dashboard import profile_home
+        canon, profile_dir = profile_home(profile_name)
         text = (payload.description or "").strip()
-        profiles_mod.write_profile_meta(
-            profile_dir,
-            description=text,
-            description_auto=False,
-        )
+        _write_profile_description(profile_dir, text)
     except HTTPException:
         raise
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail=f"profile '{profile_name}' not found")
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"failed to update profile: {exc}")
     return {"ok": True, "profile": canon, "description": text}
@@ -2329,11 +2345,21 @@ def get_orchestration_settings():
     resolved_orch = explicit_orch
     resolved_default = explicit_default
     try:
-        from hermes_cli import profiles as profiles_mod
-        active_default = profiles_mod.get_active_profile_name() or "default"
-        if not resolved_orch or not profiles_mod.profile_exists(resolved_orch):
+        from hermes_cli.cron_dashboard import active_profile_name, profile_home
+        active_default = active_profile_name() or "default"
+        if resolved_orch:
+            try:
+                resolved_orch = profile_home(resolved_orch)[0]
+            except (ValueError, FileNotFoundError):
+                resolved_orch = active_default
+        else:
             resolved_orch = active_default
-        if not resolved_default or not profiles_mod.profile_exists(resolved_default):
+        if resolved_default:
+            try:
+                resolved_default = profile_home(resolved_default)[0]
+            except (ValueError, FileNotFoundError):
+                resolved_default = active_default
+        else:
             resolved_default = active_default
     except Exception:
         active_default = "default"
@@ -2374,39 +2400,30 @@ def set_orchestration_settings(payload: OrchestrationSettingsBody):
         cfg["kanban"] = kanban_section
 
     # Validate any non-empty profile names exist before saving.
-    try:
-        from hermes_cli import profiles as profiles_mod
-    except Exception:
-        profiles_mod = None  # type: ignore
+    from hermes_cli.cron_dashboard import profile_home
 
     if payload.orchestrator_profile is not None:
         name = (payload.orchestrator_profile or "").strip()
-        if name and profiles_mod is not None:
+        if name:
             try:
-                if not profiles_mod.profile_exists(name):
-                    raise HTTPException(
-                        status_code=400,
-                        detail=f"profile '{name}' does not exist",
-                    )
-            except HTTPException:
-                raise
-            except Exception:
-                pass  # fail open if the lookup itself errors
+                name = profile_home(name)[0]
+            except (ValueError, FileNotFoundError):
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"profile '{name}' does not exist",
+                )
         kanban_section["orchestrator_profile"] = name
 
     if payload.default_assignee is not None:
         name = (payload.default_assignee or "").strip()
-        if name and profiles_mod is not None:
+        if name:
             try:
-                if not profiles_mod.profile_exists(name):
-                    raise HTTPException(
-                        status_code=400,
-                        detail=f"profile '{name}' does not exist",
-                    )
-            except HTTPException:
-                raise
-            except Exception:
-                pass
+                name = profile_home(name)[0]
+            except (ValueError, FileNotFoundError):
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"profile '{name}' does not exist",
+                )
         kanban_section["default_assignee"] = name
 
     if payload.auto_decompose is not None:
