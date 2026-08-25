@@ -13,7 +13,6 @@ import time
 from pathlib import Path
 from typing import Any, Sequence
 
-from hermes_cli.history_pagination import DEFAULT_HISTORY_PAGE_SIZE
 from playwright_dashboard_login import (
     DEFAULT_URL,
     Credentials,
@@ -48,6 +47,10 @@ def _smoke_javascript(
     provider: str = "",
     model: str = "",
 ) -> str:
+    # Imported lazily so the module loads without hermes_cli on sys.path; the
+    # constant is only needed for the messages-path template below.
+    from hermes_cli.history_pagination import DEFAULT_HISTORY_PAGE_SIZE
+
     config = json.dumps(
         {
             "base": base,
