@@ -116,7 +116,12 @@ def _has_conflicts(status: str) -> bool:
 
 
 def _has_unpushed_commits(cwd: Path) -> bool:
-    ok, count, _ = _git(cwd, "rev-list", "--count", "--not", "--remotes=origin", "HEAD")
+    # ``--not`` is sticky and negates every following specifier up to the next
+    # ``--not`` or end of args, so the previous form ``--not --remotes=origin HEAD``
+    # silently excluded HEAD itself from the positive side and always returned 0,
+    # even when HEAD had unpushed commits. The positive ref must come first, then
+    # ``--not`` to exclude the origin/* refs.
+    ok, count, _ = _git(cwd, "rev-list", "--count", "HEAD", "--not", "--remotes=origin")
     return ok and count.isdigit() and int(count) > 0
 
 
