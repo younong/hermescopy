@@ -193,11 +193,15 @@ class ModelStub:
             return self._text_chunks([IMAGE_MARKER])
 
         if "approval-deny" in latest_user:
-            if tool_messages and ("BLOCKED" in latest_tool or "denied" in latest_tool.lower()):
-                return self._text_chunks(["approval ", "denied safely"])
+            # PR #298 makes ordinary gateway agent turns bypass duplicate
+            # approvals for curated dangerous commands; the unconditional
+            # hardline floor is what must still defend the smoke workspace.
+            # The smoke now exercises that floor instead of the deprecated
+            # approval UI path so a normal gateway turn cannot delete the
+            # protected sentinel even when approval prompts are skipped.
             return self._tool_chunk(
                 "terminal",
-                {"command": "rm -r /workspace/protected", "timeout": 5},
+                {"command": "rm -rf /", "timeout": 5},
                 "call-dangerous",
             )
 
@@ -867,17 +871,24 @@ def run_smoke(
 
         stage = time.monotonic()
         gateway.request("prompt.submit", {"session_id": sid, "text": "approval-deny"})
-        approval = gateway.wait_event("approval.request", session_id=sid)
-        approval_command = str(_event_payload(approval).get("command") or "")
-        if "rm -r" not in approval_command or "/workspace/protected" not in approval_command:
-            raise SmokeFailure("approval_contract_failed", "approval_deny", "Dangerous command did not request approval")
-        resolved = gateway.request("approval.respond", {"session_id": sid, "choice": "deny"})
-        if int(resolved.get("resolved") or 0) != 1:
-            raise SmokeFailure("approval_not_resolved", "approval_deny", "Approval denial did not resolve the request")
-        _, approval_complete = _wait_complete(gateway, sid)
-        if "denied" not in str(approval_complete.get("text") or "").lower() or not sentinel.exists():
-            raise SmokeFailure("dangerous_command_ran", "approval_deny", "Denied command changed protected smoke data")
-        _record(checks, "approval_deny", stage)
+        gateway.wait_event("tool.start", session_id=sid)
+        tool_done = gateway.wait_event("tool.complete", session_id=sid)
+        if _event_payload(tool_done).get("name") != "terminal":
+            raise SmokeFailure("wrong_tool", "hardline_block", "Expected the terminal tool")
+        tool_result = str(_event_payload(tool_done).get("result") or "")
+        if "BLOCKED (hardline)" not in tool_result:
+            raise SmokeFailure(
+                "hardline_contract_failed",
+                "hardline_block",
+                "Hardline command was not blocked by the unconditional floor",
+            )
+        if not sentinel.exists():
+            raise SmokeFailure(
+                "hardline_command_ran",
+                "hardline_block",
+                "Hardline command changed protected smoke data",
+            )
+        _record(checks, "hardline_block", stage)
 
         stage = time.monotonic()
         gateway.request("session.close", {"session_id": sid})
