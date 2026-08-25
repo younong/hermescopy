@@ -13,6 +13,7 @@ import time
 from pathlib import Path
 from typing import Any, Sequence
 
+from hermes_cli.history_pagination import DEFAULT_HISTORY_PAGE_SIZE
 from playwright_dashboard_login import (
     DEFAULT_URL,
     Credentials,
@@ -290,7 +291,7 @@ def _smoke_javascript(
 
     started = now();
     activeCheck = 'public_session_reader_messages';
-    const messagesPath = `${{config.pathPrefix}}api/sessions/${{encodeURIComponent(storedSessionId)}}/messages?limit=100`;
+    const messagesPath = `${{config.pathPrefix}}api/sessions/${{encodeURIComponent(storedSessionId)}}/messages?limit={DEFAULT_HISTORY_PAGE_SIZE}`;
     const history = await readerJSON(messagesPath, activeCheck);
     if (!Array.isArray(history.messages) || !JSON.stringify(history.messages).includes(config.marker)) {{
       throw new Error('session reader messages omitted the smoke marker');
