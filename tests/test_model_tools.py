@@ -19,6 +19,33 @@ from model_tools import (
 # =========================================================================
 
 class TestHandleFunctionCall:
+    def test_terminal_literal_pseudo_reply_is_blocked_before_dispatch(self, monkeypatch):
+        monkeypatch.setattr(
+            "model_tools.registry.dispatch",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                AssertionError("pseudo-reply must not reach dispatch")
+            ),
+        )
+
+        result = json.loads(handle_function_call("terminal", {"command": "echo I am here and ready to help with whatever you need today."}))
+
+        assert result["status"] == "blocked"
+        assert result["exit_code"] == -1
+        assert "directly in the assistant message" in result["error"]
+        assert "I am here" not in result["error"]
+
+    def test_terminal_real_shell_command_is_not_classified_as_pseudo_reply(self, monkeypatch):
+        monkeypatch.setattr(
+            "model_tools.registry.dispatch",
+            lambda *_args, **_kwargs: json.dumps({"ok": True}),
+        )
+
+        result = json.loads(
+            handle_function_call("terminal", {"command": "echo $HOME"})
+        )
+
+        assert result == {"ok": True}
+
     def test_agent_loop_tool_returns_error(self):
         for tool_name in _AGENT_LOOP_TOOLS:
             result = json.loads(handle_function_call(tool_name, {}))

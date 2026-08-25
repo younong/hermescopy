@@ -1027,6 +1027,28 @@ def handle_function_call(
         function_args = {}
     _tool_middleware_trace = list(tool_request_middleware_trace or [])
 
+    # A model sometimes uses a shell builtin as a transport for a response that
+    # should have been emitted as assistant text. Reject only the unambiguous
+    # literal-output form; the terminal boundary repeats this check for direct
+    # registry callers and authenticated executors.
+    if function_name == "terminal":
+        command = function_args.get("command")
+        try:
+            from tools.terminal_tool import is_pseudo_reply_command
+            pseudo_reply = is_pseudo_reply_command(command)
+        except Exception:
+            pseudo_reply = False
+        if pseudo_reply:
+            return json.dumps({
+                "output": "",
+                "exit_code": -1,
+                "error": (
+                    "Blocked terminal pseudo-reply: send purely textual responses "
+                    "directly in the assistant message instead of using echo or printf."
+                ),
+                "status": "blocked",
+            }, ensure_ascii=False)
+
     # ── Tool Search bridge dispatch ──────────────────────────────────
     # tool_search and tool_describe are pure catalog reads — handle them
     # inline. tool_call is unwrapped to the underlying tool so that every

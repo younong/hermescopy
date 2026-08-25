@@ -40,6 +40,7 @@ from agent.prompt_builder import (
     SKILLS_GUIDANCE,
     STEER_CHANNEL_NOTE,
     TASK_COMPLETION_GUIDANCE,
+    TEXT_RESPONSE_TOOL_GUIDANCE,
     TOOL_USE_ENFORCEMENT_GUIDANCE,
     TOOL_USE_ENFORCEMENT_MODELS,
     drain_truncation_warnings,
@@ -165,6 +166,12 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     # Universal response-length and long-form delivery policy. Keep this separate
     # from the replaceable SOUL identity so it applies to every user and surface.
     stable_parts.append(RESPONSE_STYLE_GUIDANCE)
+
+    # Purely textual replies should not spend a terminal round-trip. Keep this
+    # in the stable tier so it applies consistently across all tool-enabled
+    # surfaces without invalidating the per-turn prompt cache.
+    if agent.valid_tool_names:
+        stable_parts.append(TEXT_RESPONSE_TOOL_GUIDANCE)
 
     # Pointer to the hermes-agent skill + docs for user questions about Hermes itself.
     stable_parts.append(HERMES_AGENT_HELP_GUIDANCE)
