@@ -1142,6 +1142,38 @@ def test_supervisor_resource_membership_failure_releases_reservation(tmp_path):
         os.close(fd)
 
 
+def test_supervisor_reclaims_conclusively_absent_starting_orphan_lease(tmp_path):
+    owner = _Owner("ok1_starting_orphan", tmp_path / "owner")
+    spawned: list[dict] = []
+
+    def fake_process_factory(*args, **kwargs):
+        spawned.append({"args": args, "kwargs": kwargs})
+        argv = args[0]
+        Path(argv[argv.index("--socket") + 1]).touch()
+        return _FakeProcess()
+
+    supervisor = OwnerWorkerSupervisor(
+        control_home=tmp_path / "control",
+        client_cls=_FakeClient,
+        process_factory=fake_process_factory,
+        startup_timeout=0.1,
+        startup_cooldown=0,
+    )
+    stale = supervisor.authority_store.claim_worker_start(
+        owner.owner_key,
+        worker_id="stale-starting-worker",
+    )
+
+    replacement = supervisor.get_or_start(owner)
+
+    assert replacement.worker_generation == 2
+    assert stale.lease.state is WorkerLeaseState.STARTING
+    assert supervisor.authority_store.read_owner_worker_lease(owner.owner_key).state is WorkerLeaseState.ACTIVE
+    assert supervisor.authority_store.read_worker_generation(owner.owner_key, 1).state is WorkerGenerationState.FAILED
+    assert supervisor.authority_store.read_worker_generation(owner.owner_key, 2).state is WorkerGenerationState.ACTIVE
+    assert len(spawned) == 1
+
+
 def test_supervisor_reclaims_conclusively_absent_orphan_lease(tmp_path):
     owner = _Owner("ok1_orphan", tmp_path / "owner")
     spawned: list[dict] = []

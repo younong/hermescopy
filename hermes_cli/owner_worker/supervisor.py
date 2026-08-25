@@ -1043,10 +1043,8 @@ class OwnerWorkerSupervisor:
         a potentially live peer and is never reclaimed here.
         """
         lease = self.authority_store.read_owner_worker_lease(owner_key)
-        # A STARTING fence may belong to a concurrent supervisor between
-        # claim and socket bind. Without a durable process identity/liveness
-        # witness, leave it fail-closed rather than racing that startup.
         if lease is None or lease.state not in {
+            WorkerLeaseState.STARTING,
             WorkerLeaseState.ACTIVE,
             WorkerLeaseState.DRAINING,
         }:
