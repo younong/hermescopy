@@ -1,12 +1,14 @@
-import type {
-  AutomationBlueprint,
-  AutomationBlueprintField,
-  CronDeliveryTarget,
-  CronJob,
-  CronJobMutation,
-  ModelOptionsResponse,
-  SkillInfo,
-  ToolsetInfo,
+import {
+  employeeDisplayName,
+  type AutomationBlueprint,
+  type AutomationBlueprintField,
+  type CronDeliveryTarget,
+  type CronJob,
+  type CronJobMutation,
+  type Employee,
+  type ModelOptionsResponse,
+  type SkillInfo,
+  type ToolsetInfo,
 } from "../../../../web/src/lib/api";
 import type { CronJobEditorState } from "../../../../web/src/lib/cron-job-editor";
 import {
@@ -122,6 +124,7 @@ function ScheduledTasksPage() {
   const [availableSkills, setAvailableSkills] = useState<SkillInfo[]>([]);
   const [availableToolsets, setAvailableToolsets] = useState<ToolsetInfo[]>([]);
   const [modelOptions, setModelOptions] = useState<ModelOptionsResponse | null>(null);
+  const [employees, setEmployees] = useState<Employee[]>([]);
 
   const scheduleStrings: ScheduleDescribeStrings = {
     ...t.cron.scheduleDescribe,
@@ -154,11 +157,13 @@ function ScheduledTasksPage() {
       fetchJSON<SkillInfo[]>("/api/skills").catch(() => []),
       fetchJSON<ToolsetInfo[]>("/api/tools/toolsets").catch(() => []),
       fetchJSON<ModelOptionsResponse>("/api/model/options").catch(() => null),
-    ]).then(([skills, toolsets, options]) => {
+      fetchJSON<{ employees: Employee[] }>("/api/employees?status=active&page=1&page_size=100").catch(() => ({ employees: [] })),
+    ]).then(([skills, toolsets, options, employeeList]) => {
       if (cancelled) return;
       setAvailableSkills([...skills].sort((a, b) => a.name.localeCompare(b.name)));
       setAvailableToolsets([...toolsets].sort((a, b) => a.name.localeCompare(b.name)));
       setModelOptions(options);
+      setEmployees(employeeList.employees ?? []);
     });
     return () => {
       cancelled = true;
@@ -175,7 +180,11 @@ function ScheduledTasksPage() {
   }, [setEnd, t.common.create]);
 
   const save = async (form: CronJobEditorState, job?: CronJob) => {
-    const payload = buildCronJobPayloadFromEditor(form);
+    const effectiveForm = {
+      ...form,
+      mode: form.employee_id || form.target_employee_ids.length ? "employee" as const : "custom" as const,
+    };
+    const payload = buildCronJobPayloadFromEditor(effectiveForm);
     if (!payload.schedule || (!payload.no_agent && !cronJobHasExecutionContent(payload))) {
       showToast(`${t.cron.prompt} & ${t.cron.schedule} required`, "error");
       return;
@@ -258,6 +267,7 @@ function ScheduledTasksPage() {
     availableToolsets,
     modelOptions,
     deliveryTargets,
+    employees,
   };
   const pendingJob = jobDelete.pendingId
     ? jobs.find((job) => job.id === jobDelete.pendingId)
@@ -353,6 +363,7 @@ interface JobDialogProps {
     availableToolsets: ToolsetInfo[];
     modelOptions: ModelOptionsResponse | null;
     deliveryTargets: CronDeliveryTarget[];
+    employees: Employee[];
   };
   submitLabel: string;
   title: string;
@@ -448,6 +459,38 @@ function CronJobFormFields({
         />
       </Field>
       <ScheduleBuilder value={form.scheduleState} onChange={(value) => update("scheduleState", value)} />
+      <Field label={t.cron.editor.employee} htmlFor={`${idPrefix}-employee`}>
+        <Select
+          id={`${idPrefix}-employee`}
+          value={form.employee_id}
+          onValueChange={(employee_id: string) =>
+            onChange({ ...form, employee_id, target_employee_ids: [] })
+          }
+        >
+          <SelectOption value="">{t.cron.editor.employeePlaceholder}</SelectOption>
+          {resources.employees.map((employee) => (
+            <SelectOption key={employee.employee_id} value={employee.employee_id}>
+              {employeeDisplayName(employee, t.cron.editor.modeEmployee, employee.employee_id)}
+            </SelectOption>
+          ))}
+        </Select>
+      </Field>
+      <Field label={`${t.cron.editor.employee} (multiple)`}>
+        <NameCheckboxPicker
+          available={resources.employees.map((employee) => ({
+            name: employee.employee_id,
+            description: employeeDisplayName(employee, t.cron.editor.modeEmployee, employee.employee_id),
+          }))}
+          emptyLabel={t.cron.editor.employeesEmpty}
+          id={`${idPrefix}-target-employees`}
+          onChange={(target_employee_ids) => onChange({
+            ...form,
+            target_employee_ids,
+            employee_id: target_employee_ids.length ? "" : form.employee_id,
+          })}
+          selected={form.target_employee_ids}
+        />
+      </Field>
       <Field label={t.cron.deliverTo} htmlFor={`${idPrefix}-deliver`}>
         <Select
           id={`${idPrefix}-deliver`}

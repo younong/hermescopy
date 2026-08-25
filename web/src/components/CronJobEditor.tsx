@@ -57,27 +57,50 @@ function CronEmployeeFields({
   const active = employees.filter((employee) => employee.lifecycle_status === "active");
   const known = new Set(active.map((employee) => employee.employee_id));
   return (
-    <Field htmlFor={`${idPrefix}-employee`} label={t.cron.editor.employee}>
-      <select
-        className={FIELD_INPUT}
-        id={`${idPrefix}-employee`}
-        onChange={(event) => onChange({ ...form, employee_id: event.target.value })}
-        value={form.employee_id}
-      >
-        <option value="">{t.cron.editor.employeePlaceholder}</option>
-        {active.map((employee) => (
-          <option key={employee.employee_id} value={employee.employee_id}>
-            {employeeDisplayName(employee, employeeText.aiAssistant, employeeText.unnamed)}
-          </option>
-        ))}
-        {form.employee_id && !known.has(form.employee_id) ? (
-          <option value={form.employee_id}>{form.employee_id}</option>
+    <>
+      <Field htmlFor={`${idPrefix}-employee`} label={t.cron.editor.employee}>
+        <select
+          className={FIELD_INPUT}
+          id={`${idPrefix}-employee`}
+          onChange={(event) =>
+            onChange({ ...form, employee_id: event.target.value, target_employee_ids: [] })
+          }
+          value={form.employee_id}
+        >
+          <option value="">{t.cron.editor.employeePlaceholder}</option>
+          {active.map((employee) => (
+            <option key={employee.employee_id} value={employee.employee_id}>
+              {employeeDisplayName(employee, employeeText.aiAssistant, employeeText.unnamed)}
+            </option>
+          ))}
+          {form.employee_id && !known.has(form.employee_id) ? (
+            <option value={form.employee_id}>{form.employee_id}</option>
+          ) : null}
+        </select>
+        {active.length === 0 ? (
+          <p className="text-[12px] text-[#a0a3a8]">{t.cron.editor.employeesEmpty}</p>
         ) : null}
-      </select>
-      {active.length === 0 ? (
-        <p className="text-[12px] text-[#a0a3a8]">{t.cron.editor.employeesEmpty}</p>
-      ) : null}
-    </Field>
+      </Field>
+      <Field label={`${t.cron.editor.employee} (multiple)`}>
+        <NameCheckboxPicker
+          id={`${idPrefix}-target-employees`}
+          available={active.map((employee) => ({
+            name: employee.employee_id,
+            description: employeeDisplayName(employee, employeeText.aiAssistant, employeeText.unnamed),
+          }))}
+          selected={form.target_employee_ids}
+          onChange={(target_employee_ids) =>
+            onChange({
+              ...form,
+              target_employee_ids,
+              employee_id: target_employee_ids.length ? "" : form.employee_id,
+            })
+          }
+          emptyLabel={t.cron.editor.employeesEmpty}
+        />
+        <p className="text-[12px] text-[#a0a3a8]">Select multiple employees for one scheduled run.</p>
+      </Field>
+    </>
   );
 }
 
@@ -282,7 +305,15 @@ export function CronJobFormFields({
                     : "text-[#85888e] hover:text-[#202124]"
                 }`}
                 key={mode.value}
-                onClick={() => update("mode", mode.value)}
+                onClick={() =>
+                  onChange({
+                    ...form,
+                    mode: mode.value,
+                    ...(mode.value === "custom"
+                      ? { employee_id: "", target_employee_ids: [] }
+                      : {}),
+                  })
+                }
                 type="button"
               >
                 {mode.label}

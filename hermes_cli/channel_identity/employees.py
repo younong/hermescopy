@@ -361,10 +361,15 @@ def update_employee_collaboration_policy(
     may_participate: bool,
     may_create_groups: bool,
     invite_quota: int | None,
+    may_create_scheduled_tasks: bool = False,
 ) -> EmployeeCollaborationPolicy:
     """Replace internal collaboration permissions for one employee."""
     employee_id = _employee_id(employee_id)
-    if not isinstance(may_participate, bool) or not isinstance(may_create_groups, bool):
+    if (
+        not isinstance(may_participate, bool)
+        or not isinstance(may_create_groups, bool)
+        or not isinstance(may_create_scheduled_tasks, bool)
+    ):
         raise ValueError("collaboration policy flags must be booleans")
     if invite_quota is not None and (
         isinstance(invite_quota, bool)
@@ -381,12 +386,14 @@ def update_employee_collaboration_policy(
         conn.execute(
             """
             INSERT INTO employee_collaboration_policies
-              (employee_id, may_participate, may_create_groups, invite_quota,
-               updated_by_owner_key, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+              (employee_id, may_participate, may_create_groups,
+               may_create_scheduled_tasks, invite_quota, updated_by_owner_key,
+               created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(employee_id) DO UPDATE SET
                 may_participate=excluded.may_participate,
                 may_create_groups=excluded.may_create_groups,
+                may_create_scheduled_tasks=excluded.may_create_scheduled_tasks,
                 invite_quota=excluded.invite_quota,
                 updated_by_owner_key=excluded.updated_by_owner_key,
                 updated_at=excluded.updated_at
@@ -395,6 +402,7 @@ def update_employee_collaboration_policy(
                 employee_id,
                 int(may_participate),
                 int(may_create_groups),
+                int(may_create_scheduled_tasks),
                 invite_quota,
                 owner.owner_key,
                 now,
@@ -405,6 +413,7 @@ def update_employee_collaboration_policy(
         employee_id=employee_id,
         may_participate=may_participate,
         may_create_groups=may_create_groups,
+        may_create_scheduled_tasks=may_create_scheduled_tasks,
         invite_quota=invite_quota,
     )
 
@@ -1046,6 +1055,9 @@ def _employee_from_row(row) -> Employee:
             employee_id=row["employee_id"],
             may_participate=True if is_builtin else bool(row["may_participate"]),
             may_create_groups=True if is_builtin else bool(row["may_create_groups"]),
+            may_create_scheduled_tasks=(
+                True if is_builtin else bool(row["may_create_scheduled_tasks"])
+            ),
             invite_quota=(
                 None
                 if is_builtin or row["invite_quota"] is None
@@ -1073,6 +1085,7 @@ SELECT e.employee_id, e.canonical_user_id, e.employee_kind,
        p.revision AS profile_revision, p.profile_fingerprint,
        COALESCE(cp.may_participate, 1) AS may_participate,
        COALESCE(cp.may_create_groups, 0) AS may_create_groups,
+       COALESCE(cp.may_create_scheduled_tasks, 0) AS may_create_scheduled_tasks,
        CASE WHEN cp.employee_id IS NULL THEN 5 ELSE cp.invite_quota END AS invite_quota,
        eb.binding_id, eb.provider, eb.connector_account_id,
        eb.lifecycle_status AS binding_status, a.provider_account_id,

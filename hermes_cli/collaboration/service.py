@@ -592,6 +592,38 @@ class CollaborationService:
         self._deliver_origin_card(task["task_id"], completion=True)
         return result
 
+    def finish_cron_task(self, *, task_id: str, summary: str) -> dict[str, Any]:
+        """Durably settle a cron-owned task without invoking a creator turn."""
+        task = self.store.ai_task(task_id)
+        if str(task.get("source_kind") or "") != "cron":
+            raise RuntimeError("cron task source is invalid")
+        result, changed = self.store.complete_ai_task(
+            task_id,
+            summary=summary,
+            idempotency_key=f"cron:finish:{task_id}",
+        )
+        if changed and result.get("event_id"):
+            event = self.store.list_events_payload(
+                result["group_id"],
+                after_sequence=self.store.get_group(result["group_id"]).last_sequence - 1,
+            )["events"][0]
+            self.emit("collaboration.event.appended", event)
+        return result
+
+    def mark_cron_task_ambiguous(self, *, task_id: str, reason: str) -> dict[str, Any]:
+        """Persist an uncertain cron outcome so recovery cannot silently replay it."""
+        task = self.store.ai_task(task_id)
+        if str(task.get("source_kind") or "") != "cron":
+            raise RuntimeError("cron task source is invalid")
+        result, changed = self.store.mark_ai_task_ambiguous(task_id, reason=reason)
+        if changed and result.get("event_id"):
+            event = self.store.list_events_payload(
+                result["group_id"],
+                after_sequence=self.store.get_group(result["group_id"]).last_sequence - 1,
+            )["events"][0]
+            self.emit("collaboration.event.appended", event)
+        return result
+
     def _require_bound_context(self, context: CollaborationAgentContext, *, role: str) -> None:
         if not isinstance(context, CollaborationAgentContext) or context.service is not self:
             raise RuntimeError("trusted collaboration context is required")
@@ -674,6 +706,10 @@ class CollaborationService:
             else task.get("creation_delivered_at")
         )
         if delivered is not None:
+            return
+        if task["source_kind"] == "cron":
+            # Cron target runs persist their aggregate through the Owner Worker
+            # cron store; they have no collaboration channel card to deliver.
             return
         if task["provider"] == "feishu":
             self.store.ensure_origin_delivery_intent(

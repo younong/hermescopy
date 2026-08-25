@@ -222,6 +222,23 @@ def _normalize_skill_list(skill: Optional[str] = None, skills: Optional[Any] = N
     return normalized
 
 
+def _normalize_employee_ids(value: Any) -> List[str]:
+    """Normalize explicit employee targets while preserving their order."""
+    if value is None:
+        return []
+    raw_items = [value] if isinstance(value, str) else (
+        list(value) if isinstance(value, (list, tuple, set)) else [value]
+    )
+    normalized: List[str] = []
+    for item in raw_items:
+        text = str(item or "").strip()
+        if text and text not in normalized:
+            normalized.append(text)
+    if len(normalized) > 32:
+        raise ValueError("target_employee_ids cannot contain more than 32 employees")
+    return normalized
+
+
 def _apply_skill_fields(job: Dict[str, Any]) -> Dict[str, Any]:
     """Return a job dict with canonical `skills` and legacy `skill` fields aligned."""
     normalized = dict(job)
@@ -263,6 +280,9 @@ def _normalize_job_record(job: Dict[str, Any]) -> Dict[str, Any]:
     ensure consumers never crash while formatting or running those records.
     """
     normalized = _apply_skill_fields(job)
+    normalized["target_employee_ids"] = _normalize_employee_ids(
+        normalized.get("target_employee_ids")
+    )
     job_id = _coerce_job_text(normalized.get("id"), "unknown")
     prompt = _coerce_job_text(normalized.get("prompt"))
     normalized["id"] = job_id
@@ -897,6 +917,7 @@ def create_job(
     no_agent: bool = False,
     attach_to_session: Optional[bool] = None,
     employee_id: Optional[str] = None,
+    target_employee_ids: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
     """
     Create a new cron job.
@@ -975,6 +996,12 @@ def create_job(
     normalized_no_agent = bool(no_agent)
     normalized_attach = attach_to_session if isinstance(attach_to_session, bool) else None
     normalized_employee_id = _normalize_job_optional_text(employee_id)
+    normalized_target_employee_ids = _normalize_employee_ids(target_employee_ids)
+
+    if normalized_employee_id and normalized_target_employee_ids:
+        raise ValueError("employee_id and target_employee_ids are mutually exclusive")
+    if normalized_target_employee_ids and normalized_no_agent:
+        raise ValueError("target_employee_ids require an agent cron job")
 
     # no_agent jobs are meaningless without a script — the script IS the job.
     # Surface this as a clear ValueError at create time so bad configs never
@@ -1056,6 +1083,7 @@ def create_job(
         "enabled_toolsets": normalized_toolsets,
         "workdir": normalized_workdir,
         "employee_id": normalized_employee_id,
+        "target_employee_ids": normalized_target_employee_ids,
     }
     # Only persist attach_to_session when explicitly set, so existing jobs and
     # the common case stay byte-identical (absent key => fall back to the

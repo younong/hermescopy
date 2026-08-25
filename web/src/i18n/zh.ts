@@ -1039,6 +1039,8 @@ export const zh: Translations = {
       allowCollaborationHint: "可加入内部群组",
       allowCreateGroups: "允许创建群组",
       allowCreateGroupsHint: "可邀请其他员工",
+      allowCreateScheduledTasks: "允许创建定时任务",
+      allowCreateScheduledTasksHint: "可创建 cron 任务",
       inviteQuota: "邀请名额",
       inviteQuotaFor: "{name}的邀请名额",
       unlimited: "不限制",

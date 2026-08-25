@@ -589,6 +589,8 @@ def _format_job(job: Dict[str, Any]) -> Dict[str, Any]:
         "state": job.get("state", "scheduled" if job.get("enabled", True) else "paused"),
         "paused_at": job.get("paused_at"),
         "paused_reason": job.get("paused_reason"),
+        "employee_id": job.get("employee_id"),
+        "target_employee_ids": list(job.get("target_employee_ids") or []),
     }
     if job.get("script"):
         result["script"] = job["script"]
@@ -667,7 +669,10 @@ def cronjob(
     workdir: Optional[str] = None,
     no_agent: Optional[bool] = None,
     attach_to_session: Optional[bool] = None,
+    employee_id: Optional[str] = None,
+    target_employee_ids: Optional[List[str]] = None,
     task_id: str = None,
+    collaboration_context: Any = None,
 ) -> str:
     """Unified cron job management tool."""
     del task_id  # unused but kept for handler signature compatibility
@@ -723,13 +728,40 @@ def cronjob(
                             success=False,
                         )
 
+            employee_scheduling_requested = bool(employee_id or target_employee_ids)
+            if employee_scheduling_requested:
+                if collaboration_context is None:
+                    return tool_error(
+                        "employee scheduled tasks require a trusted employee context",
+                        success=False,
+                    )
+                service = getattr(collaboration_context, "service", None)
+                creator_employee_id = str(
+                    getattr(collaboration_context, "creator_employee_id", "") or ""
+                ).strip()
+                if service is None or not creator_employee_id:
+                    return tool_error(
+                        "employee scheduling authority is unavailable",
+                        success=False,
+                    )
+                creator = service.resolver.resolve_current(creator_employee_id)
+                if not creator.may_create_scheduled_tasks:
+                    return tool_error(
+                        "employee is not authorized to create scheduled tasks",
+                        success=False,
+                    )
+
+            cron_origin = _origin_from_env()
+            if employee_scheduling_requested:
+                cron_origin = dict(cron_origin or {})
+                cron_origin["creator_employee_id"] = creator_employee_id
             job = create_job(
                 prompt=prompt or "",
                 schedule=schedule,
                 name=name,
                 repeat=repeat,
                 deliver=_normalize_deliver_param(deliver),
-                origin=_origin_from_env(),
+                origin=cron_origin,
                 skills=canonical_skills,
                 model=_normalize_optional_job_value(model),
                 provider=_normalize_optional_job_value(provider),
@@ -740,6 +772,8 @@ def cronjob(
                 workdir=_normalize_optional_job_value(workdir),
                 no_agent=_no_agent,
                 attach_to_session=attach_to_session,
+                employee_id=_normalize_optional_job_value(employee_id),
+                target_employee_ids=target_employee_ids,
             )
             _notify_provider_jobs_changed_safe()
             _create_message = f"Cron job '{job['name']}' created."
@@ -846,6 +880,10 @@ def cronjob(
 
         if normalized == "update":
             updates: Dict[str, Any] = {}
+            if employee_id is not None:
+                updates["employee_id"] = _normalize_optional_job_value(employee_id)
+            if target_employee_ids is not None:
+                updates["target_employee_ids"] = target_employee_ids or None
             if prompt is not None:
                 scan_error = _scan_cron_prompt(prompt)
                 if scan_error:
@@ -959,7 +997,7 @@ def cronjob(
 
 CRONJOB_SCHEMA = {
     "name": "cronjob",
-    "description": """Manage scheduled cron jobs with a single compressed tool.
+    "description": """Manage scheduled tasks with a single compressed tool.
 
 Use action='create' to schedule a new job from a prompt or one or more skills.
 Use action='list' to inspect jobs.
@@ -975,7 +1013,7 @@ NOTE: The agent's final response is auto-delivered to the target. Put the primar
 user-facing content in the final response. Cron jobs run autonomously with no user
 present — they cannot ask questions or request clarification.
 
-Important safety rule: cron-run sessions should not recursively schedule more cron jobs.""",
+Important safety rule: cron-run sessions should not recursively schedule more scheduled tasks.""",
     "parameters": {
         "type": "object",
         "properties": {
@@ -1055,7 +1093,7 @@ Important safety rule: cron-run sessions should not recursively schedule more cr
                 "description": (
                     "Optional job ID or list of job IDs whose most recent completed output is "
                     "injected into the prompt as context before each run. "
-                    "Use this to chain cron jobs: job A collects data, job B processes it. "
+                    "Use this to chain scheduled tasks: job A collects data, job B processes it. "
                     "Each entry must be a valid job ID (from cronjob action='list'). "
                     "Note: injects the most recent completed output — does not wait for "
                     "upstream jobs running in the same tick. "
@@ -1066,6 +1104,17 @@ Important safety rule: cron-run sessions should not recursively schedule more cr
                 "type": "array",
                 "items": {"type": "string"},
                 "description": "Optional list of toolset names to restrict the job's agent to (e.g. [\"web\", \"terminal\", \"file\", \"delegation\"]). When set, only tools from these toolsets are loaded, significantly reducing input token overhead. When omitted, all default tools are loaded. Infer from the job's prompt — e.g. use \"web\" if it calls web_search, \"terminal\" if it runs scripts, \"file\" if it reads files, \"delegation\" if it calls delegate_task. On update, pass an empty array to clear."
+            },
+            "employee_id": {
+                "type": "string",
+                "description": "Optional single AI employee whose current policy runs this job. Mutually exclusive with target_employee_ids."
+            },
+            "target_employee_ids": {
+                "type": "array",
+                "items": {"type": "string"},
+                "maxItems": 32,
+                "uniqueItems": True,
+                "description": "Optional explicit list of AI employee IDs to execute this job in parallel. Use list_employee_catalog or the employee catalog to choose IDs. Mutually exclusive with employee_id; targets are revalidated at fire time."
             },
             "workdir": {
                 "type": "string",
@@ -1130,7 +1179,10 @@ registry.register(
         enabled_toolsets=args.get("enabled_toolsets"),
         workdir=args.get("workdir"),
         no_agent=args.get("no_agent"),
+        employee_id=args.get("employee_id"),
+        target_employee_ids=args.get("target_employee_ids"),
         task_id=kw.get("task_id"),
+        collaboration_context=kw.get("collaboration_context"),
     ))(),
     check_fn=check_cronjob_requirements,
     emoji="⏰",

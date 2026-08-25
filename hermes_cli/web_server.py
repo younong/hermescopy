@@ -1355,6 +1355,7 @@ class BuiltinAssistantPersonalizationUpdate(BaseModel):
 class EmployeeCollaborationPolicyUpdate(BaseModel):
     may_participate: bool
     may_create_groups: bool
+    may_create_scheduled_tasks: bool = False
     invite_quota: Optional[int] = None
 
 
@@ -5591,6 +5592,7 @@ def _employee_payload(runtime, store, owner, employee) -> dict[str, Any]:
         "collaboration_policy": {
             "may_participate": employee.collaboration_policy.may_participate,
             "may_create_groups": employee.collaboration_policy.may_create_groups,
+            "may_create_scheduled_tasks": employee.collaboration_policy.may_create_scheduled_tasks,
             "invite_quota": employee.collaboration_policy.invite_quota,
         },
         "channels": channels,
@@ -5866,6 +5868,7 @@ async def update_employee_collaboration_policy_route(
             employee_id=employee_id,
             may_participate=body.may_participate,
             may_create_groups=body.may_create_groups,
+            may_create_scheduled_tasks=body.may_create_scheduled_tasks,
             invite_quota=body.invite_quota,
         )
         return _employee_payload(

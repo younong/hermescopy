@@ -116,6 +116,7 @@ def test_create_without_channel_and_list_detail_are_owner_scoped(authenticated_c
     assert payload["collaboration_policy"] == {
         "may_participate": True,
         "may_create_groups": False,
+        "may_create_scheduled_tasks": False,
         "invite_quota": 5,
     }
     listed = client.get("/api/employees").json()["employees"]
@@ -132,6 +133,7 @@ def test_create_without_channel_and_list_detail_are_owner_scoped(authenticated_c
     assert builtin["collaboration_policy"] == {
         "may_participate": True,
         "may_create_groups": True,
+        "may_create_scheduled_tasks": True,
         "invite_quota": None,
     }
     assert client.get(f"/api/employees/{employee_id}").json() == payload
@@ -239,6 +241,7 @@ def test_profile_policy_and_lifecycle_are_generic_employee_routes(authenticated_
         json={
             "may_participate": False,
             "may_create_groups": True,
+            "may_create_scheduled_tasks": True,
             "invite_quota": None,
         },
     )
@@ -246,6 +249,7 @@ def test_profile_policy_and_lifecycle_are_generic_employee_routes(authenticated_
     assert policy.json()["collaboration_policy"] == {
         "may_participate": False,
         "may_create_groups": True,
+        "may_create_scheduled_tasks": True,
         "invite_quota": None,
     }
 
@@ -281,6 +285,7 @@ def test_builtin_employee_mutation_routes_return_protected_conflict(
             json={
                 "may_participate": False,
                 "may_create_groups": False,
+                "may_create_scheduled_tasks": False,
                 "invite_quota": 0,
             },
         ),

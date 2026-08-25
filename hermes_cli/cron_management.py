@@ -96,6 +96,8 @@ def _normalize_updates(
         normalized["enabled_toolsets"] = string_list(normalized["enabled_toolsets"])
     if "skills" in normalized:
         normalized["skills"] = string_list(normalized["skills"])
+    if "target_employee_ids" in normalized:
+        normalized["target_employee_ids"] = string_list(normalized["target_employee_ids"])
     return normalized
 
 
@@ -109,6 +111,14 @@ def _validate_effective_job(job: Mapping[str, Any]) -> None:
         raise ValueError("no_agent=True requires a script")
     if not no_agent and not (prompt or skills or script):
         raise ValueError("agent cron jobs require a prompt, skill, or script")
+
+    target_employee_ids = string_list(job.get("target_employee_ids")) or []
+    if target_employee_ids and optional_text(job.get("employee_id")):
+        raise ValueError("target_employee_ids cannot be combined with employee_id")
+    if target_employee_ids and no_agent:
+        raise ValueError("target_employee_ids require an agent cron job")
+    if target_employee_ids and len(target_employee_ids) > 32:
+        raise ValueError("target_employee_ids cannot contain more than 32 employees")
 
     if optional_text(job.get("employee_id")):
         # An employee job runs under the employee's policy (model registration,
@@ -234,6 +244,10 @@ def create_job(
     allowed_workdir_root: Path | None = None,
 ) -> dict[str, Any]:
     store = _store(home)
+    if values.get("target_employee_ids"):
+        raise ValueError(
+            "target_employee_ids require a trusted employee scheduling context"
+        )
     normalized = _normalize_updates(
         values, store.owner_home, allowed_workdir_root=allowed_workdir_root
     )
@@ -260,6 +274,7 @@ def create_job(
             workdir=normalized.get("workdir"),
             no_agent=bool(normalized.get("no_agent")),
             employee_id=normalized.get("employee_id"),
+            target_employee_ids=normalized.get("target_employee_ids"),
         )
         _notify_provider()
     return _annotate_job(job, profile=profile, home=store.owner_home)

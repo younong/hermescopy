@@ -91,6 +91,7 @@ function builtinEmployee(): Extract<Employee, { employee_kind: "builtin_assistan
     collaboration_policy: {
       invite_quota: null,
       may_create_groups: true,
+      may_create_scheduled_tasks: true,
       may_participate: true,
     },
     employee_id: "builtin-a",

@@ -10,6 +10,7 @@ import base64
 import binascii
 import logging
 import mimetypes
+import json
 import os
 import sys
 import time
@@ -1293,6 +1294,123 @@ def create_app(
             raise ValueError("cron workdir is not a directory")
         return str(candidate)
 
+    def _run_target_employee_cron_job(
+        job: dict, fire_id: str, target_employee_ids: list[str]
+    ) -> dict | None:
+        from cron.scheduler import _build_job_prompt, complete_job_run
+        from hermes_cli.collaboration.agent_tools import CollaborationAgentContext
+
+        runtime = getattr(app.state, "collaboration_runtime", None)
+        if runtime is None:
+            raise RuntimeError("collaboration runtime is unavailable")
+        service = runtime.service
+        creator_id = str(
+            (job.get("origin") or {}).get("creator_employee_id") or ""
+        ).strip()
+        if not creator_id:
+            raise RuntimeError("scheduled employee task creator is unavailable")
+        creator = service.resolver.resolve_current(creator_id)
+        if not creator.may_participate or not creator.may_create_groups:
+            raise RuntimeError("scheduled employee task creator is unauthorized")
+        targets = []
+        for employee_id in dict.fromkeys(str(value).strip() for value in target_employee_ids):
+            resolved = service.resolver.resolve_current(employee_id)
+            if not resolved.may_participate:
+                raise RuntimeError(f"target employee is unavailable: {employee_id}")
+            targets.append(employee_id)
+        prompt = _build_job_prompt(job)
+        if prompt is None:
+            return complete_job_run(
+                job,
+                success=True,
+                output="",
+                final_response="[SILENT]",
+                fire_id=fire_id,
+            )
+        context = CollaborationAgentContext(
+            service=service,
+            creator_employee_id=creator_id,
+            source_kind="cron",
+            source_provider="cron",
+            source_conversation_id=f"cron:{job['id']}:{fire_id}",
+            source_event_id=fire_id,
+            source_depth=0,
+            role="source",
+            may_create_authorized=True,
+        )
+        created = service.create_internal_group(
+            context=context,
+            title=str(job.get("name") or "Scheduled job"),
+            brief=prompt,
+            invitee_employee_ids=targets,
+            origin_attachment_ids=(),
+            first_round_target_employee_ids=targets,
+            idempotency_key=f"cron:create:{fire_id}",
+        )
+        task_id = str(created["task_id"])
+        group = service.get_group(str(created["group_id"]))
+        turns = group.get("turns") or []
+        if not turns:
+            raise RuntimeError("scheduled employee task has no execution turn")
+        turn_id = str(turns[-1].get("turn_id") or "")
+        try:
+            status = runtime.scheduler.turn_status(turn_id)
+            deadline = time.monotonic() + 1800.0
+            while status.get("status") not in {
+                "completed", "partial", "failed", "ambiguous", "cancelled"
+            }:
+                if time.monotonic() >= deadline:
+                    service.mark_cron_task_ambiguous(
+                        task_id=task_id,
+                        reason="scheduled employee task timed out",
+                    )
+                    raise TimeoutError("scheduled employee task timed out")
+                time.sleep(0.1)
+                status = runtime.scheduler.turn_status(turn_id)
+            results = [
+                {
+                    "employee_id": str(item.get("employee_id") or ""),
+                    "status": str(item.get("status") or ""),
+                    "result": item.get("result") or {},
+                    "error": str(item.get("error") or ""),
+                }
+                for item in status.get("targets") or []
+            ]
+            aggregate = json.dumps(
+                {
+                    "job_id": str(job["id"]),
+                    "fire_id": fire_id,
+                    "status": str(status.get("status") or ""),
+                    "results": results,
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+            success = str(status.get("status")) == "completed"
+            if success:
+                service.finish_cron_task(task_id=task_id, summary=aggregate)
+            else:
+                service.mark_cron_task_ambiguous(
+                    task_id=task_id,
+                    reason="one or more employee targets failed",
+                )
+            return complete_job_run(
+                job,
+                success=success,
+                output=f"# Cron Job: {job.get('name') or job['id']}\n\n{aggregate}\n",
+                final_response=aggregate,
+                error=None if success else "one or more employee targets failed",
+                fire_id=fire_id,
+            )
+        except TimeoutError:
+            raise
+        except Exception as exc:
+            try:
+                service.mark_cron_task_ambiguous(task_id=task_id, reason=str(exc))
+            except Exception:
+                _log.warning("failed to settle cron collaboration task", exc_info=True)
+            raise
+
     def _run_agent_cron_job(job: dict, fire_id: str) -> dict | None:
         from cron.scheduler import _build_job_prompt, complete_job_run
 
@@ -1383,6 +1501,29 @@ def create_app(
                     None,
                 )
                 return executed, delivery
+            target_employee_ids = [
+                str(value).strip()
+                for value in (job.get("target_employee_ids") or [])
+                if str(value).strip()
+            ]
+            if target_employee_ids:
+                try:
+                    return True, _run_target_employee_cron_job(
+                        job, fire_id, target_employee_ids
+                    )
+                except Exception as exc:
+                    _log.error("Employee target cron failed: %s", exc, exc_info=True)
+                    from cron.scheduler import complete_job_run
+
+                    complete_job_run(
+                        job,
+                        success=False,
+                        output="",
+                        final_response="",
+                        error=str(exc),
+                        fire_id=fire_id,
+                    )
+                    return False, None
             return True, _run_agent_cron_job(job, fire_id)
 
     @app.post("/internal/collaboration/deliveries")

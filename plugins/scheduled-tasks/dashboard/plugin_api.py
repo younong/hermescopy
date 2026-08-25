@@ -57,9 +57,12 @@ class CronJobCreate(OwnerSelectors):
     workdir: str | None = None
     no_agent: bool = False
     employee_id: str | None = None
+    target_employee_ids: list[str] | None = None
 
 
 class CronJobUpdate(OwnerSelectors):
+    # Partial cron mutation payload. The cron management layer validates and
+    # normalizes target_employee_ids alongside the other mutable fields.
     updates: dict[str, Any]
 
 
@@ -184,6 +187,11 @@ def create_job_route(request: Request, body: CronJobCreate, profile: str = "defa
     from hermes_cli.cron_management import create_job
 
     values = body.model_dump(exclude={"profile", "owner", "owner_home", "owner_key"})
+    if body.target_employee_ids:
+        raise HTTPException(
+            status_code=403,
+            detail="target_employee_ids require a trusted employee scheduling context",
+        )
     if _owner_worker_mode(request):
         selectors = body.model_dump(include={"owner", "owner_home", "owner_key"})
         _reject_owner_selectors(profile=body.profile or profile, values=selectors)
@@ -207,6 +215,11 @@ def update_job_route(request: Request, job_id: str, body: CronJobUpdate, profile
         selectors = body.model_dump(include={"owner", "owner_home", "owner_key"})
         _reject_owner_selectors(profile=body.profile or profile, values=selectors)
         forbidden = {"profile", "owner", "owner_home", "owner_key"}.intersection(body.updates)
+        if "target_employee_ids" in body.updates:
+            raise HTTPException(
+                status_code=403,
+                detail="target_employee_ids require a trusted employee scheduling context",
+            )
         if forbidden:
             raise HTTPException(status_code=400, detail="owner and profile selection are not available in authenticated mode")
         name = None

@@ -32,6 +32,7 @@ export function emptyCronJobForm(): CronJobEditorState {
     enabled_toolsets: [],
     workdir: "",
     employee_id: "",
+    target_employee_ids: [],
     mode: "employee",
     scheduleState: { ...DEFAULT_SCHEDULE_STATE },
   };
@@ -41,7 +42,7 @@ export function editorFormFromJob(job: CronJob): CronJobEditorState {
   const form = cronJobFormFromJob(job);
   return {
     ...form,
-    mode: form.employee_id ? "employee" : "custom",
+    mode: form.employee_id || form.target_employee_ids.length ? "employee" : "custom",
     scheduleState: parseScheduleString(form.schedule),
   };
 }
@@ -53,11 +54,12 @@ export function buildCronJobPayloadFromEditor(form: CronJobEditorState) {
     schedule: buildScheduleString(scheduleState),
   });
   if (mode === "employee") {
-    // Employee jobs run under the employee's policy resolved at fire time;
-    // explicitly clear every manual execution knob so an update cannot leave
-    // stale values the backend's mutual-exclusion guard would reject.
+    // Employee jobs run under the selected employee policies resolved at fire
+    // time; clear the mutually-exclusive single target when fan-out targets
+    // are selected, and clear every manual execution knob.
     return {
       ...payload,
+      employee_id: payload.target_employee_ids?.length ? null : payload.employee_id,
       skills: [],
       provider: null,
       model: null,
@@ -69,5 +71,5 @@ export function buildCronJobPayloadFromEditor(form: CronJobEditorState) {
       workdir: null,
     };
   }
-  return { ...payload, employee_id: null };
+  return { ...payload, employee_id: null, target_employee_ids: null };
 }
