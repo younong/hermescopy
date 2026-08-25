@@ -627,7 +627,10 @@ async def _proxy_authenticated_session_reader_http(request: Request) -> Response
             headers=forwarded_headers,
         )
         if response.status_code == 401:
-            raise SessionReaderHealthError("session reader rejected its exact capability")
+            raise SessionReaderHealthError(
+                "session reader rejected its exact capability",
+                failure_code="401",
+            )
         log_latency_stage(
             _log,
             trace_id=trace_id,
@@ -636,6 +639,10 @@ async def _proxy_authenticated_session_reader_http(request: Request) -> Response
             started_at=stage_started_at,
             outcome="ok" if response.status_code < 500 else "error",
         )
+        if lifecycle is not None and use is not None and response.status_code < 500:
+            report_success = getattr(lifecycle, "report_request_success", None)
+            if callable(report_success):
+                report_success(use.lease)
     except HTTPException:
         if use is not None:
             use.release()
@@ -644,12 +651,20 @@ async def _proxy_authenticated_session_reader_http(request: Request) -> Response
         if use is not None:
             use.release()
         return _session_reader_unavailable_response()
-    except SessionReaderHealthError:
+    except SessionReaderHealthError as exc:
         if use is not None:
             if lifecycle is not None:
-                lifecycle.report_request_failure(use.lease, "transport")
+                lifecycle.report_request_failure(use.lease, exc.failure_code)
             await supervisor.close_client(use.handle)
             use.release()
+        _log.warning(
+            "session reader proxy request failed method=%s path=%s request_id=%s "
+            "reason=%s",
+            request.method,
+            request.url.path,
+            request.headers.get("x-request-id", ""),
+            exc.failure_code,
+        )
         return _session_reader_unavailable_response()
     except Exception as exc:
         if use is not None:

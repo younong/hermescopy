@@ -28,6 +28,25 @@ def warm_http_transport() -> None:
 class SessionReaderHealthError(RuntimeError):
     """Raised when a Session Reader request or identity check fails."""
 
+    def __init__(self, message: str, *, failure_code: str = "other") -> None:
+        super().__init__(message)
+        self.failure_code = failure_code if failure_code in {
+            "connect", "timeout", "401", "network", "transport", "other"
+        } else "other"
+
+
+def classify_session_reader_error(exc: BaseException) -> str:
+    """Return a safe, stable category for a failed Reader request."""
+    if isinstance(exc, httpx.ConnectError):
+        return "connect"
+    if isinstance(exc, httpx.TimeoutException):
+        return "timeout"
+    if isinstance(exc, httpx.NetworkError):
+        return "network"
+    if isinstance(exc, httpx.RequestError):
+        return "transport"
+    return "unavailable"
+
 
 class SessionReaderClient:
     def __init__(
@@ -72,7 +91,7 @@ class SessionReaderClient:
         content: bytes | None = None,
     ) -> httpx.Response:
         if self._closed:
-            raise SessionReaderHealthError("session reader client is closed")
+            raise SessionReaderHealthError("session reader client is closed", failure_code="other")
         token_path = str(path or "").split("?", 1)[0] or "/"
         request_headers = dict(headers or {})
         request_headers.update(self._headers(lease, token_path))
@@ -84,7 +103,10 @@ class SessionReaderClient:
                 content=content,
             )
         except Exception as exc:
-            raise SessionReaderHealthError(f"session reader request failed: {exc}") from exc
+            raise SessionReaderHealthError(
+                "session reader request failed",
+                failure_code=classify_session_reader_error(exc),
+            ) from exc
 
     async def aclose(self) -> None:
         if not self._closed:
