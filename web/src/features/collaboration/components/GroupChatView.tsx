@@ -3,8 +3,10 @@ import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from "r
 import { guiChatTranslations, useI18n } from "@/i18n";
 import { employeeDisplayName, employeeDisplayRole, type Employee } from "@/lib/api";
 import type { CollaborationApi } from "../api";
+import type { CollaborationSubmitResponse } from "../protocol";
 import { collaborationReducer } from "../reducer";
 import { defaultMentionSelection } from "../mentions";
+import type { CollaborationSubmitMessage } from "../types";
 import { initialCollaborationState, type CollaborationEmployeeIdentity } from "../types";
 import { GroupComposer, type GroupComposerSubmit } from "./GroupComposer";
 import { GroupConversation } from "./GroupConversation";
@@ -25,6 +27,7 @@ export function GroupChatView({ api, connection, employees, groupId, onArchive, 
   const [state, dispatch] = useReducer(collaborationReducer, initialCollaborationState);
   const [memberManagerOpen, setMemberManagerOpen] = useState(false);
   const loadRef = useRef<AbortController | null>(null);
+  const pendingSubmitRef = useRef<CollaborationSubmitMessage | null>(null);
   const stateRef = useRef(state);
   useEffect(() => {
     stateRef.current = state;
@@ -47,6 +50,13 @@ export function GroupChatView({ api, connection, employees, groupId, onArchive, 
     }
   }, [api, groupId]);
 
+  const applySubmitResult = useCallback((result: CollaborationSubmitResponse) => {
+    dispatch({ type: "event", event: { type: "collaboration.event.appended", payload: result.event } });
+    for (const target of result.turn?.targets ?? []) {
+      dispatch({ type: "event", event: { type: "collaboration.target.changed", payload: { group_id: groupId, ...target } } });
+    }
+  }, [groupId]);
+
   useEffect(() => {
     dispatch({ type: "clear" });
     void load(false);
@@ -63,9 +73,21 @@ export function GroupChatView({ api, connection, employees, groupId, onArchive, 
       previousConnection !== "open" &&
       stateRef.current.group?.group_id === groupId
     ) {
-      void load(true);
+      void (async () => {
+        await load(true);
+        const pending = pendingSubmitRef.current;
+        if (!pending) return;
+        try {
+          const result = await api.submitMessage(pending);
+          pendingSubmitRef.current = null;
+          applySubmitResult(result);
+        } catch {
+          // Keep the same idempotency key for the next reconnect. The composer
+          // still owns the user-visible error and preserves the draft.
+        }
+      })();
     }
-  }, [connection, groupId, load]);
+  }, [api, applySubmitResult, connection, groupId, load]);
 
   useEffect(() => api.onEvent((event) => {
     dispatch({ type: "event", event });
@@ -98,17 +120,21 @@ export function GroupChatView({ api, connection, employees, groupId, onArchive, 
   );
 
   const submit = async ({ attachments, selection, text }: GroupComposerSubmit) => {
-    const result = await api.submitMessage({
+    const message: CollaborationSubmitMessage = {
       attachment_ids: attachments.map((attachment) => attachment.attachment_id),
       client_idempotency_key: createIdempotencyKey(),
       group_id: groupId,
       mention_all: selection.mentionAll,
       mentioned_membership_ids: selection.membershipIds,
       text,
-    });
-    dispatch({ type: "event", event: { type: "collaboration.event.appended", payload: result.event } });
-    for (const target of result.turn?.targets ?? []) {
-      dispatch({ type: "event", event: { type: "collaboration.target.changed", payload: { group_id: groupId, ...target } } });
+    };
+    try {
+      const result = await api.submitMessage(message);
+      pendingSubmitRef.current = null;
+      applySubmitResult(result);
+    } catch (cause) {
+      if (connection !== "open") pendingSubmitRef.current = message;
+      throw cause;
     }
   };
 

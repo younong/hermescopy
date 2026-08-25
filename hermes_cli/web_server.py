@@ -11055,6 +11055,24 @@ async def _relay_operation(
         await asyncio.wait_for(operation, timeout=timeout)
     except TimeoutError as exc:
         raise _OwnerWorkerWsRelayClosed(1013, "relay backpressure") from exc
+    except WebSocketDisconnect as exc:
+        raise _OwnerWorkerWsRelayClosed(
+            _ws_bridge_close_code(getattr(exc, "code", None), default=1000),
+            str(getattr(exc, "reason", "") or ""),
+        ) from exc
+    except Exception as exc:
+        # The UDS websocket client can expose transport-specific close errors
+        # (for example websockets.ConnectionClosedError). Normalize only
+        # exceptions that carry a websocket close code; unrelated failures
+        # remain visible to the bridge's existing cleanup/diagnostic path.
+        close_code = getattr(exc, "code", None)
+        close_reason = getattr(exc, "reason", None)
+        if close_code is None and close_reason is None:
+            raise
+        raise _OwnerWorkerWsRelayClosed(
+            _ws_bridge_close_code(close_code, default=1011),
+            str(close_reason or ""),
+        ) from exc
 
 
 async def _relay_send(peer: Any, value: Any) -> None:

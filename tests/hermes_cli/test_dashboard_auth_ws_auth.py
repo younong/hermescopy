@@ -485,6 +485,33 @@ class TestWsAuthOkGated:
         assert result.reason == "internal_owner_invalid"
         assert result.credential == "internal_owner_token"
 
+    def test_relay_operation_normalizes_browser_disconnect(self):
+        import asyncio
+
+        async def fail():
+            raise web_server.WebSocketDisconnect(code=1001)
+
+        with pytest.raises(web_server._OwnerWorkerWsRelayClosed) as exc_info:
+            asyncio.run(web_server._relay_operation(fail()))
+
+        assert exc_info.value.code == 1001
+
+    def test_relay_operation_normalizes_worker_transport_close(self):
+        import asyncio
+
+        class _Closed(RuntimeError):
+            code = 1011
+            reason = "worker stopped"
+
+        async def fail():
+            raise _Closed()
+
+        with pytest.raises(web_server._OwnerWorkerWsRelayClosed) as exc_info:
+            asyncio.run(web_server._relay_operation(fail()))
+
+        assert exc_info.value.code == 1011
+        assert exc_info.value.reason == "worker stopped"
+
     def test_worker_change_closes_only_exact_generation_bridge(self, gated_app):
         import asyncio
         from hermes_cli.dashboard_auth.authority import WorkerGenerationState, WorkerLeaseChange, WorkerLeaseState
