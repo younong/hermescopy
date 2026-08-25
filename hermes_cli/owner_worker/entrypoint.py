@@ -31,6 +31,38 @@ _log = logging.getLogger(__name__)
 _IMAGE_PREVIEW_MAX_BYTES = 16 * 1024 * 1024
 
 
+def _dispatch_deployment_media_only(
+    tool_name: str,
+    arguments: dict[str, Any],
+    *,
+    relay_client: Any,
+    workspace_context: Any,
+    owner_home: Path,
+) -> str:
+    """Dispatch deployment-capable media only through the private relay."""
+    from hermes_cli.owner_worker.media_dispatch import (
+        active_media_selection, dispatch_deployment_media,
+    )
+    from hermes_cli.owner_worker.media_relay import DeploymentMediaRelayError
+
+    kind = "image" if tool_name == "image_generate" else "video"
+    if relay_client is None:
+        raise DeploymentMediaRelayError("deployment media relay is unavailable")
+    provider, model = active_media_selection(kind)
+    route = relay_client.descriptor.route_for(kind, provider, model)
+    if route is None:
+        raise DeploymentMediaRelayError("deployment media selection is unavailable")
+    return dispatch_deployment_media(
+        arguments,
+        kind=kind,
+        model=model or route.default_model,
+        relay_client=relay_client,
+        descriptor=route,
+        workspace_context=workspace_context,
+        owner_home=owner_home,
+    )
+
+
 class BulkDeleteSessions(BaseModel):
     ids: list[str]
     profile: str | None = None
@@ -469,30 +501,12 @@ def create_app(
             app.state.tool_executor_startup_error = "resource broker unavailable"
         else:
             def _dispatch_media(tool_name, arguments, _invocation, _materializer):
-                from hermes_cli.owner_worker.media_dispatch import (
-                    active_media_selection, dispatch_deployment_media,
-                )
-                from hermes_cli.owner_worker.owner_tool_relay import (
-                    _dispatch_owner_media_tool,
-                )
-
-                kind = "image" if tool_name == "image_generate" else "video"
-                relay_client = getattr(app.state, "deployment_media_relay", None)
-                if relay_client is not None:
-                    provider, model = active_media_selection(kind)
-                    route = relay_client.descriptor.route_for(kind, provider, model)
-                    if route is not None:
-                        return dispatch_deployment_media(
-                            arguments,
-                            kind=kind,
-                            model=model or route.default_model,
-                            relay_client=relay_client,
-                            descriptor=route,
-                            workspace_context=workspace_context,
-                            owner_home=owner_home,
-                        )
-                return _dispatch_owner_media_tool(
-                    tool_name, arguments, workspace_context
+                return _dispatch_deployment_media_only(
+                    tool_name,
+                    arguments,
+                    relay_client=getattr(app.state, "deployment_media_relay", None),
+                    workspace_context=workspace_context,
+                    owner_home=owner_home,
                 )
 
             app.state.tool_executor_supervisor = ToolExecutorSupervisor(

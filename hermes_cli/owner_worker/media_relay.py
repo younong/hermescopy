@@ -11,10 +11,13 @@ from __future__ import annotations
 
 import base64
 import json
+import logging
+import math
 import os
 import socket
 import struct
 import threading
+import time
 from dataclasses import dataclass
 from typing import Any
 
@@ -46,6 +49,9 @@ _SAFE_METADATA_KEYS = frozenset({
 })
 _MAX_PARAM_KEY_LENGTH = 64
 _MAX_PARAM_VALUE_LENGTH = 4096
+_MAX_CONCURRENT_MEDIA_REQUESTS = 2
+_MEDIA_REQUEST_WAIT_TIMEOUT_SECONDS = 5.0
+logger = logging.getLogger(__name__)
 
 
 class DeploymentMediaRelayError(RuntimeError):
@@ -139,11 +145,33 @@ class _RelayPeer:
 class DeploymentMediaBroker:
     """Control-plane-only media broker fenced to exact durable worker leases."""
 
-    def __init__(self, *, policy: DeploymentMediaPolicy, authority_store: AuthorityStore) -> None:
+    def __init__(
+        self,
+        *,
+        policy: DeploymentMediaPolicy,
+        authority_store: AuthorityStore,
+        max_concurrent_requests: int = _MAX_CONCURRENT_MEDIA_REQUESTS,
+        request_wait_timeout_seconds: float = _MEDIA_REQUEST_WAIT_TIMEOUT_SECONDS,
+    ) -> None:
+        if (
+            isinstance(max_concurrent_requests, bool)
+            or not isinstance(max_concurrent_requests, int)
+            or max_concurrent_requests < 1
+        ):
+            raise ValueError("deployment media concurrency limit is invalid")
+        if (
+            isinstance(request_wait_timeout_seconds, bool)
+            or not isinstance(request_wait_timeout_seconds, (int, float))
+            or not math.isfinite(request_wait_timeout_seconds)
+            or request_wait_timeout_seconds < 0
+        ):
+            raise ValueError("deployment media wait timeout is invalid")
         self._policy = policy
         self._authority_store = authority_store
         self._peers: dict[tuple[str, int, str, int, int], _RelayPeer] = {}
         self._lock = threading.RLock()
+        self._media_slots = threading.BoundedSemaphore(max_concurrent_requests)
+        self._request_wait_timeout_seconds = float(request_wait_timeout_seconds)
         self._closed = False
 
     @staticmethod
@@ -299,14 +327,80 @@ class DeploymentMediaBroker:
             if not data or len(data) > descriptor.max_reference_bytes or total > descriptor.max_total_reference_bytes:
                 raise DeploymentMediaRelayError("deployment media reference is too large")
             references.append({"name": name, "mime_type": mime_type, "data": data})
-        result = self._policy.execute(
-            operation,
-            provider=descriptor.provider,
-            model=model,
-            prompt=prompt.strip() if operation != "transcribe" else prompt,
-            aspect_ratio=aspect_ratio,
-            references=tuple(references),
-            params=params,
+        started_at = time.monotonic()
+        acquired = self._media_slots.acquire(timeout=self._request_wait_timeout_seconds)
+        wait_seconds = time.monotonic() - started_at
+        if not acquired:
+            logger.warning(
+                "Deployment media request capacity exhausted",
+                extra={
+                    "outcome": "capacity_exhausted",
+                    "operation": operation,
+                    "kind": kind,
+                    "provider": descriptor.provider,
+                    "model": model,
+                    "wait_seconds": round(wait_seconds, 3),
+                    "reference_count": len(references),
+                    "reference_bytes": total,
+                    "params_count": len(params),
+                },
+            )
+            raise DeploymentMediaRelayError("deployment media request capacity is exhausted")
+        try:
+            result = self._policy.execute(
+                operation,
+                provider=descriptor.provider,
+                model=model,
+                prompt=prompt.strip() if operation != "transcribe" else prompt,
+                aspect_ratio=aspect_ratio,
+                references=tuple(references),
+                params=params,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Deployment media request failed",
+                extra={
+                    "outcome": "generation_failed",
+                    "operation": operation,
+                    "kind": kind,
+                    "provider": descriptor.provider,
+                    "model": model,
+                    "wait_seconds": round(wait_seconds, 3),
+                    "elapsed_seconds": round(time.monotonic() - started_at, 3),
+                    "reference_count": len(references),
+                    "reference_bytes": total,
+                    "params_count": len(params),
+                    "error_type": type(exc).__name__,
+                },
+            )
+            raise
+        finally:
+            self._media_slots.release()
+        logger.info(
+            "Deployment media request completed",
+            extra={
+                "outcome": "complete",
+                "operation": operation,
+                "kind": kind,
+                "provider": descriptor.provider,
+                "model": model,
+                "wait_seconds": round(wait_seconds, 3),
+                "elapsed_seconds": round(time.monotonic() - started_at, 3),
+                "reference_count": len(references),
+                "reference_bytes": total,
+                "params_count": len(params),
+                "modality": result.get("modality"),
+                "output_bytes": sum(
+                    len(result.get(name, b""))
+                    for name in ("image_bytes", "video_bytes", "audio_bytes")
+                    if isinstance(result.get(name), bytes)
+                ),
+                "embedding_dimensions": result.get("dimensions")
+                if isinstance(result.get("embedding"), list) else 0,
+                "transcript_chars": len(result.get("text", ""))
+                if isinstance(result.get("text"), str) else 0,
+                "video_url_present": isinstance(result.get("video_url"), str),
+            },
         )
         response: dict[str, Any] = {
             "ok": True,

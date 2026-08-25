@@ -1,6 +1,7 @@
 import base64
 import io
 import json
+import logging
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -29,6 +30,7 @@ from hermes_cli.deployment_media import (
 from hermes_cli.model_plane import capability as capability_module
 from hermes_cli.owner_runtime import ensure_owner_runtime_dirs, owner_worker_runtime_paths
 from hermes_cli.owner_worker.media_dispatch import dispatch_deployment_media
+from hermes_cli.owner_worker.entrypoint import _dispatch_deployment_media_only
 from hermes_cli.owner_worker.media_relay import (
     DeploymentMediaBroker,
     DeploymentMediaRelayError,
@@ -357,6 +359,187 @@ def test_custom_codex_real_path_rejects_before_publication(
         client.close()
         broker.close()
         roots.close()
+
+
+def test_relay_rejects_when_media_capacity_wait_expires(tmp_path, monkeypatch, caplog):
+    store = AuthorityStore(tmp_path)
+    claim = store.claim_worker_start("owner", worker_id="worker")
+    policy = _policy()
+    broker = DeploymentMediaBroker(
+        policy=policy,
+        authority_store=store,
+        max_concurrent_requests=1,
+        request_wait_timeout_seconds=0.01,
+    )
+    active = store.transition_worker_lease(
+        claim.lease,
+        state=WorkerLeaseState.ACTIVE,
+        generation_state=WorkerGenerationState.ACTIVE,
+    )
+    started = threading.Event()
+    release = threading.Event()
+
+    def blocking_executor(**kwargs):
+        started.set()
+        assert release.wait(2)
+        return _fake_executor(**kwargs)
+
+    monkeypatch.setattr(DeploymentMediaRoute, "load_executor", lambda self: blocking_executor)
+    first = threading.Thread(target=broker._handle_request, args=(active, _request(policy, prompt="first")))
+    first.start()
+    assert started.wait(1)
+    with caplog.at_level(logging.WARNING, logger="hermes_cli.owner_worker.media_relay"):
+        with pytest.raises(DeploymentMediaRelayError, match="capacity"):
+            broker._handle_request(active, _request(policy, prompt="must-not-log"))
+    assert "must-not-log" not in caplog.text
+    release.set()
+    first.join(timeout=2)
+    assert not first.is_alive()
+    broker.close()
+
+
+def test_relay_waits_for_media_capacity_and_releases_slot(tmp_path, monkeypatch):
+    store = AuthorityStore(tmp_path)
+    claim = store.claim_worker_start("owner", worker_id="worker")
+    policy = _policy()
+    broker = DeploymentMediaBroker(
+        policy=policy,
+        authority_store=store,
+        max_concurrent_requests=1,
+        request_wait_timeout_seconds=1,
+    )
+    active = store.transition_worker_lease(
+        claim.lease,
+        state=WorkerLeaseState.ACTIVE,
+        generation_state=WorkerGenerationState.ACTIVE,
+    )
+    started = threading.Event()
+    release = threading.Event()
+
+    def blocking_executor(**kwargs):
+        started.set()
+        assert release.wait(2)
+        return _fake_executor(**kwargs)
+
+    monkeypatch.setattr(DeploymentMediaRoute, "load_executor", lambda self: blocking_executor)
+    first_result = []
+    first = threading.Thread(
+        target=lambda: first_result.append(broker._handle_request(active, _request(policy, prompt="first")))
+    )
+    first.start()
+    assert started.wait(1)
+    second_result = []
+    second = threading.Thread(
+        target=lambda: second_result.append(broker._handle_request(active, _request(policy, prompt="second")))
+    )
+    second.start()
+    release.set()
+    first.join(timeout=2)
+    second.join(timeout=2)
+    assert len(first_result) == 1
+    assert len(second_result) == 1
+    broker.close()
+
+
+def test_relay_logs_safe_media_outcome(tmp_path, caplog):
+    store = AuthorityStore(tmp_path)
+    claim = store.claim_worker_start("owner", worker_id="worker")
+    policy = _policy()
+    broker = DeploymentMediaBroker(policy=policy, authority_store=store)
+    active = store.transition_worker_lease(
+        claim.lease,
+        state=WorkerLeaseState.ACTIVE,
+        generation_state=WorkerGenerationState.ACTIVE,
+    )
+    with caplog.at_level(logging.INFO, logger="hermes_cli.owner_worker.media_relay"):
+        broker._handle_request(active, _request(policy, prompt="do-not-log", params={"resolution": "4K"}))
+    assert "do-not-log" not in caplog.text
+    assert len(caplog.records) == 1
+    record = caplog.records[0]
+    assert record.outcome == "complete"
+    assert record.operation == "image_generate"
+    assert record.provider == "apiyi"
+    assert record.model == "gpt-image-2-medium"
+    broker.close()
+
+
+def test_deployment_media_dispatch_fails_closed_without_route(tmp_path, monkeypatch):
+    store = AuthorityStore(tmp_path)
+    claim = store.claim_worker_start("owner", worker_id="worker")
+    policy = _policy()
+    broker = DeploymentMediaBroker(policy=policy, authority_store=store)
+    fd = broker.register(claim.lease)
+    client = OwnerMediaRelayClient(fd, policy.descriptor())
+    monkeypatch.setattr(
+        "hermes_cli.owner_worker.media_dispatch.active_media_selection",
+        lambda _kind: ("missing-provider", "missing-model"),
+    )
+    try:
+        with pytest.raises(DeploymentMediaRelayError, match="selection is unavailable"):
+            _dispatch_deployment_media_only(
+                "image_generate",
+                {"prompt": "draw", "aspect_ratio": "square"},
+                relay_client=client,
+                workspace_context=None,
+                owner_home=tmp_path,
+            )
+    finally:
+        client.close()
+        broker.close()
+
+
+def test_authenticated_image_generation_smoke_mocks_only_provider(tmp_path, monkeypatch):
+    """Exercise the authenticated relay path with a deterministic image provider."""
+    store = AuthorityStore(tmp_path)
+    claim = store.claim_worker_start("owner", worker_id="worker")
+    image_route = _image_route()
+    policy = DeploymentMediaPolicy(routes=(image_route,), policy_id="image-smoke-v1")
+    provider_calls = []
+
+    def image_provider(**kwargs):
+        provider_calls.append(kwargs)
+        return {
+            "image_bytes": _png_bytes((300, 400)),
+            "mime_type": "image/png",
+            "metadata": {"upstream_model": "smoke-image-model"},
+        }
+
+    monkeypatch.setattr(
+        DeploymentMediaRoute,
+        "load_executor",
+        lambda route: image_provider if route.descriptor.kind == "image" else pytest.fail(
+            "smoke must not mock or invoke a non-image provider"
+        ),
+    )
+    broker = DeploymentMediaBroker(policy=policy, authority_store=store)
+    fd = broker.register(claim.lease)
+    client = OwnerMediaRelayClient(fd, policy.descriptor())
+    active = store.transition_worker_lease(
+        claim.lease,
+        state=WorkerLeaseState.ACTIVE,
+        generation_state=WorkerGenerationState.ACTIVE,
+    )
+    broker.activate(active)
+    try:
+        result = client.execute(
+            "image_generate",
+            provider="apiyi",
+            model="gpt-image-2-medium",
+            prompt="smoke image",
+            aspect_ratio="3:4",
+            params={"resolution": "2K"},
+        )
+    finally:
+        client.close()
+        broker.close()
+
+    assert result["image_bytes"] == _png_bytes((300, 400))
+    assert result["mime_type"] == "image/png"
+    assert result["provider"] == "apiyi"
+    assert result["model"] == "gpt-image-2-medium"
+    assert len(provider_calls) == 1
+    assert provider_calls[0]["prompt"] == "smoke image"
+    assert provider_calls[0]["model"] == "gpt-image-2-medium"
 
 
 def test_relay_requires_active_exact_lease_and_returns_bytes(tmp_path):
