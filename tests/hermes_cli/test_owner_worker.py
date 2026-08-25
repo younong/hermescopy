@@ -1142,14 +1142,12 @@ def test_supervisor_resource_membership_failure_releases_reservation(tmp_path):
         os.close(fd)
 
 
-def test_supervisor_reclaims_conclusively_absent_starting_orphan_lease(tmp_path):
+def test_supervisor_does_not_reclaim_starting_orphan_lease(tmp_path):
     owner = _Owner("ok1_starting_orphan", tmp_path / "owner")
     spawned: list[dict] = []
 
     def fake_process_factory(*args, **kwargs):
         spawned.append({"args": args, "kwargs": kwargs})
-        argv = args[0]
-        Path(argv[argv.index("--socket") + 1]).touch()
         return _FakeProcess()
 
     supervisor = OwnerWorkerSupervisor(
@@ -1164,14 +1162,17 @@ def test_supervisor_reclaims_conclusively_absent_starting_orphan_lease(tmp_path)
         worker_id="stale-starting-worker",
     )
 
-    replacement = supervisor.get_or_start(owner)
+    with pytest.raises(OwnerWorkerUnavailableError, match="already_owned"):
+        supervisor.get_or_start(owner)
 
-    assert replacement.worker_generation == 2
-    assert stale.lease.state is WorkerLeaseState.STARTING
-    assert supervisor.authority_store.read_owner_worker_lease(owner.owner_key).state is WorkerLeaseState.ACTIVE
-    assert supervisor.authority_store.read_worker_generation(owner.owner_key, 1).state is WorkerGenerationState.FAILED
-    assert supervisor.authority_store.read_worker_generation(owner.owner_key, 2).state is WorkerGenerationState.ACTIVE
-    assert len(spawned) == 1
+    current = supervisor.authority_store.read_owner_worker_lease(owner.owner_key)
+    generation = supervisor.authority_store.read_worker_generation(owner.owner_key, 1)
+    assert current is not None
+    assert current.state is WorkerLeaseState.STARTING
+    assert generation is not None
+    assert generation.state is WorkerGenerationState.STARTING
+    assert stale.lease == current
+    assert len(spawned) == 0
 
 
 def test_supervisor_reclaims_conclusively_absent_orphan_lease(tmp_path):
