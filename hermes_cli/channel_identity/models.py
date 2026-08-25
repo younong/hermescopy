@@ -43,6 +43,7 @@ class EmployeeCollaborationPolicy:
     employee_id: str
     may_participate: bool = True
     may_create_groups: bool = False
+    may_create_scheduled_tasks: bool = False
     invite_quota: int | None = 5
 
 
