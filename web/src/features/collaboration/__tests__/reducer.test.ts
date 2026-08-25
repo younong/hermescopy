@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import type { GatewayEvent } from "@/lib/gatewayClient";
+import { DEFAULT_HISTORY_PAGE_SIZE } from "@/lib/historyPagination";
 import { collaborationReducer } from "../reducer";
 import type {
   CollaborationApproval,
@@ -53,7 +54,7 @@ function snapshot(
       before_sequence: null,
       direction,
       has_more: false,
-      limit: 100,
+      limit: DEFAULT_HISTORY_PAGE_SIZE,
       next_after_sequence: direction === "forward" ? lastSequence : null,
       next_before_sequence: direction === "initial" && events.length > 0 ? events[0].sequence : null,
       range_end_sequence: events.at(-1)?.sequence ?? null,
@@ -219,7 +220,7 @@ describe("collaborationReducer", () => {
           before_sequence: null,
           direction: "initial",
           has_more: false,
-          limit: 100,
+          limit: DEFAULT_HISTORY_PAGE_SIZE,
           next_after_sequence: null,
           next_before_sequence: null,
           range_end_sequence: 2,
@@ -245,7 +246,7 @@ describe("collaborationReducer", () => {
           before_sequence: null,
           direction: "initial",
           has_more: false,
-          limit: 100,
+          limit: DEFAULT_HISTORY_PAGE_SIZE,
           next_after_sequence: null,
           next_before_sequence: null,
           range_end_sequence: 1,
@@ -268,7 +269,7 @@ describe("collaborationReducer", () => {
           before_sequence: null,
           direction: "forward",
           has_more: false,
-          limit: 100,
+          limit: DEFAULT_HISTORY_PAGE_SIZE,
           next_after_sequence: 3,
           next_before_sequence: null,
           range_end_sequence: 3,

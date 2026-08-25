@@ -652,7 +652,7 @@ describe("GuiChatShell", () => {
         before_sequence: null,
         direction: "initial",
         has_more: false,
-        limit: 100,
+        limit: 10,
         next_after_sequence: null,
         next_before_sequence: null,
         range_end_sequence: null,
@@ -1342,7 +1342,7 @@ describe("GuiChatShell", () => {
     expect(document.querySelector("[data-files-pane]")).toBeNull();
     expect(connection.collaboration.getGroup).toHaveBeenCalledWith(
       "group-archived",
-      { limit: 100 },
+      { limit: 10 },
       expect.any(AbortSignal),
     );
   });
@@ -1401,7 +1401,7 @@ describe("GuiChatShell", () => {
         before_sequence: null,
         direction: "initial",
         has_more: false,
-        limit: 100,
+        limit: 10,
         next_after_sequence: null,
         next_before_sequence: null,
         range_end_sequence: null,
@@ -1607,7 +1607,7 @@ describe("GuiChatShell", () => {
 
     expect(mocks.getSessionMessages).toHaveBeenCalledWith(
       "requested",
-      expect.objectContaining({ limit: 100, signal: expect.any(AbortSignal) }),
+      expect.objectContaining({ limit: 10, signal: expect.any(AbortSignal) }),
     );
     expect(connection.createOrAttach).toHaveBeenCalledOnce();
     expect(container.textContent).toContain("saved answer");

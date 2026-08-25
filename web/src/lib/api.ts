@@ -1,3 +1,7 @@
+import {
+  DEFAULT_HISTORY_PAGE_SIZE,
+  MAX_HISTORY_PAGE_SIZE,
+} from "./historyPagination";
 import { buildHermesWebSocketUrl } from "./websocket-url";
 
 // The dashboard can be served either at the root of its host (e.g.
@@ -389,7 +393,10 @@ export const api = {
     options: { before?: string; limit?: number; signal?: AbortSignal } = {},
   ) => {
     const params = new URLSearchParams();
-    params.set("limit", String(Math.max(1, Math.min(options.limit ?? 100, 200))));
+    params.set("limit", String(Math.max(
+      1,
+      Math.min(options.limit ?? DEFAULT_HISTORY_PAGE_SIZE, MAX_HISTORY_PAGE_SIZE),
+    )));
     if (options.before) params.set("before", options.before);
     return fetchSessionReaderJSON<SessionMessagesResponse>(
       `/api/sessions/${encodeURIComponent(id)}/messages?${params.toString()}`,

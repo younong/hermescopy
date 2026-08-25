@@ -389,7 +389,7 @@ def test_mentioned_turn_snapshots_members_and_attachment_grants_atomically(db):
     )
     assert snapshot["history_page"] == {
         "direction": "initial",
-        "limit": 100,
+        "limit": 10,
         "snapshot_sequence": all_submitted.event.sequence,
         "range_start_sequence": 1,
         "range_end_sequence": all_submitted.event.sequence,
@@ -411,7 +411,7 @@ def test_mentioned_turn_snapshots_members_and_attachment_grants_atomically(db):
     assert len(incremental["targets"]) == 3
     assert incremental["history_page"] == {
         "direction": "forward",
-        "limit": 100,
+        "limit": 10,
         "snapshot_sequence": all_submitted.event.sequence,
         "range_start_sequence": all_submitted.event.sequence,
         "range_end_sequence": all_submitted.event.sequence,

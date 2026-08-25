@@ -2,6 +2,7 @@ import { Archive, RefreshCw, UserRoundCog } from "lucide-react";
 import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from "react";
 import { guiChatTranslations, useI18n } from "@/i18n";
 import { employeeDisplayName, employeeDisplayRole, type Employee } from "@/lib/api";
+import { DEFAULT_HISTORY_PAGE_SIZE } from "@/lib/historyPagination";
 import type { CollaborationApi } from "../api";
 import type { CollaborationSubmitResponse } from "../protocol";
 import { collaborationReducer, isTerminalTarget } from "../reducer";
@@ -11,8 +12,6 @@ import { initialCollaborationState, type CollaborationEmployeeIdentity } from ".
 import { GroupComposer, type GroupComposerSubmit } from "./GroupComposer";
 import { GroupConversation } from "./GroupConversation";
 import { MemberManager } from "./MemberManager";
-
-const HISTORY_PAGE_SIZE = 100;
 
 interface GroupChatViewProps {
   api: CollaborationApi;
@@ -61,7 +60,7 @@ export function GroupChatView({ api, connection, employees, groupId, onArchive, 
     initialRef.current = controller;
     dispatch({ type: "load.started", mode: "initial" });
     try {
-      const snapshot = await api.getGroup(groupId, { limit: HISTORY_PAGE_SIZE }, controller.signal);
+      const snapshot = await api.getGroup(groupId, { limit: DEFAULT_HISTORY_PAGE_SIZE }, controller.signal);
       if (!controller.signal.aborted && generation === generationRef.current) {
         dispatch({ type: "snapshot", snapshot });
       }
@@ -86,7 +85,7 @@ export function GroupChatView({ api, connection, employees, groupId, onArchive, 
         const snapshot = await api.getGroup(groupId, {
           ...activeOverlayOptions(),
           after_sequence: after,
-          limit: HISTORY_PAGE_SIZE,
+          limit: DEFAULT_HISTORY_PAGE_SIZE,
           ...(through === undefined ? {} : { through_sequence: through }),
         }, controller.signal);
         if (controller.signal.aborted || generation !== generationRef.current) return;
@@ -116,7 +115,7 @@ export function GroupChatView({ api, connection, employees, groupId, onArchive, 
     try {
       const snapshot = await api.getGroup(groupId, {
         before_sequence: before,
-        limit: HISTORY_PAGE_SIZE,
+        limit: DEFAULT_HISTORY_PAGE_SIZE,
       }, controller.signal);
       if (!controller.signal.aborted && generation === generationRef.current) {
         dispatch({ type: "snapshot", snapshot });

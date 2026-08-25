@@ -12,6 +12,7 @@ import time
 from pathlib import Path
 from typing import Any, Sequence
 
+from hermes_cli.history_pagination import DEFAULT_HISTORY_PAGE_SIZE
 from hermes_cli.owner_worker.tokens import OWP1_MAX_MESSAGE_BYTES
 from playwright_dashboard_login import (
     DEFAULT_URL,
@@ -29,7 +30,7 @@ SCHEMA_VERSION = 1
 KIND = "hermes.dashboard-collaboration-validation"
 DEFAULT_SESSION = "hermes-collaboration-validation"
 DEFAULT_TIMEOUT = 120.0
-DEFAULT_LIMIT = 100
+DEFAULT_LIMIT = DEFAULT_HISTORY_PAGE_SIZE
 MAX_MESSAGE_BYTES = OWP1_MAX_MESSAGE_BYTES
 
 

@@ -201,6 +201,7 @@ describe("SessionsPage session management", () => {
 
     await act(async () => click(row));
 
+    expect(api.getSessionMessages).toHaveBeenCalledWith("session-a", { limit: 10 });
     expect(api.getSessionComposition).toHaveBeenCalledWith(
       ["session-a"],
       expect.objectContaining({ signal: expect.any(AbortSignal) }),

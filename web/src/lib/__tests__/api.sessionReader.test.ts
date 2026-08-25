@@ -83,6 +83,18 @@ describe("fetchSessionReaderJSON", () => {
     await rejection;
   });
 
+  it("uses the shared ten-message default for session history", async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      response(200, { messages: [], session_id: "session-1" }),
+    );
+
+    await api.getSessionMessages("session-1");
+
+    expect(fetchMock.mock.calls[0]?.[0]).toContain(
+      "/api/sessions/session-1/messages?limit=10",
+    );
+  });
+
   it("forwards getSessionMessages cancellation through a pending Reader retry", async () => {
     const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(
       response(503, { error: "session_reader_unavailable" }, "1"),
