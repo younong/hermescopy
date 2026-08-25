@@ -1416,6 +1416,49 @@ class TestAuxiliaryPoolAwareness:
 
         assert runtime is None
 
+    def test_nous_runtime_failure_cools_down_repeated_probe(self):
+        from agent.auxiliary_client import (
+            _AUX_PROVIDER_UNAVAILABLE_TTL_SECONDS,
+            _is_provider_unhealthy,
+            _resolve_nous_runtime_api,
+        )
+
+        with (
+            patch("agent.auxiliary_client.load_pool", return_value=None),
+            patch(
+                "hermes_cli.auth.resolve_nous_runtime_credentials",
+                side_effect=RuntimeError("provider unavailable"),
+            ) as resolve,
+        ):
+            assert _resolve_nous_runtime_api() is None
+            assert _is_provider_unhealthy("nous") is True
+            assert _resolve_nous_runtime_api() is None
+
+        resolve.assert_called_once()
+        assert _AUX_PROVIDER_UNAVAILABLE_TTL_SECONDS > 0
+
+    def test_try_nous_skips_cooldown_before_credential_probe(self):
+        from agent.auxiliary_client import _mark_provider_unhealthy, _try_nous
+
+        _mark_provider_unhealthy("nous", ttl=60)
+        with patch("agent.auxiliary_client._resolve_nous_runtime_api") as resolve:
+            client, model = _try_nous()
+
+        assert client is None and model is None
+        resolve.assert_not_called()
+
+    def test_try_nous_probe_continues_when_not_in_cooldown(self):
+        from agent.auxiliary_client import _try_nous
+
+        with (
+            patch("agent.auxiliary_client._is_provider_unhealthy", return_value=False),
+            patch("agent.auxiliary_client._read_nous_auth", return_value=None),
+            patch("agent.auxiliary_client._resolve_nous_runtime_api", return_value=None),
+        ):
+            client, model = _try_nous()
+
+        assert client is None and model is None
+
     def test_try_nous_uses_portal_recommendation_for_text(self):
         """When the Portal recommends a compaction model, _try_nous honors it."""
         fresh_base = "https://inference-api.nousresearch.com/v1"
@@ -3031,6 +3074,80 @@ class TestTransientTransportRetry:
             result = call_llm(task="compression", messages=[{"role": "user", "content": "hi"}])
         assert result == {"ok": True}
         assert client.chat.completions.create.call_count == 2
+
+    @pytest.mark.asyncio
+    async def test_async_retries_transient_transport_with_backoff(self):
+        client = MagicMock()
+        client.base_url = "https://openrouter.ai/api/v1"
+        client.chat.completions.create = AsyncMock(
+            side_effect=[
+                Exception("peer closed connection without sending complete message body"),
+                {"ok": True},
+            ]
+        )
+        p1, p2, p3 = self._patches(client)
+        with (
+            p1,
+            p2,
+            p3,
+            patch("agent.auxiliary_client._transient_retry_count", return_value=1),
+            patch("agent.auxiliary_client._TRANSIENT_RETRY_BACKOFF_BASE", 0.0),
+            patch("asyncio.sleep", new_callable=AsyncMock) as sleep,
+        ):
+            result = await async_call_llm(
+                task="session_search",
+                messages=[{"role": "user", "content": "hi"}],
+            )
+
+        assert result == {"ok": True}
+        assert client.chat.completions.create.await_count == 2
+        sleep.assert_awaited_once_with(0.0)
+
+    @pytest.mark.asyncio
+    async def test_async_connection_failure_marks_provider_cooldown_before_fallback(self):
+        primary = MagicMock()
+        primary.base_url = "https://openrouter.ai/api/v1"
+        primary.chat.completions.create = AsyncMock(
+            side_effect=Exception(
+                "peer closed connection without sending complete message body"
+            )
+        )
+        fallback = MagicMock()
+        fallback.base_url = "https://api.openai.com/v1"
+        fallback.chat.completions.create = AsyncMock(return_value={"fallback": True})
+        p1, p2, p3 = self._patches(primary)
+        async_fallback = MagicMock()
+        async_fallback.chat.completions.create = AsyncMock(return_value={"fallback": True})
+        with (
+            p1,
+            p2,
+            p3,
+            patch("agent.auxiliary_client._transient_retry_count", return_value=1),
+            patch("agent.auxiliary_client._TRANSIENT_RETRY_BACKOFF_BASE", 0.0),
+            patch("asyncio.sleep", new_callable=AsyncMock),
+            patch(
+                "agent.auxiliary_client._try_configured_fallback_chain",
+                return_value=(None, None, ""),
+            ),
+            patch(
+                "agent.auxiliary_client._try_main_agent_model_fallback",
+                return_value=(fallback, "fb-model", "openai"),
+            ),
+            patch(
+                "agent.auxiliary_client._to_async_client",
+                return_value=(async_fallback, "fb-model"),
+            ),
+            patch("agent.auxiliary_client._mark_provider_unhealthy") as mark_unhealthy,
+        ):
+            result = await async_call_llm(
+                task="session_search",
+                messages=[{"role": "user", "content": "hi"}],
+            )
+
+        assert result == {"fallback": True}
+        mark_unhealthy.assert_called_once_with(
+            "openrouter", ttl=60,
+        )
 
 
 class TestAuxClientNoSdkRetries:

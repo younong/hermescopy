@@ -1733,11 +1733,17 @@ def _resolve_nous_runtime_api(*, force_refresh: bool = False) -> Optional[tuple[
         )
     except Exception as exc:
         logger.debug("Auxiliary Nous runtime credential resolution failed: %s", exc)
+        _mark_provider_unhealthy(
+            "nous", ttl=_AUX_PROVIDER_UNAVAILABLE_TTL_SECONDS,
+        )
         return None
 
     api_key = str(creds.get("api_key") or "").strip()
     base_url = str(creds.get("base_url") or "").strip().rstrip("/")
     if not api_key or not base_url:
+        _mark_provider_unhealthy(
+            "nous", ttl=_AUX_PROVIDER_UNAVAILABLE_TTL_SECONDS,
+        )
         return None
     return api_key, base_url
 
@@ -1999,6 +2005,10 @@ def _describe_openrouter_unavailable() -> str:
 
 
 def _try_nous(vision: bool = False) -> Tuple[Optional[OpenAI], Optional[str]]:
+    if _is_provider_unhealthy("nous"):
+        _log_skip_unhealthy("nous")
+        return None, None
+
     # Check cross-session rate limit guard before attempting Nous —
     # if another session already recorded a 429, skip Nous entirely
     # to avoid piling more requests onto the tapped RPH bucket.
@@ -2693,6 +2703,10 @@ def _get_provider_chain() -> List[tuple]:
 # the user might be running two profiles with different OpenRouter keys.
 
 _AUX_UNHEALTHY_TTL_SECONDS = 600  # 10 minutes
+# Short cooldown for providers that are unreachable or cannot resolve runtime
+# credentials. This prevents every auxiliary task from paying the same probe
+# timeout before the normal fallback chain runs (issue #279).
+_AUX_PROVIDER_UNAVAILABLE_TTL_SECONDS = 60
 _aux_unhealthy_until: Dict[str, float] = {}
 _aux_unhealthy_logged_at: Dict[str, float] = {}
 
@@ -2722,9 +2736,9 @@ def _normalize_chain_label(provider: str) -> str:
 
 
 def _mark_provider_unhealthy(provider: str, ttl: Optional[float] = None) -> None:
-    """Mark ``provider`` as recently-402'd, hidden from chain iteration
-    until the TTL expires. Called from the payment-fallback branches in
-    ``call_llm`` and ``acall_llm`` after a confirmed payment error.
+    """Temporarily hide ``provider`` from chain iteration until the TTL expires.
+
+    Used for payment exhaustion and short-lived provider-unavailable failures.
     """
     label = _normalize_chain_label(provider)
     if not label:
@@ -2732,8 +2746,9 @@ def _mark_provider_unhealthy(provider: str, ttl: Optional[float] = None) -> None
     expires_at = time.time() + (ttl if ttl is not None else _AUX_UNHEALTHY_TTL_SECONDS)
     _aux_unhealthy_until[label] = expires_at
     logger.warning(
-        "Auxiliary: marking %s unhealthy for %ds (payment / credit error). "
-        "Subsequent auxiliary calls will skip it until %s.",
+        "Auxiliary: marking %s unhealthy for %ds (provider unavailable or "
+        "payment / credit error). Subsequent auxiliary calls will skip it "
+        "until %s.",
         label,
         int(ttl if ttl is not None else _AUX_UNHEALTHY_TTL_SECONDS),
         time.strftime("%H:%M:%S", time.localtime(expires_at)),
@@ -7136,6 +7151,12 @@ def call_llm(
                 reason = "invalid provider response"
             else:
                 reason = "connection error"
+                _mark_provider_unhealthy(
+                    _recoverable_pool_provider(
+                        resolved_provider, client, main_runtime=main_runtime,
+                    ) or resolved_provider,
+                    ttl=_AUX_PROVIDER_UNAVAILABLE_TTL_SECONDS,
+                )
             logger.info("Auxiliary %s: %s on %s (%s), trying fallback",
                         task or "call", reason, resolved_provider, first_err)
 
@@ -7387,8 +7408,8 @@ async def async_call_llm(
             if not _is_transient_transport_error(transient_err):
                 raise
             # See call_llm(): compression is on the critical preflight path,
-            # so skip the same-provider retry on a full-budget timeout and
-            # fall straight through to fallback (issue #54465).
+            # so skip same-provider retry on a full-budget timeout and fall
+            # straight through to fallback (issue #54465).
             if task == "compression" and _is_timeout_error(transient_err):
                 logger.info(
                     "Auxiliary compression (async): timeout on the critical "
@@ -7396,13 +7417,30 @@ async def async_call_llm(
                     transient_err,
                 )
                 raise
-            logger.info(
-                "Auxiliary %s (async): transient transport error; retrying "
-                "once on the same provider before fallback: %s",
-                task or "call", transient_err,
-            )
-            return _validate_llm_response(
-                await client.chat.completions.create(**kwargs), task)
+            import asyncio
+            _max_transient_retries = _transient_retry_count()
+            _last_transient = transient_err
+            for _attempt in range(1, _max_transient_retries + 1):
+                _backoff = min(
+                    _TRANSIENT_RETRY_BACKOFF_BASE * (2.0 ** (_attempt - 1)),
+                    8.0,
+                )
+                logger.info(
+                    "Auxiliary %s (async): transient transport error "
+                    "(attempt %d/%d); retrying same provider after %.1fs "
+                    "before fallback: %s",
+                    task or "call", _attempt, _max_transient_retries,
+                    _backoff, _last_transient,
+                )
+                await asyncio.sleep(_backoff)
+                try:
+                    return _validate_llm_response(
+                        await client.chat.completions.create(**kwargs), task)
+                except Exception as retry_transient:
+                    if not _is_transient_transport_error(retry_transient):
+                        raise
+                    _last_transient = retry_transient
+            raise _last_transient
     except Exception as first_err:
         if "temperature" in kwargs and _is_unsupported_temperature_error(first_err):
             retry_kwargs = dict(kwargs)
@@ -7656,6 +7694,12 @@ async def async_call_llm(
                 reason = "invalid provider response"
             else:
                 reason = "connection error"
+                _mark_provider_unhealthy(
+                    _recoverable_pool_provider(
+                        resolved_provider, client, main_runtime=main_runtime,
+                    ) or resolved_provider,
+                    ttl=_AUX_PROVIDER_UNAVAILABLE_TTL_SECONDS,
+                )
             logger.info("Auxiliary %s (async): %s on %s (%s), trying fallback",
                         task or "call", reason, resolved_provider, first_err)
 
