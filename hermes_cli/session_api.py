@@ -16,6 +16,7 @@ from typing import Any
 from starlette.exceptions import HTTPException
 
 from hermes_cli.display_transcript import format_display_transcript
+from hermes_cli.history_pagination import DEFAULT_HISTORY_PAGE_SIZE
 from hermes_cli.latency_trace import log_latency_stage
 
 
@@ -581,7 +582,7 @@ def session_messages_payload(
         page = db.get_conversation_page(
             sid,
             before_cursor=before,
-            limit=limit or 100,
+            limit=limit or DEFAULT_HISTORY_PAGE_SIZE,
             include_ancestors=True,
             recovery_scope=recovery_scope,
         )

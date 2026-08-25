@@ -18,6 +18,7 @@ from hermes_cli.channel_identity import (
 from hermes_cli.controlled_roots import RootKind
 from hermes_cli.employee_catalog import employee_catalog_payload
 from hermes_cli.employee_policy import employee_policy_with_workspace
+from hermes_cli.history_pagination import DEFAULT_HISTORY_PAGE_SIZE
 from hermes_state import SessionDB
 
 from .agent_tools import CollaborationAgentContext
@@ -102,7 +103,7 @@ class CollaborationService:
         self,
         group_id: str,
         *,
-        limit: int = 100,
+        limit: int = DEFAULT_HISTORY_PAGE_SIZE,
         before_sequence: int | None = None,
         after_sequence: int | None = None,
         through_sequence: int | None = None,

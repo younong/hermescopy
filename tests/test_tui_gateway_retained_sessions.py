@@ -1007,6 +1007,11 @@ def _employee_repin_policy(revision: int, *, model: str, system_prompt: str) -> 
     )[0]
 
 
+def test_display_history_request_defaults_to_ten():
+    assert server._display_history_request({}) == (False, 10)
+    assert server._display_history_request({"display_history": {}}) == (True, 10)
+
+
 class _EmployeeDashboardTransport:
     def __init__(self):
         self.active_session_id = None
@@ -3152,7 +3157,7 @@ def test_collaboration_rpc_uses_bound_owner_service_and_redacts_internal_ids():
         def get_group(self, group_id, **kwargs):
             assert group_id == "group-a"
             assert kwargs == {
-                "limit": 100,
+                "limit": 10,
                 "before_sequence": None,
                 "after_sequence": None,
                 "through_sequence": None,

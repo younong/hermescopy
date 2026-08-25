@@ -29,6 +29,7 @@ import {
   Archive,
 } from "lucide-react";
 import { api } from "@/lib/api";
+import { DEFAULT_HISTORY_PAGE_SIZE } from "@/lib/historyPagination";
 import { shouldRefreshSessions } from "@/lib/session-refresh";
 import { SessionCompositionCharts } from "@/components/sessions/SessionCompositionCharts";
 import type {
@@ -418,7 +419,7 @@ function SessionRow({
       setInitialLoading(true);
       setError(null);
       api
-        .getSessionMessages(session.id, { limit: 100 })
+        .getSessionMessages(session.id, { limit: DEFAULT_HISTORY_PAGE_SIZE })
         .then((resp) => {
           setMessages(resp.messages);
           setHistoryCursor(resp.history_page?.cursor ?? null);
@@ -436,7 +437,7 @@ function SessionRow({
     try {
       const resp = await api.getSessionMessages(session.id, {
         before: historyCursor,
-        limit: 100,
+        limit: DEFAULT_HISTORY_PAGE_SIZE,
       });
       setMessages((current) => [...resp.messages, ...(current ?? [])]);
       setHistoryCursor(resp.history_page?.cursor ?? null);

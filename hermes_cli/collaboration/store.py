@@ -9,6 +9,10 @@ import uuid
 from collections.abc import Iterable, Mapping
 from typing import Any
 
+from hermes_cli.history_pagination import (
+    DEFAULT_HISTORY_PAGE_SIZE,
+    MAX_HISTORY_PAGE_SIZE,
+)
 from hermes_state import SessionDB
 
 from .models import (
@@ -1986,7 +1990,7 @@ class CollaborationStore:
         self,
         group_id: str,
         *,
-        limit: int = 100,
+        limit: int = DEFAULT_HISTORY_PAGE_SIZE,
         before_sequence: int | None = None,
         after_sequence: int | None = None,
         through_sequence: int | None = None,
@@ -1995,8 +1999,14 @@ class CollaborationStore:
         reconcile_approval_ids: Iterable[str] = (),
     ) -> dict[str, Any]:
         group_id = _identifier(group_id, "group ID")
-        if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 200:
-            raise ValueError("collaboration history limit must be between 1 and 200")
+        if (
+            isinstance(limit, bool)
+            or not isinstance(limit, int)
+            or not 1 <= limit <= MAX_HISTORY_PAGE_SIZE
+        ):
+            raise ValueError(
+                f"collaboration history limit must be between 1 and {MAX_HISTORY_PAGE_SIZE}"
+            )
         if before_sequence is not None and after_sequence is not None:
             raise ValueError("before_sequence and after_sequence are mutually exclusive")
         if through_sequence is not None and after_sequence is None:

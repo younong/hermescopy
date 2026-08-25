@@ -63,6 +63,19 @@ def test_pages_backward_without_duplicates_or_omissions(db):
     assert contents == [f"message-{index}" for index in range(11)]
 
 
+def test_default_page_size_is_ten(db):
+    db.create_session("s1", source="tui")
+    for index in range(12):
+        db.append_message("s1", role="user", content=f"message-{index}")
+
+    page = db.get_conversation_page("s1")
+
+    assert [message["content"] for message in page["messages"]] == [
+        f"message-{index}" for index in range(2, 12)
+    ]
+    assert page["has_more"] is True
+
+
 def test_cursor_snapshot_excludes_new_appends(db):
     db.create_session("s1", source="tui")
     for index in range(6):

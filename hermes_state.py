@@ -27,6 +27,10 @@ import time
 import uuid
 from pathlib import Path
 
+from hermes_cli.history_pagination import (
+    DEFAULT_HISTORY_PAGE_SIZE,
+    MAX_HISTORY_PAGE_SIZE,
+)
 from hermes_constants import get_hermes_home
 from hermes_session_queries import (
     SessionQueryMixin,
@@ -4665,8 +4669,8 @@ class SessionDB(SessionQueryMixin):
 
 
     _CONVERSATION_PAGE_CURSOR_VERSION = 2
-    _CONVERSATION_PAGE_DEFAULT_LIMIT = 100
-    _CONVERSATION_PAGE_MAX_LIMIT = 200
+    _CONVERSATION_PAGE_DEFAULT_LIMIT = DEFAULT_HISTORY_PAGE_SIZE
+    _CONVERSATION_PAGE_MAX_LIMIT = MAX_HISTORY_PAGE_SIZE
     _CONVERSATION_PAGE_CONTEXT_ROWS = 32
     _CONVERSATION_PAGE_MAX_TEXT_CHARS = 120_000
     _CONVERSATION_PAGE_MAX_ATTACHMENTS = 64
