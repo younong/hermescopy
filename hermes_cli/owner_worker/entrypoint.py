@@ -6,6 +6,7 @@ owner-sensitive modules such as ``hermes_state``.
 from __future__ import annotations
 
 import argparse
+import asyncio
 import base64
 import binascii
 import logging
@@ -162,6 +163,7 @@ class ModelRegistrationMutation(BaseModel):
 
 
 from hermes_cli.dashboard_auth.authority import (
+    AuthorizationRejected,
     AuthorityStore,
     OwnerWorkerAuthorityLease,
     WorkerGenerationState,
@@ -373,8 +375,46 @@ def create_app(
                 except Exception as exc:
                     raise RuntimeError("deployment media relay startup failed") from exc
             collaboration_db, collaboration_runtime = _start_collaboration_runtime()
+            heartbeat_task = None
+            app.state.owner_worker_heartbeat_failed = None
+            process_token = os.environ.get("HERMES_WORKER_PROCESS_TOKEN", "").strip()
+            control_home = os.environ.get("HERMES_CONTROL_HOME", "").strip()
+            if process_token and control_home:
+                from gateway.status import get_process_start_time
+
+                store = AuthorityStore(control_home)
+                heartbeat_lease = app.state.owner_worker_lease
+                store.bind_worker_process(
+                    heartbeat_lease,
+                    process_token=process_token,
+                    pid=os.getpid(),
+                    process_start_time=get_process_start_time(os.getpid()),
+                )
+
+                async def _worker_heartbeat() -> None:
+                    while True:
+                        await asyncio.sleep(1.0)
+                        try:
+                            store.renew_worker_heartbeat(
+                                heartbeat_lease,
+                                process_token=process_token,
+                            )
+                        except AuthorizationRejected as exc:
+                            _log.error("owner worker heartbeat fence was lost", exc_info=True)
+                            app.state.owner_worker_heartbeat_failed = str(exc)
+                            return
+                        except Exception:
+                            _log.warning("owner worker heartbeat renewal failed", exc_info=True)
+
+                heartbeat_task = asyncio.create_task(_worker_heartbeat(), name="owner-worker-heartbeat")
             yield
         finally:
+            if heartbeat_task is not None:
+                heartbeat_task.cancel()
+                try:
+                    await heartbeat_task
+                except asyncio.CancelledError:
+                    pass
             cleanup_error = None
 
             def _cleanup(callback):
@@ -801,7 +841,8 @@ def create_app(
             app.state.owner_worker_live_state.gateway_runtime
         )
         return {
-            "ready": True,
+            "ready": not bool(getattr(app.state, "owner_worker_heartbeat_failed", None)),
+            "heartbeat_error": getattr(app.state, "owner_worker_heartbeat_failed", None),
             "active_turns": turn_status["active_turns"],
             "owner_key": owner_key,
             "owner_home": str(owner_home),

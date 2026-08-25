@@ -433,6 +433,53 @@ def test_worker_lifecycle_changes_are_shared_and_exactly_fenced(tmp_path):
     assert reader.worker_changes_since(changes[-1].sequence) == ()
 
 
+def test_worker_start_process_heartbeat_is_fenced_and_reclaimable(tmp_path):
+    store = AuthorityStore(tmp_path / "control-plane")
+    claim = store.claim_worker_start("ok1_heartbeat", worker_id="worker-a")
+    binding = store.read_owner_worker_process_binding("ok1_heartbeat")
+    assert binding is not None
+    assert binding.process_token_digest
+    assert store.bind_worker_process(
+        claim.lease,
+        process_token=claim.process_token,
+        pid=4321,
+        process_start_time=99,
+        now=1_000,
+    ).pid == 4321
+    renewed = store.renew_worker_heartbeat(
+        claim.lease, process_token=claim.process_token, now=2_000,
+    )
+    assert renewed.heartbeat_at == 2_000
+    active = store.transition_worker_lease(
+        claim.lease, state=WorkerLeaseState.ACTIVE, generation_state=WorkerGenerationState.ACTIVE,
+    )
+    active_renewed = store.renew_worker_heartbeat(
+        claim.lease, process_token=claim.process_token, now=3_000,
+    )
+    assert active_renewed.heartbeat_at == 3_000
+    assert active_renewed.heartbeat_seq > renewed.heartbeat_seq
+    assert store.reclaim_stale_worker_lease(
+        claim.lease,
+        process_token_digest=renewed.process_token_digest,
+        stale_before=3_000,
+    ) is False
+
+    stale_claim = store.claim_worker_start("ok1_heartbeat_stale", worker_id="worker-stale")
+    stale_binding = store.bind_worker_process(
+        stale_claim.lease,
+        process_token=stale_claim.process_token,
+        pid=4322,
+        now=4_000,
+    )
+    assert store.reclaim_stale_worker_lease(
+        stale_claim.lease,
+        process_token_digest=stale_binding.process_token_digest,
+        stale_before=5_000,
+    ) is True
+    assert store.read_owner_worker_lease("ok1_heartbeat").state is WorkerLeaseState.ACTIVE
+    assert store.read_owner_worker_lease("ok1_heartbeat_stale").state is WorkerLeaseState.REVOKED
+
+
 def test_worker_lease_claim_is_fenced_and_rejects_stale_transition(tmp_path):
     store = AuthorityStore(tmp_path / "control-plane")
     claim = store.claim_worker_start("ok1_a", worker_id="worker-a")

@@ -67,6 +67,7 @@ OWNER_ENV_KEYS: tuple[str, ...] = (
     "HERMES_WORKER_ID",
     "HERMES_WORKER_LEASE_VERSION",
     "HERMES_WORKER_RECOVERY_GENERATION",
+    "HERMES_WORKER_PROCESS_TOKEN",
     "HERMES_OWNER_WORKER_CAPABILITY_ISSUER",
     "HERMES_OWNER_WORKER_CAPABILITY_PUBLIC_KEY",
     "HERMES_OWNER_WORKER_CAPABILITY_RETAINED_PUBLIC_KEYS",
@@ -195,6 +196,7 @@ def owner_worker_env_for(
     worker_id: str = "",
     lease_version: int | None = None,
     recovery_generation: int | None = None,
+    process_token: str = "",
     capability_issuer: str = "",
     capability_public_key: str = "",
     capability_retained_public_keys: str = "",
@@ -233,6 +235,8 @@ def owner_worker_env_for(
         if int(recovery_generation) < 0:
             raise ValueError("recovery_generation must not be negative")
         env["HERMES_WORKER_RECOVERY_GENERATION"] = str(int(recovery_generation))
+    if process_token:
+        env["HERMES_WORKER_PROCESS_TOKEN"] = str(process_token)
     if bool(capability_issuer) != bool(capability_public_key):
         raise ValueError("capability issuer and public key must be supplied together")
     if capability_retained_public_keys and not capability_issuer:
