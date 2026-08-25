@@ -11689,11 +11689,29 @@ def _run_prompt_submit(
                         agent, "_config_context_length", None
                     ),
                 )
+                reference_summarizer = None
+                _compressor = getattr(agent, "context_compressor", None)
+                if _compressor is not None and hasattr(_compressor, "_generate_summary"):
+                    def reference_summarizer(**kwargs):
+                        previous = getattr(_compressor, "_previous_summary", None)
+                        try:
+                            _compressor._previous_summary = kwargs.get("previous_summary")
+                            summary = _compressor._generate_summary(
+                                [{"role": "user", "content": kwargs.get("chunk_text", "")}],
+                                focus_topic="attached reference",
+                                _summary_budget=max(1, min(int(kwargs.get("output_budget", 4000)), 4000)),
+                                _serialized_content=kwargs.get("chunk_text", ""),
+                            )
+                            return summary
+                        finally:
+                            _compressor._previous_summary = previous
+
                 ctx = preprocess_context_references(
                     prompt,
                     cwd=cwd,
                     allowed_root=cwd,
                     context_length=ctx_len,
+                    summarize_chunk=reference_summarizer,
                 )
                 if ctx.blocked:
                     _emit(

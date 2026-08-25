@@ -9,9 +9,10 @@ import re
 import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Awaitable, Callable
+from typing import Any, Awaitable, Callable
 
 from agent.model_metadata import estimate_tokens_rough
+from agent.redact import redact_sensitive_text
 from hermes_cli._subprocess_compat import IS_WINDOWS, windows_hide_flags
 
 _QUOTED_REFERENCE_VALUE = r'(?:`[^`\n]+`|"[^"\n]+"|\'[^\'\n]+\')'
@@ -58,6 +59,21 @@ class ContextReferenceResult:
     injected_tokens: int = 0
     expanded: bool = False
     blocked: bool = False
+    source_tokens: int = 0
+    summarized: bool = False
+    truncated: bool = False
+
+
+# Reference source may be processed in bounded passes, but the final user
+# message must retain room for the normal prompt, tools, and model output.
+_REFERENCE_SOURCE_CAP = 256_000
+_REFERENCE_INLINE_CAP = 192_000
+_REFERENCE_SOURCE_RATIO = 0.60
+_REFERENCE_INLINE_RATIO = 0.75
+_REFERENCE_HEAD_RATIO = 0.70
+
+
+ReferenceSummarizer = Callable[..., Any]
 
 
 def parse_context_references(message: str) -> list[ContextReference]:
@@ -110,6 +126,7 @@ def preprocess_context_references(
     context_length: int,
     url_fetcher: Callable[[str], str | Awaitable[str]] | None = None,
     allowed_root: str | Path | None = None,
+    summarize_chunk: ReferenceSummarizer | None = None,
 ) -> ContextReferenceResult:
     coro = preprocess_context_references_async(
         message,
@@ -117,6 +134,7 @@ def preprocess_context_references(
         context_length=context_length,
         url_fetcher=url_fetcher,
         allowed_root=allowed_root,
+        summarize_chunk=summarize_chunk,
     )
     # Safe for both CLI (no loop) and gateway (loop already running).
     try:
@@ -137,6 +155,7 @@ async def preprocess_context_references_async(
     context_length: int,
     url_fetcher: Callable[[str], str | Awaitable[str]] | None = None,
     allowed_root: str | Path | None = None,
+    summarize_chunk: ReferenceSummarizer | None = None,
 ) -> ContextReferenceResult:
     refs = parse_context_references(message)
     if not refs:
@@ -150,14 +169,13 @@ async def preprocess_context_references_async(
     )
     warnings: list[str] = []
     blocks: list[str] = []
-    injected_tokens = 0
+    source_tokens = 0
+    summarized = False
+    truncated = False
 
-    # Expand all references concurrently. Each _expand_reference is independent
-    # (no shared state during expansion) — a message with several @url: refs
-    # would otherwise pay one full web_extract round-trip per ref in series.
-    # gather preserves positional order, so we reassemble warnings/blocks in the
-    # original ref order exactly as the prior serial loop did; the token-budget
-    # check below is unchanged (it runs once, after all refs are expanded).
+    # Expansion remains concurrent for independent references. The resulting
+    # blocks are bounded before they can enter the user message; a large source
+    # is never allowed to make the final request unbounded.
     expanded = await asyncio.gather(
         *(
             _expand_reference(
@@ -169,40 +187,59 @@ async def preprocess_context_references_async(
             for ref in refs
         )
     )
-    for warning, block in expanded:
+    available_input = max(1, int(context_length))
+    source_budget = min(_REFERENCE_SOURCE_CAP, max(1, int(available_input * _REFERENCE_SOURCE_RATIO)))
+    inline_budget = min(_REFERENCE_INLINE_CAP, max(1, int(available_input * _REFERENCE_INLINE_RATIO)))
+    bounded: list[str] = []
+    for ref, (warning, block) in zip(refs, expanded):
         if warning:
             warnings.append(warning)
-        if block:
-            blocks.append(block)
-            injected_tokens += estimate_tokens_rough(block)
-
-    hard_limit = max(1, int(context_length * 0.50))
-    soft_limit = max(1, int(context_length * 0.25))
-    if injected_tokens > hard_limit:
-        warnings.append(
-            f"@ context injection refused: {injected_tokens} tokens exceeds the 50% hard limit ({hard_limit})."
+        if not block:
+            continue
+        original_tokens = estimate_tokens_rough(block)
+        block = redact_sensitive_text(block)
+        source_tokens += original_tokens
+        source_block = block
+        if original_tokens > source_budget:
+            truncated = True
+            warnings.append(
+                f"{ref.raw}: source is about {original_tokens} tokens; processing is capped at {source_budget} tokens."
+            )
+            source_block = _excerpt_text(block, source_budget * 4)
+        remaining = max(0, inline_budget - sum(estimate_tokens_rough(item) for item in bounded))
+        if remaining <= 0:
+            truncated = True
+            warnings.append(f"{ref.raw}: omitted because the inline context budget is full.")
+            continue
+        result = await _bound_reference_block(
+            source_block,
+            limit_tokens=min(remaining, source_budget),
+            ref=ref,
+            summarize_chunk=summarize_chunk,
+            force_summarize=original_tokens > source_budget,
         )
-        return ContextReferenceResult(
-            message=message,
-            original_message=message,
-            references=refs,
-            warnings=warnings,
-            injected_tokens=injected_tokens,
-            expanded=False,
-            blocked=True,
-        )
+        if result.text:
+            bounded.append(result.text)
+        if result.truncated:
+            truncated = True
+            summarized = summarized or result.summarized
+            warnings.append(
+                f"{ref.raw}: content was {'summarized' if result.summarized else 'truncated'} "
+                f"to fit the {inline_budget}-token inline context budget."
+            )
 
-    if injected_tokens > soft_limit:
-        warnings.append(
-            f"@ context injection warning: {injected_tokens} tokens exceeds the 25% soft limit ({soft_limit})."
-        )
-
+    injected_tokens = sum(estimate_tokens_rough(item) for item in bounded)
+    if injected_tokens > inline_budget:
+        combined = _excerpt_text("\n\n".join(bounded), inline_budget * 4)
+        bounded = [combined]
+        injected_tokens = estimate_tokens_rough(combined)
+        truncated = True
     stripped = _remove_reference_tokens(message, refs)
     final = stripped
     if warnings:
         final = f"{final}\n\n--- Context Warnings ---\n" + "\n".join(f"- {warning}" for warning in warnings)
-    if blocks:
-        final = f"{final}\n\n--- Attached Context ---\n\n" + "\n\n".join(blocks)
+    if bounded:
+        final = f"{final}\n\n--- Attached Context ---\n\n" + "\n\n".join(bounded)
 
     return ContextReferenceResult(
         message=final.strip(),
@@ -210,9 +247,97 @@ async def preprocess_context_references_async(
         references=refs,
         warnings=warnings,
         injected_tokens=injected_tokens,
-        expanded=bool(blocks or warnings),
+        source_tokens=source_tokens,
+        summarized=summarized,
+        truncated=truncated,
+        expanded=bool(bounded or warnings),
         blocked=False,
     )
+
+
+@dataclass(frozen=True)
+class _BoundedReferenceBlock:
+    text: str
+    truncated: bool = False
+    summarized: bool = False
+
+
+async def _bound_reference_block(
+    block: str,
+    *,
+    limit_tokens: int,
+    ref: ContextReference,
+    summarize_chunk: ReferenceSummarizer | None,
+    force_summarize: bool = False,
+) -> _BoundedReferenceBlock:
+    if not force_summarize and estimate_tokens_rough(block) <= limit_tokens:
+        return _BoundedReferenceBlock(block)
+
+    # Keep source boundaries and labels while selecting a deterministic excerpt.
+    # This fallback is intentionally local: callers without an auxiliary route
+    # still get useful bounded context instead of the old all-or-nothing refusal.
+    max_chars = max(4, limit_tokens * 4)
+    if summarize_chunk is not None:
+        try:
+            chunk_tokens = max(1, min(32_000, limit_tokens))
+            pieces = _split_text_chunks(block, chunk_tokens * 4)
+            summaries: list[str] = []
+            previous: str | None = None
+            for index, piece in enumerate(pieces):
+                value = summarize_chunk(
+                    source_label=ref.raw,
+                    chunk_text=redact_sensitive_text(piece),
+                    chunk_index=index,
+                    total_chunks=len(pieces),
+                    previous_summary=previous,
+                    output_budget=max(1, min(limit_tokens, 4_000)),
+                )
+                if inspect.isawaitable(value):
+                    value = await value
+                if value:
+                    previous = redact_sensitive_text(str(value).strip())
+                    summaries.append(previous)
+            summary = "\n\n".join(summaries)
+            if summary:
+                if estimate_tokens_rough(summary) > limit_tokens:
+                    summary = _excerpt_text(summary, max_chars)
+                return _BoundedReferenceBlock(summary, truncated=True, summarized=True)
+        except Exception:
+            pass
+
+    return _BoundedReferenceBlock(
+        redact_sensitive_text(_excerpt_text(block, max_chars)),
+        truncated=True,
+        summarized=False,
+    )
+
+
+def _split_text_chunks(text: str, max_chars: int) -> list[str]:
+    if len(text) <= max_chars:
+        return [text]
+    chunks: list[str] = []
+    lines: list[str] = []
+    size = 0
+    for line in text.splitlines(keepends=True):
+        if lines and size + len(line) > max_chars:
+            chunks.append("".join(lines))
+            lines = []
+            size = 0
+        lines.append(line)
+        size += len(line)
+    if lines:
+        chunks.append("".join(lines))
+    return chunks
+
+
+def _excerpt_text(text: str, max_chars: int) -> str:
+    if len(text) <= max_chars:
+        return text
+    marker = "\n...[reference content omitted]...\n"
+    content_chars = max(2, max_chars - len(marker))
+    head = max(1, int(content_chars * _REFERENCE_HEAD_RATIO))
+    tail = max(1, content_chars - head)
+    return (text[:head].rstrip() + marker + text[-tail:].lstrip())[:max_chars]
 
 
 async def _expand_reference(
@@ -363,11 +488,13 @@ def _resolve_path(cwd: Path, target: str, *, allowed_root: Path | None = None) -
 
 def _ensure_reference_path_allowed(path: Path) -> None:
     from hermes_constants import get_hermes_home
-    home = Path(os.path.expanduser("~")).resolve()
+    home = Path(os.environ.get("HOME") or os.path.expanduser("~")).resolve()
     hermes_home = get_hermes_home().resolve()
 
     blocked_exact = {home / rel for rel in _SENSITIVE_HOME_FILES}
     blocked_exact.add(hermes_home / ".env")
+    blocked_exact.add(home / ".ssh" / "id_rsa")
+    blocked_exact.add(home / ".ssh" / "id_ed25519")
     blocked_dirs = [home / rel for rel in _SENSITIVE_HOME_DIRS]
     blocked_dirs.extend(hermes_home / rel for rel in _SENSITIVE_HERMES_DIRS)
 
