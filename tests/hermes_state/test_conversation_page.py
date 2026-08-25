@@ -76,6 +76,19 @@ def test_default_page_size_is_ten(db):
     assert page["has_more"] is True
 
 
+@pytest.mark.parametrize("requested_limit", [200, 201, 10_000])
+def test_page_size_caps_at_two_hundred(db, requested_limit):
+    db.create_session("s1", source="tui")
+    for index in range(205):
+        db.append_message("s1", role="user", content=f"message-{index}")
+
+    page = db.get_conversation_page("s1", limit=requested_limit)
+
+    assert len(page["messages"]) == 200
+    assert page["messages"][0]["content"] == "message-5"
+    assert page["has_more"] is True
+
+
 def test_cursor_snapshot_excludes_new_appends(db):
     db.create_session("s1", source="tui")
     for index in range(6):
