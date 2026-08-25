@@ -32,6 +32,13 @@ export function GroupChatView({ api, connection, employees, groupId, onArchive, 
   useEffect(() => {
     stateRef.current = state;
   }, [state]);
+  // Mirror the live `connection` prop so async error paths (e.g. submit
+  // throwing mid-flight) can read the current value instead of the stale
+  // closure captured when submit() was invoked.
+  const connectionRef = useRef(connection);
+  useEffect(() => {
+    connectionRef.current = connection;
+  }, [connection]);
 
   const load = useCallback(async (incremental: boolean) => {
     loadRef.current?.abort();
@@ -133,7 +140,10 @@ export function GroupChatView({ api, connection, employees, groupId, onArchive, 
       pendingSubmitRef.current = null;
       applySubmitResult(result);
     } catch (cause) {
-      if (connection !== "open") pendingSubmitRef.current = message;
+      // Queue the message for replay on the next reconnect only when the
+      // websocket is currently down. Validation/server errors thrown while
+      // the connection is healthy must not loop forever on every reconnect.
+      if (connectionRef.current !== "open") pendingSubmitRef.current = message;
       throw cause;
     }
   };
