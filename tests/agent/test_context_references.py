@@ -226,7 +226,7 @@ def test_binary_file_yields_actionable_block_not_a_dead_warning(sample_repo: Pat
     assert str(sample_repo / "blob.bin") in result.message
 
 
-def test_soft_budget_warns_and_hard_budget_refuses(sample_repo: Path):
+def test_oversized_reference_is_bounded_without_blocking(sample_repo: Path):
     from agent.context_references import preprocess_context_references
 
     soft = preprocess_context_references(
@@ -235,17 +235,65 @@ def test_soft_budget_warns_and_hard_budget_refuses(sample_repo: Path):
         context_length=100,
     )
     assert soft.expanded
-    assert any("25%" in warning for warning in soft.warnings)
+    assert not soft.blocked
+    assert soft.injected_tokens <= 75
 
     hard = preprocess_context_references(
         "Check @file:src/main.py and @file:README.md",
         cwd=sample_repo,
         context_length=20,
     )
-    assert not hard.expanded
-    assert hard.blocked
-    assert "@file:src/main.py" in hard.message
-    assert any("50%" in warning for warning in hard.warnings)
+    assert hard.expanded
+    assert not hard.blocked
+    assert hard.injected_tokens <= 15
+    assert "--- Attached Context ---" in hard.message
+
+
+@pytest.mark.asyncio
+async def test_large_reference_uses_bounded_summarizer(tmp_path: Path):
+    from agent.context_references import preprocess_context_references_async
+
+    path = tmp_path / "large.txt"
+    path.write_text("\n".join(f"line-{i}" for i in range(1000)), encoding="utf-8")
+    calls = []
+
+    async def summarize_chunk(**kwargs):
+        calls.append(kwargs)
+        return f"summary-{kwargs['chunk_index']}"
+
+    result = await preprocess_context_references_async(
+        "Review @file:large.txt",
+        cwd=tmp_path,
+        context_length=100,
+        summarize_chunk=summarize_chunk,
+    )
+
+    assert result.summarized
+    assert result.truncated
+    assert calls
+    assert all(len(call["chunk_text"]) <= 32_000 * 4 for call in calls)
+    assert "summary-" in result.message
+    assert "line-999" not in result.message
+
+
+def test_large_file_keeps_head_and_tail_with_metadata(tmp_path: Path):
+    from agent.context_references import preprocess_context_references
+
+    path = tmp_path / "large.txt"
+    path.write_text("\n".join(f"line-{i}" for i in range(1000)), encoding="utf-8")
+    result = preprocess_context_references(
+        "Review @file:large.txt",
+        cwd=tmp_path,
+        context_length=100,
+    )
+
+    assert result.expanded
+    assert not result.blocked
+    assert result.truncated
+    assert result.source_tokens > result.injected_tokens
+    assert "line-0" in result.message
+    assert "line-999" in result.message
+    assert "omitted" in result.message.lower()
 
 
 @pytest.mark.asyncio
