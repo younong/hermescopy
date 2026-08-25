@@ -13,6 +13,14 @@ import time
 from pathlib import Path
 from typing import Any, Sequence
 
+# The deploy tool invokes this script by absolute path, so only scripts/ is on
+# sys.path[0]. Prepend the repo root so hermes_cli resolves to the worktree
+# copy we're shipping rather than the editable-install mapping (which points
+# at a different checkout and may not yet carry history_pagination).
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
 from hermes_cli.history_pagination import DEFAULT_HISTORY_PAGE_SIZE
 from playwright_dashboard_login import (
     DEFAULT_URL,
