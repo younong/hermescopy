@@ -6,7 +6,7 @@ import os
 from pathlib import Path
 from unittest.mock import patch, MagicMock
 
-from hermes_cli.profiles import _get_default_hermes_home
+from hermes_constants import get_default_hermes_root
 
 import pytest
 
@@ -353,7 +353,7 @@ class TestResolveConfigPath:
 
     def test_falls_back_to_default_profile_when_no_local(self, tmp_path, monkeypatch):
         # Profile mode: HERMES_HOME points at ~/.hermes/profiles/<name>, so
-        # _get_default_hermes_home() must resolve back to ~/.hermes — that's
+        # get_default_hermes_root() must resolve back to ~/.hermes — that's
         # the bug the HOME-anchored helper fixes (vs. blindly using Path.home()).
         fake_home = tmp_path / "fakehome"
         fake_home.mkdir()
@@ -368,7 +368,7 @@ class TestResolveConfigPath:
 
         result = resolve_config_path()
 
-        assert _get_default_hermes_home() == default_home
+        assert get_default_hermes_root() == default_home
         assert result == default_cfg
 
     def test_falls_back_to_global_without_hermes_home_env(self, tmp_path):
@@ -448,35 +448,26 @@ class TestResolveActiveHost:
     def test_profile_name_derives_host(self):
         with patch.dict(os.environ, {}, clear=False):
             os.environ.pop("HERMES_HONCHO_HOST", None)
-            with patch("hermes_cli.profiles.get_active_profile_name", return_value="coder"):
+            with patch("plugins.memory.honcho.client.active_profile_name", return_value="coder"):
                 assert resolve_active_host() == "hermes_coder"
 
     def test_default_profile_returns_hermes(self):
         with patch.dict(os.environ, {}, clear=False):
             os.environ.pop("HERMES_HONCHO_HOST", None)
-            with patch("hermes_cli.profiles.get_active_profile_name", return_value="default"):
+            with patch("plugins.memory.honcho.client.active_profile_name", return_value="default"):
                 assert resolve_active_host() == "hermes"
 
     def test_custom_profile_returns_hermes(self):
         with patch.dict(os.environ, {}, clear=False):
             os.environ.pop("HERMES_HONCHO_HOST", None)
-            with patch("hermes_cli.profiles.get_active_profile_name", return_value="custom"):
+            with patch("plugins.memory.honcho.client.active_profile_name", return_value="custom"):
                 assert resolve_active_host() == "hermes"
 
-    def test_profiles_import_failure_falls_back(self):
-        import sys
+    def test_active_profile_resolution_failure_falls_back(self):
         with patch.dict(os.environ, {}, clear=False):
             os.environ.pop("HERMES_HONCHO_HOST", None)
-            # Temporarily remove hermes_cli.profiles to simulate import failure
-            saved = sys.modules.get("hermes_cli.profiles")
-            sys.modules["hermes_cli.profiles"] = None  # type: ignore
-            try:
+            with patch("plugins.memory.honcho.client.active_profile_name", side_effect=RuntimeError):
                 assert resolve_active_host() == "hermes"
-            finally:
-                if saved is not None:
-                    sys.modules["hermes_cli.profiles"] = saved
-                else:
-                    sys.modules.pop("hermes_cli.profiles", None)
 
 
 class TestProfileScopedConfig:

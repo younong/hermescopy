@@ -44,7 +44,7 @@ from dataclasses import dataclass
 from typing import Optional
 
 from hermes_cli import kanban_db as kb
-from hermes_cli import profiles as profiles_mod
+from hermes_cli.cron_dashboard import active_profile_name, profile_home, profile_homes
 
 logger = logging.getLogger(__name__)
 
@@ -187,15 +187,10 @@ def _resolve_orchestrator_profile(cfg: dict) -> str:
     explicit = (kanban_cfg.get("orchestrator_profile") or "").strip()
     if explicit:
         try:
-            if profiles_mod.profile_exists(explicit):
-                return explicit
-        except Exception:
+            return profile_home(explicit)[0]
+        except (ValueError, FileNotFoundError):
             pass
-    # Fall back to the active default profile.
-    try:
-        return profiles_mod.get_active_profile_name() or "default"
-    except Exception:
-        return "default"
+    return active_profile_name() or "default"
 
 
 def _resolve_default_assignee(cfg: dict) -> str:
@@ -204,14 +199,10 @@ def _resolve_default_assignee(cfg: dict) -> str:
     explicit = (kanban_cfg.get("default_assignee") or "").strip()
     if explicit:
         try:
-            if profiles_mod.profile_exists(explicit):
-                return explicit
-        except Exception:
+            return profile_home(explicit)[0]
+        except (ValueError, FileNotFoundError):
             pass
-    try:
-        return profiles_mod.get_active_profile_name() or "default"
-    except Exception:
-        return "default"
+    return active_profile_name() or "default"
 
 
 def _build_roster() -> tuple[list[dict], set[str]]:
@@ -224,18 +215,17 @@ def _build_roster() -> tuple[list[dict], set[str]]:
     roster: list[dict] = []
     valid: set[str] = set()
     try:
-        all_profiles = profiles_mod.list_profiles()
+        all_profiles = profile_homes()
     except Exception as exc:
         logger.warning("decompose: failed to list profiles: %s", exc)
         return roster, valid
-    for p in all_profiles:
-        desc = (p.description or "").strip()
+    for name, _home in all_profiles:
         roster.append({
-            "name": p.name,
-            "description": desc or f"(no description; profile named {p.name!r})",
-            "has_description": bool(desc),
+            "name": name,
+            "description": f"(no description; profile named {name!r})",
+            "has_description": False,
         })
-        valid.add(p.name)
+        valid.add(name)
     return roster, valid
 
 

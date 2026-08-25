@@ -4,7 +4,7 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
-from hermes_constants import get_default_hermes_root
+from hermes_constants import get_default_hermes_root, get_hermes_home
 
 
 _PROFILE_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
@@ -29,6 +29,21 @@ def profile_home(value: str | None) -> tuple[str, Path]:
     if name != "default" and not home.is_dir():
         raise FileNotFoundError(f"Profile {name!r} does not exist.")
     return name, home
+
+
+def active_profile_name() -> str:
+    """Infer the active profile name from the resolved Hermes home."""
+    try:
+        home = get_hermes_home().resolve()
+        root = get_default_hermes_root().resolve()
+        if home == root:
+            return "default"
+        relative = home.relative_to(root / "profiles")
+        if len(relative.parts) == 1 and _PROFILE_NAME_RE.fullmatch(relative.parts[0]):
+            return relative.parts[0]
+    except (OSError, RuntimeError, ValueError):
+        pass
+    return "custom"
 
 
 def profile_homes() -> list[tuple[str, Path]]:

@@ -11,6 +11,7 @@ import sys
 from pathlib import Path
 
 from hermes_constants import get_hermes_home
+from hermes_cli.cron_dashboard import active_profile_name, profile_homes
 from plugins.memory.honcho.client import _host_block, profile_host_key, resolve_active_host, resolve_config_path, HOST
 from hermes_cli.config import cfg_get
 
@@ -165,8 +166,7 @@ def cmd_sync(args) -> None:
     have one yet. Inherits settings from the default host block.
     """
     try:
-        from hermes_cli.profiles import list_profiles
-        profiles = list_profiles()
+        profiles = [name for name, _home in profile_homes()]
     except Exception as e:
         print(f"  Could not list profiles: {e}\n")
         return
@@ -186,11 +186,11 @@ def cmd_sync(args) -> None:
 
     created = 0
     skipped = 0
-    for p in profiles:
-        if p.name == "default":
+    for name in profiles:
+        if name == "default":
             continue
-        if clone_honcho_for_profile(p.name):
-            print(f"  + {p.name} -> {profile_host_key(p.name)}")
+        if clone_honcho_for_profile(name):
+            print(f"  + {name} -> {profile_host_key(name)}")
             created += 1
         else:
             skipped += 1
@@ -210,8 +210,7 @@ def sync_honcho_profiles_quiet() -> int:
     Called from `hermes update` -- no output, no exceptions.
     """
     try:
-        from hermes_cli.profiles import list_profiles
-        profiles = list_profiles()
+        profiles = [name for name, _home in profile_homes()]
     except Exception:
         return 0
 
@@ -225,10 +224,10 @@ def sync_honcho_profiles_quiet() -> int:
         return 0
 
     created = 0
-    for p in profiles:
-        if p.name == "default":
+    for name in profiles:
+        if name == "default":
             continue
-        if clone_honcho_for_profile(p.name):
+        if clone_honcho_for_profile(name):
             created += 1
     return created
 
@@ -982,11 +981,7 @@ def _active_profile_name() -> str:
     """Return the active Hermes profile name (respects --target-profile override)."""
     if _profile_override:
         return _profile_override
-    try:
-        from hermes_cli.profiles import get_active_profile_name
-        return get_active_profile_name()
-    except Exception:
-        return "default"
+    return active_profile_name()
 
 
 def _all_profile_host_configs() -> list[tuple[str, str, dict]]:
@@ -995,8 +990,7 @@ def _all_profile_host_configs() -> list[tuple[str, str, dict]]:
     Reads honcho.json once and maps each profile to its host block.
     """
     try:
-        from hermes_cli.profiles import list_profiles
-        profiles = list_profiles()
+        profiles = [name for name, _home in profile_homes()]
     except Exception:
         return [(_active_profile_name(), _host_key(), {})]
 
@@ -1008,11 +1002,11 @@ def _all_profile_host_configs() -> list[tuple[str, str, dict]]:
     default_block = hosts.get(HOST, {})
     results.append(("default", HOST, default_block))
 
-    for p in profiles:
-        if p.name == "default":
+    for name in profiles:
+        if name == "default":
             continue
-        h = f"{HOST}.{p.name}"
-        results.append((p.name, h, hosts.get(h, {})))
+        h = profile_host_key(name)
+        results.append((name, h, hosts.get(h, _host_block(cfg, h))))
 
     return results
 
