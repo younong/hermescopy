@@ -291,7 +291,9 @@ def test_authenticated_image_hint_uses_tool_visible_workspace_path(
     image.write_bytes(b"\x89PNG\r\n\x1a\nvalid-test-image")
     monkeypatch.setattr(
         "tools.vision_tools.vision_analyze_tool",
-        lambda **_kwargs: asyncio.sleep(0, result='{"success":false}'),
+        lambda **_kwargs: asyncio.sleep(
+            0, result='{"success":true,"analysis":"a test image"}'
+        ),
     )
 
     with server.owner_worker_gateway_runtime(runtime):
@@ -301,6 +303,100 @@ def test_authenticated_image_hint_uses_tool_visible_workspace_path(
     assert str(image) not in enriched
 
 
+def test_attached_image_analysis_failure_is_fail_closed(owner_gateway, monkeypatch):
+    _db, runtime, workspace_root = owner_gateway
+    image = Path(workspace_root) / "default" / "uploads" / "attached.png"
+    image.parent.mkdir(parents=True)
+    image.write_bytes(b"\x89PNG\r\n\x1a\nvalid-test-image")
+    monkeypatch.setattr(
+        "tools.vision_tools.vision_analyze_tool",
+        lambda **_kwargs: asyncio.sleep(0, result='{"success":false}'),
+    )
+
+    with server.owner_worker_gateway_runtime(runtime):
+        with pytest.raises(server._AttachedImageError, match="could not be analyzed"):
+            server._enrich_with_attached_images("describe it", [str(image)])
+
+
+def test_native_image_build_requires_every_attachment(owner_gateway, monkeypatch):
+    from hermes_cli.deployment_inference import DeploymentInferenceDescriptor
+
+    _db, runtime, workspace_root = owner_gateway
+    image = Path(workspace_root) / "default" / "uploads" / "attached.png"
+    image.parent.mkdir(parents=True)
+    image.write_bytes(b"\x89PNG\r\n\x1a\nvalid-test-image")
+    captured = {}
+
+    def _build(_prompt, _images, **_kwargs):
+        return ([{"type": "text", "text": "describe it"}], [])
+
+    monkeypatch.setattr("agent.image_routing.build_native_content_parts", _build)
+
+    class _Agent:
+        provider = "custom:codex"
+        model = "gpt-5.6-sol"
+        api_mode = "chat_completions"
+
+        def clear_interrupt(self):
+            return None
+
+        def run_conversation(self, message, **_kwargs):
+            captured["called"] = True
+            return {"final_response": "should not run"}
+
+    session = {
+        "agent": _Agent(),
+        "agent_ready": threading.Event(),
+        "session_key": "incomplete-image",
+        "history": [],
+        "history_lock": threading.Lock(),
+        "history_version": 0,
+        "inflight_turn": None,
+        "running": False,
+        "attached_images": [str(image), str(image)],
+        "pending_attachments": [],
+        "cwd": str(runtime.filesystem_context.workspace_path),
+        "cols": 80,
+        "transport": _CollaborationTransport(),
+        "source": "dashboard-gui",
+    }
+    session["agent_ready"].set()
+    runtime.mutable_state.sessions["incomplete-image"] = session
+    descriptor = DeploymentInferenceDescriptor(
+        provider="custom:codex",
+        model="gpt-5.6-sol",
+        api_mode="chat_completions",
+        policy_id="policy-v1",
+        allowed_models=("gpt-5.6-sol",),
+        supports_vision=True,
+    )
+    monkeypatch.setattr(server, "_emit", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(server, "_sync_agent_model_with_config", lambda *_args: None)
+    monkeypatch.setattr(server, "_register_session_cwd", lambda *_args: None)
+    monkeypatch.setattr(server, "_complete_prompt_turn_receipt", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(server, "_session_info", lambda *_args: {})
+    monkeypatch.setattr(server, "_get_usage", lambda *_args: {})
+    monkeypatch.setattr(server, "render_message", lambda *_args: "")
+    monkeypatch.setattr(server, "_voice_tts_enabled", lambda: False)
+    monkeypatch.setattr("hermes_cli.config.load_config", lambda: {})
+    monkeypatch.setattr(
+        "hermes_cli.deployment_inference.deployment_descriptor_from_environment",
+        lambda: descriptor,
+    )
+
+    try:
+        response = _call(
+            runtime,
+            "prompt.submit",
+            {"session_id": "incomplete-image", "text": "describe it"},
+            transport=session["transport"],
+        )
+        assert response["result"] == {"status": "streaming"}
+        session["_run_thread"].join(timeout=2)
+    finally:
+        runtime.mutable_state.sessions.pop("incomplete-image", None)
+
+    assert "called" not in captured
 def test_owner_worker_codex_prompt_uses_deployment_native_vision(
     owner_gateway, monkeypatch
 ):
@@ -423,6 +519,26 @@ def test_authenticated_image_attach_rejects_stale_workspace_path(owner_gateway, 
     }
     assert str(stale) not in str(response)
     assert session["attached_images"] == []
+
+
+def test_input_detect_drop_stages_non_image_attachment(monkeypatch, tmp_path):
+    target = tmp_path / "notes.txt"
+    target.write_text("attached text", encoding="utf-8")
+    session = {"cwd": str(tmp_path), "pending_attachments": [], "attached_images": []}
+    monkeypatch.setenv("TERMINAL_CWD", str(tmp_path))
+    monkeypatch.setattr(server, "_sess_nowait", lambda _params, _rid: (session, None))
+    monkeypatch.setattr(server, "_authenticated_workspace_context", lambda: None)
+
+    response = server._methods["input.detect_drop"](
+        "request", {"text": f"{target} summarize this"}
+    )
+
+    result = response["result"]
+    assert result["matched"] is True
+    assert result["attach_method"] == "file.attach"
+    assert result["ref_text"] == "@file:notes.txt"
+    assert result["text"].startswith("@file:notes.txt")
+    assert session["pending_attachments"][0]["ref_text"] == "@file:notes.txt"
 
 
 def test_attachment_ref_rejects_external_path_in_non_authenticated_mode(monkeypatch, tmp_path):
