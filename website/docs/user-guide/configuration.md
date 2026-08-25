@@ -1884,6 +1884,8 @@ approvals:
 | `smart` | Use an auxiliary LLM to assess whether a flagged command is actually dangerous. Low-risk commands are auto-approved with session-level persistence. Genuinely risky commands are escalated to the user. |
 | `off` | Skip all approval checks. Equivalent to `HERMES_YOLO_MODE=true`. **Use with caution.** |
 
+In ordinary TUI/Web gateway agent turns, terminal and execute_code calls skip this duplicate approval prompt; the hardline and sudo-stdin safety floors still apply. Collaboration group/task approvals and cron policy remain separate. Set `approvals.mode: manual` to require ordinary command approval in other approval-enabled flows.
+
 Smart mode is particularly useful for reducing approval fatigue — it lets the agent work more autonomously on safe operations while still catching genuinely destructive commands.
 
 :::warning

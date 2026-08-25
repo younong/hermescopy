@@ -5831,12 +5831,17 @@ class CollaborationAgentRunner:
                 agent.collaboration_context = collaboration_context
         from tools.approval import (
             register_gateway_notify,
-            set_current_session_key,
             reset_current_session_key,
+            reset_gateway_agent_turn_bypass,
+            set_current_session_key,
+            set_gateway_agent_turn_bypass,
             unregister_gateway_notify,
         )
 
         approval_token = set_current_session_key(stored_session_id)
+        # A collaboration run may be invoked from a normal gateway turn, so
+        # explicitly suppress that turn's ordinary-approval bypass here.
+        gateway_bypass_token = set_gateway_agent_turn_bypass(False)
         register_gateway_notify(stored_session_id, on_approval)
         session_tokens = _set_session_context(stored_session_id)
         try:
@@ -5850,6 +5855,7 @@ class CollaborationAgentRunner:
         finally:
             _clear_session_context(session_tokens)
             unregister_gateway_notify(stored_session_id)
+            reset_gateway_agent_turn_bypass(gateway_bypass_token)
             reset_current_session_key(approval_token)
         if isinstance(result, dict):
             failed = bool(result.get("failed") or result.get("partial") or result.get("error"))
@@ -11687,15 +11693,19 @@ def _run_prompt_submit(
 
     def run():
         approval_token = None
+        gateway_bypass_token = None
         session_tokens = []
         goal_followup = None  # set by the post-turn goal hook below
         try:
             from tools.approval import (
                 reset_current_session_key,
+                reset_gateway_agent_turn_bypass,
                 set_current_session_key,
+                set_gateway_agent_turn_bypass,
             )
 
             approval_token = set_current_session_key(session["session_key"])
+            gateway_bypass_token = set_gateway_agent_turn_bypass()
             session_tokens = _set_session_context(session["session_key"])
             # The sudo password callback is thread-local (tools.terminal_tool
             # _callback_tls), so wiring it on the build thread doesn't reach this
@@ -12208,6 +12218,8 @@ def _run_prompt_submit(
             for temporary_root in session.pop("_attachment_temp_roots", []):
                 _cleanup_authenticated_temporary(temporary_root)
             try:
+                if gateway_bypass_token is not None:
+                    reset_gateway_agent_turn_bypass(gateway_bypass_token)
                 if approval_token is not None:
                     reset_current_session_key(approval_token)
             except Exception:

@@ -167,6 +167,48 @@ def test_guard_cron_deny_blocks(monkeypatch):
     assert res["outcome"] == "blocked"
 
 
+def test_normal_gateway_turn_bypasses_ordinary_approval(gw_session):
+    token = A.set_gateway_agent_turn_bypass()
+    try:
+        res = A.check_execute_code_guard("import os; print(1)", "local")
+        assert res["approved"] is True
+        assert A.check_all_command_guards("rm -rf /tmp/work", "local")["approved"] is True
+    finally:
+        A.reset_gateway_agent_turn_bypass(token)
+
+
+def test_gateway_turn_bypass_does_not_leak(gw_session):
+    token = A.set_gateway_agent_turn_bypass()
+    A.reset_gateway_agent_turn_bypass(token)
+    _register_resolver(gw_session, "deny")
+    res = A.check_execute_code_guard("import os; print(1)", "local")
+    assert res["approved"] is False
+    assert res["outcome"] == "denied"
+
+
+def test_gateway_turn_bypass_keeps_hardline_and_sudo_floors(gw_session):
+    token = A.set_gateway_agent_turn_bypass()
+    try:
+        hardline = A.check_all_command_guards("rm -rf /", "local")
+        sudo = A.check_all_command_guards("sudo -S whoami", "local")
+        assert hardline["approved"] is False
+        assert sudo["approved"] is False
+    finally:
+        A.reset_gateway_agent_turn_bypass(token)
+
+
+def test_gateway_turn_bypass_does_not_apply_to_cron(gw_session, monkeypatch):
+    monkeypatch.setenv("HERMES_CRON_SESSION", "1")
+    monkeypatch.setattr(A, "_get_cron_approval_mode", lambda: "deny")
+    token = A.set_gateway_agent_turn_bypass()
+    try:
+        res = A.check_execute_code_guard("import os", "local")
+        assert res["approved"] is False
+        assert res["outcome"] == "blocked"
+    finally:
+        A.reset_gateway_agent_turn_bypass(token)
+
+
 def test_guard_gateway_user_approves_is_one_shot(gw_session):
     _register_resolver(gw_session, "once")
     res = A.check_execute_code_guard("import os; print(1)", "local")

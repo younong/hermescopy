@@ -48,6 +48,13 @@ _approval_tool_call_id: contextvars.ContextVar[str] = contextvars.ContextVar(
     "approval_tool_call_id",
     default="",
 )
+# Normal TUI/Web gateway agent turns do not need a second user approval for
+# ordinary terminal or execute_code calls. Keep this opt-in and context-local:
+# collaboration runners and other callers remain on the normal approval path.
+_gateway_agent_turn_bypass: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "gateway_agent_turn_bypass",
+    default=False,
+)
 
 # Interactive-runtime flag. A contextvar keeps concurrent executor workers or
 # asyncio tasks from racing through process-global HERMES_INTERACTIVE changes.
@@ -122,6 +129,16 @@ def set_current_session_key(session_key: str) -> contextvars.Token[str]:
 def reset_current_session_key(token: contextvars.Token[str]) -> None:
     """Restore the prior approval session key context."""
     _approval_session_key.reset(token)
+
+
+def set_gateway_agent_turn_bypass(enabled: bool = True) -> contextvars.Token[bool]:
+    """Bind whether ordinary approvals are bypassed in the current turn."""
+    return _gateway_agent_turn_bypass.set(bool(enabled))
+
+
+def reset_gateway_agent_turn_bypass(token: contextvars.Token[bool]) -> None:
+    """Restore the prior normal gateway approval behavior."""
+    _gateway_agent_turn_bypass.reset(token)
 
 
 def set_current_observability_context(
@@ -2256,6 +2273,12 @@ def check_all_command_guards(command: str, env_type: str,
                        sudo_guess_desc, command[:200])
         return _sudo_stdin_block_result(sudo_guess_desc)
 
+    # Normal gateway agent turns are already operating under the user's
+    # authenticated conversation. This scoped bypass is deliberately after the
+    # unconditional safety floors and is never enabled by collaboration runs.
+    if _gateway_agent_turn_bypass.get() and not env_var_enabled("HERMES_CRON_SESSION"):
+        return {"approved": True, "message": None}
+
     # --yolo or approvals.mode=off: bypass all approval prompts.
     # Gateway /yolo is session-scoped; CLI --yolo remains process-scoped.
     approval_mode = _get_approval_mode()
@@ -2651,6 +2674,12 @@ def check_execute_code_guard(code: str, env_type: str,
     if env_type == "vercel_sandbox":
         return {"approved": True, "message": None}
     if _should_skip_container_guards(env_type, has_host_access=has_host_access):
+        return {"approved": True, "message": None}
+
+    # Normal gateway agent turns do not need a second approval for arbitrary
+    # code. The scope is bound only around ordinary gateway turns; cron and
+    # collaboration runners do not inherit it.
+    if _gateway_agent_turn_bypass.get() and not env_var_enabled("HERMES_CRON_SESSION"):
         return {"approved": True, "message": None}
 
     # --yolo or approvals.mode=off: bypass (session- or process-scoped).
