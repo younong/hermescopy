@@ -133,6 +133,47 @@ def test_owner_worker_turn_lease_guard_releases_on_exact_health_failure(monkeypa
     assert lease.release_count == 1
 
 
+def test_owner_worker_transport_failure_is_reported_only_when_unexpected() -> None:
+    class _Lifecycle:
+        def __init__(self) -> None:
+            self.calls = []
+
+        def report_request_failure(self, handle, reason):
+            self.calls.append((handle, reason))
+
+    lifecycle = _Lifecycle()
+    handle = object()
+    web_server._report_unexpected_owner_worker_transport_failure(
+        lifecycle, handle, worker_transport_ended=True, bridge_closing=False
+    )
+    web_server._report_unexpected_owner_worker_transport_failure(
+        lifecycle, handle, worker_transport_ended=True, bridge_closing=True
+    )
+    web_server._report_unexpected_owner_worker_transport_failure(
+        lifecycle, handle, worker_transport_ended=False, bridge_closing=False
+    )
+    assert lifecycle.calls == [(handle, "transport")]
+
+
+def test_owner_worker_relay_end_kind_classifies_worker_and_browser_tasks() -> None:
+    async def noop() -> None:
+        return None
+
+    async def exercise() -> tuple[tuple[bool, bool], tuple[bool, bool]]:
+        tasks = tuple(asyncio.create_task(noop()) for _ in range(4))
+        try:
+            return (
+                web_server._owner_worker_relay_end_kind(tasks[2], tasks),
+                web_server._owner_worker_relay_end_kind(tasks[0], tasks),
+            )
+        finally:
+            await asyncio.gather(*tasks)
+
+    worker, browser = asyncio.run(exercise())
+    assert worker == (False, True)
+    assert browser == (True, False)
+
+
 def test_owner_worker_bridge_lifecycle_audit_is_terminal_and_exactly_once(monkeypatch) -> None:
     events = []
     monkeypatch.setattr(web_server, "_report_bridge_lifecycle", lambda lease, reason: events.append((lease, reason)))

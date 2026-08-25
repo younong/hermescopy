@@ -10981,6 +10981,28 @@ class _OwnerWorkerWsRelayClosed(Exception):
         super().__init__(self.reason or f"websocket relay closed ({self.code})")
 
 
+def _owner_worker_relay_end_kind(
+    task: asyncio.Task[Any], relay_tasks: tuple[asyncio.Task[Any], ...]
+) -> tuple[bool, bool]:
+    """Classify a completed relay task as browser-side or worker-side."""
+    return (
+        task in {relay_tasks[0], relay_tasks[3]},
+        task in {relay_tasks[1], relay_tasks[2]},
+    )
+
+
+def _report_unexpected_owner_worker_transport_failure(
+    lifecycle: Any | None,
+    handle: Any,
+    *,
+    worker_transport_ended: bool,
+    bridge_closing: bool,
+) -> None:
+    """Fence a generation only for an unexpected worker-side relay loss."""
+    if worker_transport_ended and not bridge_closing and lifecycle is not None:
+        lifecycle.report_request_failure(handle, "transport")
+
+
 class _OwnerWorkerWsBridge:
     """Own the two relay halves and transfer or release the use lease once."""
 
@@ -11594,6 +11616,7 @@ async def _bridge_websocket_to_owner_worker(
     await asyncio.sleep(0)
     close_code, close_reason = 1011, "owner worker relay ended"
     browser_transport_ended = False
+    worker_transport_ended = False
     try:
         wait_targets = (*relay_tasks, *((expiry_task,) if expiry_task is not None else ()))
         done, _pending = await asyncio.wait(wait_targets, return_when=asyncio.FIRST_COMPLETED)
@@ -11621,10 +11644,14 @@ async def _bridge_websocket_to_owner_worker(
                 task.result()
             except _OwnerWorkerWsRelayClosed as exc:
                 close_code, close_reason = exc.code, exc.reason
-                browser_transport_ended = task in {relay_tasks[0], relay_tasks[3]}
+                browser_transport_ended, worker_transport_ended = _owner_worker_relay_end_kind(
+                    task, relay_tasks
+                )
                 break
             except Exception:
-                browser_transport_ended = task in {relay_tasks[0], relay_tasks[3]}
+                browser_transport_ended, worker_transport_ended = _owner_worker_relay_end_kind(
+                    task, relay_tasks
+                )
                 _log.debug("owner websocket relay ended", exc_info=True)
                 break
     finally:
@@ -11655,6 +11682,12 @@ async def _bridge_websocket_to_owner_worker(
                         ws.app.state.authorized_ws_bridges_by_worker.pop(
                             bridge_worker_identity, None
                         )
+        _report_unexpected_owner_worker_transport_failure(
+            lifecycle,
+            handle,
+            worker_transport_ended=worker_transport_ended,
+            bridge_closing=bridge.closing,
+        )
         if not bridge.closing:
             defer_turn_lease = path == "/api/ws" and browser_transport_ended
             guarded_lease = await bridge.close(

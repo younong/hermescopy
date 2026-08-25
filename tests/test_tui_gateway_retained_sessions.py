@@ -72,6 +72,28 @@ def owner_gateway(monkeypatch, tmp_path):
     roots.close()
 
 
+def test_write_json_drops_stale_session_events_without_ambient_fallback(monkeypatch):
+    runtime = server.OwnerWorkerGatewayRuntime("owner-a", 2, "worker-a", 1, 0)
+    ambient = _Transport("ambient")
+    stale = {"method": "event", "params": {"session_id": "stale-session"}}
+    monkeypatch.setattr(server, "current_transport", lambda: ambient)
+    with server.owner_worker_gateway_runtime(runtime):
+        with server._sessions_lock:
+            server._sessions.pop("stale-session", None)
+        assert server.write_json(stale) is False
+
+
+def test_write_json_keeps_request_transport_strict_without_ambient_transport(
+    monkeypatch,
+):
+    runtime = server.OwnerWorkerGatewayRuntime("owner-a", 2, "worker-a", 1, 0)
+    monkeypatch.setattr(server, "current_transport", lambda: None)
+
+    with server.owner_worker_gateway_runtime(runtime):
+        with pytest.raises(RuntimeError, match="owner worker gateway transport is required"):
+            server.write_json({"jsonrpc": "2.0", "id": "request", "result": {}})
+
+
 def test_fanout_transport_broadcasts_and_isolates_failed_subscribers():
     class _Sink:
         def __init__(self, *, fail=False):
