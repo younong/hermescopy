@@ -242,6 +242,7 @@ def create_job(
     *,
     profile: str | None = None,
     allowed_workdir_root: Path | None = None,
+    max_jobs: int | None = None,
 ) -> dict[str, Any]:
     store = _store(home)
     if values.get("target_employee_ids"):
@@ -275,6 +276,7 @@ def create_job(
             no_agent=bool(normalized.get("no_agent")),
             employee_id=normalized.get("employee_id"),
             target_employee_ids=normalized.get("target_employee_ids"),
+            max_jobs=max_jobs,
         )
         _notify_provider()
     return _annotate_job(job, profile=profile, home=store.owner_home)
