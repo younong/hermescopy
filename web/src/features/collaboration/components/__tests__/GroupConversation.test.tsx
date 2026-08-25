@@ -157,6 +157,31 @@ describe("GroupConversation owner mentions", () => {
       .toBe("/hermes/api/employees/employee-a/avatar?v=123");
   });
 
+  it("renders the history control when a page has no visible message events", () => {
+    const container = renderConversation({
+      ...initialCollaborationState,
+      eventsBySequence: {
+        1: {
+          actor_employee_id: null,
+          actor_kind: "system",
+          actor_membership_id: null,
+          body: { membership_id: "membership-a" },
+          created_at: 1,
+          event_id: "event-a",
+          event_kind: "membership.joined",
+          group_id: "group-a",
+          sequence: 1,
+        },
+      },
+      historyBeforeSequence: 1,
+      historyHasMore: true,
+      loading: false,
+    });
+
+    expect(container.textContent).toContain("Scroll up for earlier messages");
+    expect(container.textContent).not.toContain("Start the group conversation");
+  });
+
   it("does not render target cards below the user message", () => {
     const container = renderConversation({
       ...initialCollaborationState,

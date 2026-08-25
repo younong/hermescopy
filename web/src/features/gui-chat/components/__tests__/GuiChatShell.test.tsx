@@ -647,6 +647,19 @@ describe("GuiChatShell", () => {
         status: "active",
         updated_at: 1,
       },
+      history_page: {
+        after_sequence: null,
+        before_sequence: null,
+        direction: "initial",
+        has_more: false,
+        limit: 100,
+        next_after_sequence: null,
+        next_before_sequence: null,
+        range_end_sequence: null,
+        range_start_sequence: null,
+        snapshot_sequence: 0,
+        through_sequence: 0,
+      },
       memberships: [],
       reconciliation: {
         after_sequence: 0,
@@ -1329,7 +1342,7 @@ describe("GuiChatShell", () => {
     expect(document.querySelector("[data-files-pane]")).toBeNull();
     expect(connection.collaboration.getGroup).toHaveBeenCalledWith(
       "group-archived",
-      undefined,
+      { limit: 100 },
       expect.any(AbortSignal),
     );
   });
@@ -1382,6 +1395,19 @@ describe("GuiChatShell", () => {
         name: "Group A",
         status: "active",
         updated_at: 1_700_000_000,
+      },
+      history_page: {
+        after_sequence: null,
+        before_sequence: null,
+        direction: "initial",
+        has_more: false,
+        limit: 100,
+        next_after_sequence: null,
+        next_before_sequence: null,
+        range_end_sequence: null,
+        range_start_sequence: null,
+        snapshot_sequence: 0,
+        through_sequence: 0,
       },
       memberships: [],
       reconciliation: {

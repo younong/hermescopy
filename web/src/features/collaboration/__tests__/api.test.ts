@@ -23,7 +23,7 @@ describe("collaboration API", () => {
     const { api, ensureConnected, request } = harness();
 
     await api.listGroups(true);
-    await api.getGroup("group-a", 12);
+    await api.getGroup("group-a", { after_sequence: 12 });
     await api.createGroup("Research", ["account-b", "account-a"], "create-key");
     await api.updateMembers("group-a", ["account-a"]);
     await api.submitMessage({

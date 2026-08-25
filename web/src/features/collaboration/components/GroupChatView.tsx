@@ -4,13 +4,15 @@ import { guiChatTranslations, useI18n } from "@/i18n";
 import { employeeDisplayName, employeeDisplayRole, type Employee } from "@/lib/api";
 import type { CollaborationApi } from "../api";
 import type { CollaborationSubmitResponse } from "../protocol";
-import { collaborationReducer } from "../reducer";
+import { collaborationReducer, isTerminalTarget } from "../reducer";
 import { defaultMentionSelection } from "../mentions";
-import type { CollaborationSubmitMessage } from "../types";
+import type { CollaborationGetOptions, CollaborationSubmitMessage } from "../types";
 import { initialCollaborationState, type CollaborationEmployeeIdentity } from "../types";
 import { GroupComposer, type GroupComposerSubmit } from "./GroupComposer";
 import { GroupConversation } from "./GroupConversation";
 import { MemberManager } from "./MemberManager";
+
+const HISTORY_PAGE_SIZE = 100;
 
 interface GroupChatViewProps {
   api: CollaborationApi;
@@ -26,34 +28,103 @@ export function GroupChatView({ api, connection, employees, groupId, onArchive, 
   const copy = guiChatTranslations(t).collaboration;
   const [state, dispatch] = useReducer(collaborationReducer, initialCollaborationState);
   const [memberManagerOpen, setMemberManagerOpen] = useState(false);
-  const loadRef = useRef<AbortController | null>(null);
+  const initialRef = useRef<AbortController | null>(null);
+  const reconciliationRef = useRef<AbortController | null>(null);
+  const historyRef = useRef<AbortController | null>(null);
+  const generationRef = useRef(0);
   const pendingSubmitRef = useRef<CollaborationSubmitMessage | null>(null);
   const stateRef = useRef(state);
   useEffect(() => {
     stateRef.current = state;
   }, [state]);
-  // Mirror the live `connection` prop so async error paths (e.g. submit
-  // throwing mid-flight) can read the current value instead of the stale
-  // closure captured when submit() was invoked.
   const connectionRef = useRef(connection);
   useEffect(() => {
     connectionRef.current = connection;
   }, [connection]);
 
-  const load = useCallback(async (incremental: boolean) => {
-    loadRef.current?.abort();
+  const activeOverlayOptions = useCallback((): CollaborationGetOptions => ({
+    reconcile_approval_ids: Object.values(stateRef.current.approvalsById)
+      .filter((approval) => approval.status === "pending")
+      .map((approval) => approval.approval_id),
+    reconcile_membership_ids: Object.values(stateRef.current.membershipsById)
+      .filter((membership) => membership.leave_sequence === null)
+      .map((membership) => membership.membership_id),
+    reconcile_target_ids: Object.values(stateRef.current.targetsById)
+      .filter((target) => !isTerminalTarget(target.status))
+      .map((target) => target.target_id),
+  }), []);
+
+  const loadInitial = useCallback(async () => {
+    initialRef.current?.abort();
     const controller = new AbortController();
-    loadRef.current = controller;
-    const after = incremental && stateRef.current.group?.group_id === groupId
-      ? stateRef.current.lastSequence
-      : undefined;
-    if (incremental && after === undefined) return;
-    dispatch({ type: "load.started", incremental: after !== undefined });
+    const generation = generationRef.current;
+    initialRef.current = controller;
+    dispatch({ type: "load.started", mode: "initial" });
     try {
-      const snapshot = await api.getGroup(groupId, after, controller.signal);
-      if (!controller.signal.aborted) dispatch({ type: "snapshot", snapshot });
+      const snapshot = await api.getGroup(groupId, { limit: HISTORY_PAGE_SIZE }, controller.signal);
+      if (!controller.signal.aborted && generation === generationRef.current) {
+        dispatch({ type: "snapshot", snapshot });
+      }
     } catch (cause) {
-      if (!controller.signal.aborted) dispatch({ type: "error", message: cause instanceof Error ? cause.message : String(cause) });
+      if (!controller.signal.aborted && generation === generationRef.current) {
+        dispatch({ type: "load.failed", mode: "initial", message: errorMessage(cause) });
+      }
+    }
+  }, [api, groupId]);
+
+  const reconcile = useCallback(async () => {
+    if (stateRef.current.group?.group_id !== groupId) return;
+    reconciliationRef.current?.abort();
+    const controller = new AbortController();
+    const generation = generationRef.current;
+    reconciliationRef.current = controller;
+    dispatch({ type: "load.started", mode: "forward" });
+    let after = stateRef.current.reconciledSequence;
+    let through: number | undefined;
+    try {
+      while (!controller.signal.aborted) {
+        const snapshot = await api.getGroup(groupId, {
+          ...activeOverlayOptions(),
+          after_sequence: after,
+          limit: HISTORY_PAGE_SIZE,
+          ...(through === undefined ? {} : { through_sequence: through }),
+        }, controller.signal);
+        if (controller.signal.aborted || generation !== generationRef.current) return;
+        dispatch({ type: "snapshot", snapshot });
+        const page = snapshot.history_page;
+        through ??= page?.through_sequence ?? snapshot.reconciliation?.last_sequence ?? snapshot.group.last_sequence;
+        const next = page?.next_after_sequence ?? snapshot.reconciliation?.next_after_sequence ?? after;
+        if (!(page?.has_more ?? false)) break;
+        if (next <= after) throw new Error("Collaboration reconciliation cursor did not advance");
+        after = next;
+      }
+    } catch (cause) {
+      if (!controller.signal.aborted && generation === generationRef.current) {
+        dispatch({ type: "load.failed", mode: "forward", message: errorMessage(cause) });
+      }
+    }
+  }, [activeOverlayOptions, api, groupId]);
+
+  const loadEarlier = useCallback(async () => {
+    const before = stateRef.current.historyBeforeSequence;
+    if (!before || !stateRef.current.historyHasMore || stateRef.current.historyLoading) return;
+    historyRef.current?.abort();
+    const controller = new AbortController();
+    const generation = generationRef.current;
+    historyRef.current = controller;
+    dispatch({ type: "load.started", mode: "backward" });
+    try {
+      const snapshot = await api.getGroup(groupId, {
+        before_sequence: before,
+        limit: HISTORY_PAGE_SIZE,
+      }, controller.signal);
+      if (!controller.signal.aborted && generation === generationRef.current) {
+        dispatch({ type: "snapshot", snapshot });
+      }
+    } catch (cause) {
+      if (!controller.signal.aborted && generation === generationRef.current) {
+        dispatch({ type: "load.failed", mode: "backward", message: errorMessage(cause) });
+      }
     }
   }, [api, groupId]);
 
@@ -65,23 +136,25 @@ export function GroupChatView({ api, connection, employees, groupId, onArchive, 
   }, [groupId]);
 
   useEffect(() => {
+    generationRef.current += 1;
     dispatch({ type: "clear" });
-    void load(false);
-    return () => loadRef.current?.abort();
-  }, [groupId, load]);
+    void loadInitial();
+    return () => {
+      generationRef.current += 1;
+      initialRef.current?.abort();
+      reconciliationRef.current?.abort();
+      historyRef.current?.abort();
+    };
+  }, [groupId, loadInitial]);
 
   const previousConnectionRef = useRef(connection);
   useEffect(() => {
     const previousConnection = previousConnectionRef.current;
     previousConnectionRef.current = connection;
     dispatch({ type: "connection", state: connection });
-    if (
-      connection === "open" &&
-      previousConnection !== "open" &&
-      stateRef.current.group?.group_id === groupId
-    ) {
+    if (connection === "open" && previousConnection !== "open" && stateRef.current.group?.group_id === groupId) {
       void (async () => {
-        await load(true);
+        await reconcile();
         const pending = pendingSubmitRef.current;
         if (!pending) return;
         try {
@@ -89,12 +162,11 @@ export function GroupChatView({ api, connection, employees, groupId, onArchive, 
           pendingSubmitRef.current = null;
           applySubmitResult(result);
         } catch {
-          // Keep the same idempotency key for the next reconnect. The composer
-          // still owns the user-visible error and preserves the draft.
+          // Preserve the same idempotency key for the next reconnect.
         }
       })();
     }
-  }, [api, applySubmitResult, connection, groupId, load]);
+  }, [api, applySubmitResult, connection, groupId, reconcile]);
 
   useEffect(() => api.onEvent((event) => {
     dispatch({ type: "event", event });
@@ -113,10 +185,7 @@ export function GroupChatView({ api, connection, employees, groupId, onArchive, 
   );
   const employeeName = useCallback((employeeId: string) =>
     identities.find((employee) => employee.employeeId === employeeId)?.name ?? copy.formerEmployee, [copy.formerEmployee, identities]);
-  const memberships = useMemo(
-    () => Object.values(state.membershipsById),
-    [state.membershipsById],
-  );
+  const memberships = useMemo(() => Object.values(state.membershipsById), [state.membershipsById]);
   const defaultSelection = useMemo(
     () => defaultMentionSelection(
       { mentionAll: false, membershipIds: [] },
@@ -140,9 +209,6 @@ export function GroupChatView({ api, connection, employees, groupId, onArchive, 
       pendingSubmitRef.current = null;
       applySubmitResult(result);
     } catch (cause) {
-      // Queue the message for replay on the next reconnect only when the
-      // websocket is currently down. Validation/server errors thrown while
-      // the connection is healthy must not loop forever on every reconnect.
       if (connectionRef.current !== "open") pendingSubmitRef.current = message;
       throw cause;
     }
@@ -164,7 +230,7 @@ export function GroupChatView({ api, connection, employees, groupId, onArchive, 
         />
       ) : null}
       <div className="flex h-10 shrink-0 items-center justify-end gap-1 border-b border-[#f0f1f3] px-3">
-        <button aria-label={copy.refreshGroup} className="gui-chat-icon-button" onClick={() => void load(true)} type="button"><RefreshCw className={state.reconciling ? "animate-spin" : ""} /></button>
+        <button aria-label={copy.refreshGroup} className="gui-chat-icon-button" onClick={() => void reconcile()} type="button"><RefreshCw className={state.reconciling ? "animate-spin" : ""} /></button>
         {state.group?.status === "active" ? (
           <>
             <button aria-label={copy.manageMembers} className="gui-chat-icon-button" onClick={() => setMemberManagerOpen(true)} type="button"><UserRoundCog /></button>
@@ -173,7 +239,7 @@ export function GroupChatView({ api, connection, employees, groupId, onArchive, 
         ) : null}
       </div>
       {state.error ? <div className="gui-chat-notice gui-chat-notice-error">{state.error}</div> : null}
-      <GroupConversation employees={identities} state={state} />
+      <GroupConversation employees={identities} onLoadEarlier={loadEarlier} state={state} />
       <GroupComposer
         employeeName={employeeName}
         archived={state.group?.status === "archived"}
@@ -185,6 +251,10 @@ export function GroupChatView({ api, connection, employees, groupId, onArchive, 
       />
     </div>
   );
+}
+
+function errorMessage(cause: unknown): string {
+  return cause instanceof Error ? cause.message : String(cause);
 }
 
 function createIdempotencyKey(): string {

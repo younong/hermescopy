@@ -1084,6 +1084,194 @@ class TestWsAuthOkGated:
         assert worker.closed
         assert lease.release_count == 1
 
+    def test_public_ticket_relays_owner_attach_and_collaboration_rpc_to_exact_worker_path(
+        self, gated_app, monkeypatch, tmp_path
+    ):
+        import asyncio
+        import json
+
+        ticket, ticket_ws = _browser_ticket_ws(gated_app, path="/api/ws")
+        auth_result = web_server._ws_auth_result(ticket_ws)
+        assert auth_result.reason is None
+
+        class _Browser:
+            def __init__(self):
+                self.app = web_server.app
+                self.query_params = ticket_ws.query_params
+                self.url = ticket_ws.url
+                self.accepted = False
+                self.closed = []
+                self.responses = []
+                self._requests = iter(
+                    (
+                        {
+                            "type": "websocket.receive",
+                            "text": json.dumps(
+                                {
+                                    "jsonrpc": "2.0",
+                                    "id": "attach",
+                                    "method": "session.owner_attach",
+                                    "params": {"browser_id": "browser-a"},
+                                }
+                            ),
+                        },
+                        {
+                            "type": "websocket.receive",
+                            "text": json.dumps(
+                                {
+                                    "jsonrpc": "2.0",
+                                    "id": "group",
+                                    "method": "collaboration.group.get",
+                                    "params": {"group_id": "group-a", "limit": 100},
+                                }
+                            ),
+                        },
+                    )
+                )
+                self._responses_complete = asyncio.Event()
+
+            async def accept(self):
+                self.accepted = True
+
+            async def close(self, *, code=1000, reason=""):
+                self.closed.append((code, reason))
+
+            async def receive(self):
+                try:
+                    return next(self._requests)
+                except StopIteration:
+                    await self._responses_complete.wait()
+                    return {"type": "websocket.disconnect", "code": 1000, "reason": ""}
+
+            async def send_text(self, value):
+                self.responses.append(json.loads(value))
+                if len(self.responses) == 2:
+                    self._responses_complete.set()
+
+        class _Worker:
+            def __init__(self):
+                self.closed = []
+                self.sent = []
+                self.responses = asyncio.Queue()
+
+            async def send(self, value):
+                self.sent.append(value)
+                if value == "hello":
+                    return
+                request = json.loads(value)
+                result = (
+                    {"attached": True}
+                    if request["method"] == "session.owner_attach"
+                    else {
+                        "group": {"group_id": "group-a"},
+                        "events": [],
+                        "history_page": {"direction": "initial", "has_more": False},
+                    }
+                )
+                await self.responses.put(
+                    json.dumps({"jsonrpc": "2.0", "id": request["id"], "result": result})
+                )
+
+            async def recv(self):
+                return "ack"
+
+            async def close(self, **kwargs):
+                self.closed.append(kwargs)
+
+            def __aiter__(self):
+                return self
+
+            async def __anext__(self):
+                return await self.responses.get()
+
+        class _Lease:
+            def __init__(self):
+                self.release_count = 0
+
+            def release(self):
+                self.release_count += 1
+
+        browser, worker, lease = _Browser(), _Worker(), _Lease()
+        handle = SimpleNamespace(
+            socket_path=tmp_path / "worker.sock",
+            owner_key="ok1_owner",
+            worker_generation=7,
+            worker_id="worker-strict-path",
+            lease_version=3,
+            recovery_generation=1,
+        )
+        browser.app.state.owner_worker_supervisor = SimpleNamespace(
+            get_or_start=lambda _owner: handle,
+            control_home=tmp_path / "control",
+        )
+        connected = []
+
+        async def connect(socket_path, uri, **_kwargs):
+            connected.append((socket_path, uri))
+            return worker
+
+        monkeypatch.setattr(
+            web_server,
+            "_owner_context_from_ws_auth_result",
+            lambda _result: SimpleNamespace(owner_key="ok1_owner"),
+        )
+        monkeypatch.setattr(web_server, "_acquire_owner_worker_use", lambda *_args: lease)
+        monkeypatch.setattr(web_server, "_connect_owner_worker_ws", connect)
+        monkeypatch.setattr(
+            "hermes_cli.dashboard_auth.owner_context.ensure_owner_home", lambda _owner: None
+        )
+        monkeypatch.setattr(
+            "hermes_cli.owner_worker.tokens.mint_owner_worker_bootstrap",
+            lambda *_args, **_kwargs: "bootstrap-claim",
+        )
+        monkeypatch.setattr(
+            "hermes_cli.owner_worker.tokens.owner_worker_capability_public_config",
+            lambda *_args: {
+                "HERMES_OWNER_WORKER_CAPABILITY_PUBLIC_KEY": "public",
+                "HERMES_OWNER_WORKER_CAPABILITY_ISSUER": "issuer",
+                "HERMES_OWNER_WORKER_CAPABILITY_RETAINED_PUBLIC_KEYS": "{}",
+            },
+        )
+        monkeypatch.setattr(
+            "hermes_cli.owner_worker.tokens.parse_owner_worker_bootstrap",
+            lambda *_args, **_kwargs: "bootstrap",
+        )
+        monkeypatch.setattr("hermes_cli.owner_worker.tokens.owp1_hello", lambda *_args: "hello")
+        monkeypatch.setattr(
+            "hermes_cli.owner_worker.tokens.validate_owp1_control", lambda *_args, **_kwargs: None
+        )
+        monkeypatch.setattr(
+            "hermes_cli.owner_worker.tokens.owp1_data",
+            lambda _bootstrap, **kwargs: kwargs["text"],
+        )
+        monkeypatch.setattr(
+            "hermes_cli.owner_worker.tokens.parse_owp1_data",
+            lambda raw, *_args, **_kwargs: ("text", raw),
+        )
+
+        asyncio.run(
+            web_server._bridge_websocket_to_owner_worker(
+                browser, path="/api/ws", auth_result=auth_result
+            )
+        )
+
+        assert browser.accepted is True
+        assert [response["id"] for response in browser.responses] == ["attach", "group"]
+        assert browser.responses[0]["result"] == {"attached": True}
+        assert browser.responses[1]["result"]["history_page"]["has_more"] is False
+        assert lease.release_count == 1
+        assert connected[0][0] == handle.socket_path
+        worker_uri = connected[0][1]
+        assert worker_uri.startswith("ws://owner-worker/api/ws?")
+        assert "internal_owner_bootstrap=bootstrap-claim" in worker_uri
+        assert f"ticket={ticket}" not in worker_uri
+        assert "token=" not in worker_uri
+        relayed = [json.loads(value) for value in worker.sent[1:]]
+        assert [request["method"] for request in relayed] == [
+            "session.owner_attach",
+            "collaboration.group.get",
+        ]
+
     def test_bridge_close_propagates_to_worker_and_releases_exact_lease(self, gated_app, monkeypatch, tmp_path):
         import asyncio
 

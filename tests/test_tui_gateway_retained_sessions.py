@@ -3145,13 +3145,21 @@ def test_collaboration_runner_refreshes_dynamic_context_but_pins_identity(
     runner.close()
 
 
-def test_collaboration_rpc_uses_bound_owner_service_and_redacts_internal_ids(owner_gateway):
-    _db, runtime, _workspace_root = owner_gateway
+def test_collaboration_rpc_uses_bound_owner_service_and_redacts_internal_ids():
+    runtime = server.OwnerWorkerGatewayRuntime("owner-a", 2, "worker-a", 1, 0)
 
     class _Service:
-        def get_group(self, group_id, *, after_sequence=None):
+        def get_group(self, group_id, **kwargs):
             assert group_id == "group-a"
-            assert after_sequence is None
+            assert kwargs == {
+                "limit": 100,
+                "before_sequence": None,
+                "after_sequence": None,
+                "through_sequence": None,
+                "reconcile_membership_ids": [],
+                "reconcile_target_ids": [],
+                "reconcile_approval_ids": [],
+            }
             return {
                 "group": {"group_id": group_id},
                 "memberships": [{"membership_id": "member-a"}],
@@ -3545,27 +3553,102 @@ def test_browser_collaboration_rpcs_reject_retained_channel(
     assert transport not in runtime.mutable_state.collaboration_transports
 
 
-def test_collaboration_group_get_forwards_incremental_sequence(owner_gateway):
-    _db, runtime, _workspace_root = owner_gateway
+def test_collaboration_group_get_treats_null_cursors_as_omitted():
+    runtime = server.OwnerWorkerGatewayRuntime("owner-a", 2, "worker-a", 1, 0)
 
     class _Service:
-        def get_group(self, group_id, *, after_sequence=None):
+        def get_group(self, group_id, **kwargs):
             assert group_id == "group-a"
-            assert after_sequence == 7
-            return {"events": [], "reconciliation": {"after_sequence": 7}}
+            assert kwargs["before_sequence"] is None
+            assert kwargs["after_sequence"] is None
+            assert kwargs["through_sequence"] is None
+            return {"events": []}
 
     server.bind_collaboration_service(runtime, _Service())
     response = server.dispatch(
         {
             "id": "request",
             "method": "collaboration.group.get",
-            "params": {"group_id": "group-a", "after_sequence": 7},
+            "params": {
+                "group_id": "group-a",
+                "before_sequence": None,
+                "after_sequence": None,
+                "through_sequence": None,
+            },
         },
         transport=_CollaborationTransport(),
         runtime=runtime,
     )
 
-    assert response["result"]["reconciliation"]["after_sequence"] == 7
+    assert "error" not in response, response
+
+
+def test_collaboration_group_get_forwards_pagination_contract():
+    runtime = server.OwnerWorkerGatewayRuntime("owner-a", 2, "worker-a", 1, 0)
+
+    class _Service:
+        def get_group(self, group_id, **kwargs):
+            assert group_id == "group-a"
+            assert kwargs == {
+                "limit": 50,
+                "before_sequence": None,
+                "after_sequence": 7,
+                "through_sequence": 42,
+                "reconcile_membership_ids": ["membership-a"],
+                "reconcile_target_ids": ["target-a"],
+                "reconcile_approval_ids": ["approval-a"],
+            }
+            return {"events": [], "history_page": {"after_sequence": 7}}
+
+    server.bind_collaboration_service(runtime, _Service())
+    response = server.dispatch(
+        {
+            "id": "request",
+            "method": "collaboration.group.get",
+            "params": {
+                "group_id": "group-a",
+                "limit": 50,
+                "after_sequence": 7,
+                "through_sequence": 42,
+                "reconcile_membership_ids": ["membership-a"],
+                "reconcile_target_ids": ["target-a"],
+                "reconcile_approval_ids": ["approval-a"],
+            },
+        },
+        transport=_CollaborationTransport(),
+        runtime=runtime,
+    )
+
+    assert response["result"]["history_page"]["after_sequence"] == 7
+
+
+@pytest.mark.parametrize(
+    "params",
+    [
+        {"group_id": "group-a", "before_sequence": 4, "after_sequence": 2},
+        {"group_id": "group-a", "through_sequence": 4},
+        {"group_id": "group-a", "limit": True},
+        {"group_id": "group-a", "limit": 201},
+        {"group_id": "group-a", "after_sequence": True},
+        {"group_id": "group-a", "reconcile_target_ids": "target-a"},
+        {"group_id": "group-a", "reconcile_approval_ids": [""]},
+    ],
+)
+def test_collaboration_group_get_rejects_invalid_pagination(params):
+    runtime = server.OwnerWorkerGatewayRuntime("owner-a", 2, "worker-a", 1, 0)
+
+    class _Service:
+        def get_group(self, *_args, **_kwargs):
+            pytest.fail("invalid pagination must fail before service dispatch")
+
+    server.bind_collaboration_service(runtime, _Service())
+    response = server.dispatch(
+        {"id": "request", "method": "collaboration.group.get", "params": params},
+        transport=_CollaborationTransport(),
+        runtime=runtime,
+    )
+
+    assert response["error"]["code"] == -32602
 
 
 def test_collaboration_byte_upload_and_approval_rpc(owner_gateway):
