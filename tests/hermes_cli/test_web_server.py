@@ -1693,6 +1693,52 @@ class TestWebServerEndpoints:
         assert cfg["model"]["provider"] == "anthropic"
         assert cfg["model"]["default"] == "claude-opus-4-6"
 
+    def test_model_set_main_preserves_media_selections(self, monkeypatch):
+        monkeypatch.setattr(
+            "hermes_cli.model_cost_guard.expensive_model_warning",
+            lambda *_args, **_kwargs: None,
+        )
+        from hermes_cli.config import load_config, save_config
+
+        cfg = load_config()
+        cfg["model"] = {"provider": "old-provider", "default": "old-model"}
+        cfg["image_gen"] = {
+            "provider": "image-provider",
+            "model": "image-model",
+            "use_gateway": True,
+        }
+        cfg["video_gen"] = {
+            "provider": "video-provider",
+            "model": "video-model",
+            "use_gateway": False,
+        }
+        save_config(cfg)
+
+        resp = self.client.post(
+            "/api/model/set",
+            json={
+                "scope": "main",
+                "provider": "new-provider",
+                "model": "new-model",
+            },
+        )
+
+        assert resp.status_code == 200
+        assert resp.json()["ok"] is True
+        updated = load_config()
+        assert updated["model"]["provider"] == "new-provider"
+        assert updated["model"]["default"] == "new-model"
+        assert updated["image_gen"] == {
+            "provider": "image-provider",
+            "model": "image-model",
+            "use_gateway": True,
+        }
+        assert updated["video_gen"] == {
+            "provider": "video-provider",
+            "model": "video-model",
+            "use_gateway": False,
+        }
+
     def test_model_set_maps_unknown_vendor_to_aggregator(self, monkeypatch):
         """A bare vendor name from analytics rows (no billing_provider) is not
         a Hermes provider — keep the user's aggregator instead of writing a

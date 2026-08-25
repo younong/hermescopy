@@ -3,6 +3,66 @@
 from types import SimpleNamespace
 
 
+def test_chat_startup_prefers_configured_model_and_provider_over_environment(monkeypatch):
+    from tui_gateway import server
+
+    monkeypatch.setattr(
+        server,
+        "_load_cfg",
+        lambda: {"model": {"default": "config-model", "provider": "config-provider"}},
+    )
+    monkeypatch.setenv("HERMES_MODEL", "env-model")
+    monkeypatch.setenv("HERMES_INFERENCE_MODEL", "env-inference-model")
+    monkeypatch.setenv("HERMES_TUI_PROVIDER", "env-provider")
+    monkeypatch.setenv("HERMES_INFERENCE_PROVIDER", "env-inference-provider")
+
+    assert server._resolve_model() == "config-model"
+    assert server._resolve_startup_runtime() == ("config-model", "config-provider")
+
+
+def test_chat_startup_accepts_string_config_and_auto_provider(monkeypatch):
+    from tui_gateway import server
+
+    monkeypatch.setattr(server, "_load_cfg", lambda: {"model": "config-model"})
+    monkeypatch.setenv("HERMES_MODEL", "env-model")
+    monkeypatch.setenv("HERMES_TUI_PROVIDER", "env-provider")
+    assert server._resolve_startup_runtime() == ("config-model", None)
+
+    monkeypatch.setattr(
+        server,
+        "_load_cfg",
+        lambda: {"model": {"default": "config-model", "provider": "auto"}},
+    )
+    assert server._resolve_startup_runtime() == ("config-model", None)
+
+
+def test_chat_startup_uses_environment_when_profile_has_no_model(monkeypatch):
+    from tui_gateway import server
+
+    monkeypatch.setattr(server, "_load_cfg", lambda: {"model": {}})
+    monkeypatch.setenv("HERMES_INFERENCE_MODEL", "env-inference-model")
+    monkeypatch.setenv("HERMES_TUI_PROVIDER", "env-provider")
+    assert server._resolve_startup_runtime() == ("env-inference-model", "env-provider")
+
+
+def test_code_startup_remains_independent_from_chat_config(monkeypatch):
+    from tui_gateway import server
+
+    monkeypatch.setattr(
+        server,
+        "_load_cfg",
+        lambda: {
+            "model": {"default": "chat-model", "provider": "chat-provider"},
+            "code_agent": {"model": "code-model", "provider": "code-provider"},
+        },
+    )
+    monkeypatch.setattr(
+        "hermes_cli.model_plane.capability.get_capability_provider",
+        lambda *_args: None,
+    )
+    assert server._resolve_code_startup_runtime() == ("code-model", "code-provider")
+
+
 def test_code_runtime_overrides_are_forced_on_resume():
     from tui_gateway import server
 

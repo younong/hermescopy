@@ -2669,12 +2669,9 @@ def resolve_skin() -> dict:
 
 
 def _resolve_model() -> str:
-    env = (
-        os.environ.get("HERMES_MODEL", "")
-        or os.environ.get("HERMES_INFERENCE_MODEL", "")
-    ).strip()
-    if env:
-        return env
+    # A profile selection is an explicit user choice and must win over the
+    # deployment environment's provision-time seed. The environment remains
+    # the fallback for profiles that have not selected a Chat model yet.
     m = _load_cfg().get("model", "")
     if isinstance(m, dict):
         configured = str(m.get("default", "") or "").strip()
@@ -2684,6 +2681,13 @@ def _resolve_model() -> str:
         configured = m.strip()
         if configured:
             return configured
+
+    env = (
+        os.environ.get("HERMES_MODEL", "")
+        or os.environ.get("HERMES_INFERENCE_MODEL", "")
+    ).strip()
+    if env:
+        return env
     try:
         from hermes_cli.deployment_inference import deployment_descriptor_from_environment
 
@@ -2746,6 +2750,23 @@ def _resolve_code_startup_runtime(params: dict | None = None) -> tuple[str, str 
 
 
 def _resolve_startup_runtime() -> tuple[str, str | None]:
+    cfg_model = _load_cfg().get("model", "")
+    configured_model = ""
+    configured_provider = ""
+    if isinstance(cfg_model, dict):
+        configured_model = str(cfg_model.get("default", "") or "").strip()
+        configured_provider = str(cfg_model.get("provider") or "").strip()
+    elif isinstance(cfg_model, str):
+        configured_model = cfg_model.strip()
+
+    # A configured Chat selection is authoritative for new sessions. In
+    # particular, do not let deployment seed variables or HERMES_TUI_PROVIDER
+    # replace a user's profile selection.
+    if configured_model:
+        if configured_provider.lower() == "auto":
+            configured_provider = ""
+        return configured_model, configured_provider or None
+
     model = _resolve_model()
     explicit_provider = os.environ.get("HERMES_TUI_PROVIDER", "").strip()
     if explicit_provider:
@@ -2761,14 +2782,8 @@ def _resolve_startup_runtime() -> tuple[str, str | None]:
     try:
         from hermes_cli.models import detect_static_provider_for_model
 
-        cfg = _load_cfg().get("model") or {}
         current_provider = (
-            (
-                str(cfg.get("provider") or "").strip().lower()
-                if isinstance(cfg, dict)
-                else ""
-            )
-            or os.environ.get("HERMES_INFERENCE_PROVIDER", "").strip().lower()
+            os.environ.get("HERMES_INFERENCE_PROVIDER", "").strip().lower()
             or "auto"
         )
         detected = detect_static_provider_for_model(explicit_model, current_provider)

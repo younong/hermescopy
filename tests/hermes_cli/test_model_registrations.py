@@ -427,6 +427,51 @@ def test_catalog_registration_cannot_duplicate_admin_target(monkeypatch):
         })
 
 
+def test_media_activation_updates_only_matching_kind_section():
+    image = model_registrations.create_model_registration({
+        "name": "Selected image",
+        "kind": "image",
+        "provider": "image-test",
+        "model": "image-v1",
+    })
+    video = model_registrations.create_model_registration({
+        "name": "Selected video",
+        "kind": "video",
+        "provider": "video-test",
+        "model": "video-v1",
+    })
+    config = load_config()
+    config["image_gen"] = {"provider": "image-old", "model": "image-old-model", "use_gateway": True}
+    config["video_gen"] = {"provider": "video-old", "model": "video-old-model", "use_gateway": True}
+    save_config(config, preserve_keys={("image_gen",), ("video_gen",)})
+
+    model_registrations.activate_model_registration(image["id"])
+    config = load_config()
+    assert config["image_gen"] == {
+        "provider": "image-test",
+        "model": "image-v1",
+        "use_gateway": False,
+    }
+    assert config["video_gen"] == {
+        "provider": "video-old",
+        "model": "video-old-model",
+        "use_gateway": True,
+    }
+
+    model_registrations.activate_model_registration(video["id"])
+    config = load_config()
+    assert config["video_gen"] == {
+        "provider": "video-test",
+        "model": "video-v1",
+        "use_gateway": False,
+    }
+    assert config["image_gen"] == {
+        "provider": "image-test",
+        "model": "image-v1",
+        "use_gateway": False,
+    }
+
+
 def test_catalog_media_crud_activation_and_active_delete_guard():
     created = model_registrations.create_model_registration({
         "name": "My image",
