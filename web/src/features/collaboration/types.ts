@@ -149,6 +149,32 @@ export interface CollaborationReconciliation {
   snapshot_authoritative: true;
 }
 
+export type CollaborationHistoryDirection = "initial" | "backward" | "forward";
+
+export interface CollaborationHistoryPage {
+  direction: CollaborationHistoryDirection;
+  limit: number;
+  snapshot_sequence: number;
+  range_start_sequence: number | null;
+  range_end_sequence: number | null;
+  before_sequence: number | null;
+  next_before_sequence: number | null;
+  after_sequence: number | null;
+  next_after_sequence: number | null;
+  through_sequence: number;
+  has_more: boolean;
+}
+
+export interface CollaborationGetOptions {
+  limit?: number;
+  before_sequence?: number;
+  after_sequence?: number;
+  through_sequence?: number;
+  reconcile_membership_ids?: string[];
+  reconcile_target_ids?: string[];
+  reconcile_approval_ids?: string[];
+}
+
 export interface CollaborationSnapshot {
   group: CollaborationGroup;
   memberships: CollaborationMembership[];
@@ -157,7 +183,9 @@ export interface CollaborationSnapshot {
   targets: CollaborationTarget[];
   approvals: CollaborationApproval[];
   attachments: CollaborationAttachment[];
-  reconciliation: CollaborationReconciliation;
+  /** Absent only while an older server remains in a rolling deployment. */
+  history_page?: CollaborationHistoryPage;
+  reconciliation?: CollaborationReconciliation;
 }
 
 export interface CollaborationState {
@@ -172,6 +200,11 @@ export interface CollaborationState {
   approvalsById: Record<string, CollaborationApproval>;
   attachmentsById: Record<string, CollaborationAttachment>;
   lastSequence: number;
+  reconciledSequence: number;
+  historyBeforeSequence?: number;
+  historyHasMore: boolean;
+  historyLoading: boolean;
+  historyError?: string;
   loading: boolean;
   reconciling: boolean;
   error?: string;
@@ -184,7 +217,10 @@ export const initialCollaborationState: CollaborationState = {
   eventSequenceById: {},
   eventsBySequence: {},
   executionsById: {},
+  historyHasMore: false,
+  historyLoading: false,
   lastSequence: 0,
+  reconciledSequence: 0,
   loading: true,
   membershipsById: {},
   reconciling: false,

@@ -6965,15 +6965,62 @@ def _collaboration_groups_list(rid, params: dict) -> dict:
 
 @method("collaboration.group.get")
 def _collaboration_group_get(rid, params: dict) -> dict:
-    if set(params) - {"group_id", "after_sequence"} or "group_id" not in params:
+    allowed = {
+        "group_id",
+        "limit",
+        "before_sequence",
+        "after_sequence",
+        "through_sequence",
+        "reconcile_membership_ids",
+        "reconcile_target_ids",
+        "reconcile_approval_ids",
+    }
+    if set(params) - allowed or "group_id" not in params:
         return _err(rid, -32602, "collaboration group get params are invalid")
+    before_sequence = params.get("before_sequence")
     after_sequence = params.get("after_sequence")
-    if after_sequence is not None and (isinstance(after_sequence, bool) or not isinstance(after_sequence, int)):
-        return _err(rid, -32602, "after_sequence must be an integer")
+    through_sequence = params.get("through_sequence")
+    if before_sequence is not None and after_sequence is not None:
+        return _err(rid, -32602, "before_sequence and after_sequence are mutually exclusive")
+    if through_sequence is not None and after_sequence is None:
+        return _err(rid, -32602, "through_sequence requires after_sequence")
+    limit = params.get("limit", 100)
+    if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 200:
+        return _err(rid, -32602, "limit must be an integer between 1 and 200")
+    for name, minimum in (
+        ("before_sequence", 1),
+        ("after_sequence", 0),
+        ("through_sequence", 0),
+    ):
+        value = params.get(name)
+        if value is not None and (
+            isinstance(value, bool) or not isinstance(value, int) or value < minimum
+        ):
+            return _err(rid, -32602, f"{name} must be an integer greater than or equal to {minimum}")
+    id_params = (
+        "reconcile_membership_ids",
+        "reconcile_target_ids",
+        "reconcile_approval_ids",
+    )
+    for name in id_params:
+        values = params.get(name, [])
+        if (
+            not isinstance(values, list)
+            or len(values) > 512
+            or any(not isinstance(value, str) or not value.strip() for value in values)
+        ):
+            return _err(rid, -32602, f"{name} must be an array of at most 512 IDs")
     return _collaboration_call(
         rid,
         lambda service: service.get_group(
-            str(params.get("group_id") or ""), after_sequence=after_sequence
+            str(params.get("group_id") or ""),
+            limit=limit,
+            before_sequence=before_sequence,
+            after_sequence=after_sequence,
+            through_sequence=through_sequence,
+            reconcile_membership_ids=params.get("reconcile_membership_ids", []),
+            reconcile_target_ids=params.get("reconcile_target_ids", []),
+            reconcile_approval_ids=params.get("reconcile_approval_ids", []),
         ),
     )
 

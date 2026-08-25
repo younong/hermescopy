@@ -38,6 +38,7 @@ from hermes_cli.owner_worker.tokens import (
     SCOPE_OWNER_WORKER_WS,
     CONNECTION_PURPOSE_INTERACTIVE,
     CONNECTION_PURPOSE_RETAINED_CHANNEL,
+    OWP1_MAX_MESSAGE_BYTES,
     OwnerWorkerCapabilityInvalid,
     child_token_ttl_seconds,
     admit_owner_worker_bootstrap,
@@ -465,6 +466,38 @@ def test_owp1_data_requires_exact_peer_and_monotonic_sequence(tmp_path):
         parse_owp1_data(envelope, claims, direction="control-to-worker", expected_sequence=2)
     with pytest.raises(OwnerWorkerCapabilityInvalid, match="data_mismatch"):
         parse_owp1_data(envelope, claims, direction="worker-to-control", expected_sequence=1)
+
+
+def test_owp1_data_preserves_unicode_without_ascii_expansion(tmp_path):
+    _store, lease = _active_lease(tmp_path)
+    verifier = owner_worker_capability_public_config(tmp_path / "control")
+    claims = parse_owner_worker_bootstrap(
+        mint_owner_worker_bootstrap(
+            lease,
+            path="/api/ws",
+            connection_id="connection_identifier_1234",
+            nonce="control_nonce_identifier_1234",
+            connection_purpose=CONNECTION_PURPOSE_INTERACTIVE,
+            control_home=tmp_path / "control",
+        ),
+        expected_lease=lease,
+        path="/api/ws",
+        public_key=verifier["HERMES_OWNER_WORKER_CAPABILITY_PUBLIC_KEY"],
+        issuer_key_version=verifier["HERMES_OWNER_WORKER_CAPABILITY_ISSUER"],
+    )
+    text = "群聊恢复了 🚀" * 128
+
+    envelope = owp1_data(
+        claims, direction="worker-to-control", sequence=1, text=text,
+    )
+    legacy_envelope = envelope.encode("ascii", errors="backslashreplace")
+
+    assert text in envelope
+    assert len(envelope.encode("utf-8")) < len(legacy_envelope)
+    assert len(envelope.encode("utf-8")) < OWP1_MAX_MESSAGE_BYTES
+    assert parse_owp1_data(
+        envelope, claims, direction="worker-to-control", expected_sequence=1,
+    ) == ("text", text)
 
 
 def test_capability_ttl_is_bounded(tmp_path):

@@ -42,11 +42,25 @@ function snapshot(
   overrides: Partial<CollaborationSnapshot> = {},
 ): CollaborationSnapshot {
   const lastSequence = Math.max(0, ...events.map((item) => item.sequence));
+  const direction = afterSequence > 0 ? "forward" : "initial";
   return {
     approvals: [],
     attachments: [],
     events,
     group: { ...group, last_sequence: lastSequence },
+    history_page: {
+      after_sequence: direction === "forward" ? afterSequence : null,
+      before_sequence: null,
+      direction,
+      has_more: false,
+      limit: 100,
+      next_after_sequence: direction === "forward" ? lastSequence : null,
+      next_before_sequence: direction === "initial" && events.length > 0 ? events[0].sequence : null,
+      range_end_sequence: events.at(-1)?.sequence ?? null,
+      range_start_sequence: events[0]?.sequence ?? null,
+      snapshot_sequence: lastSequence,
+      through_sequence: lastSequence,
+    },
     memberships: [],
     reconciliation: {
       after_sequence: afterSequence,
@@ -104,7 +118,174 @@ describe("collaborationReducer", () => {
     expect(reconciled.lastSequence).toBe(4);
   });
 
-  it("rejects duplicate, old, and cross-group appended events idempotently", () => {
+  it("separates backward history cursors from the forward reconciliation watermark", () => {
+    const initial = collaborationReducer(initialCollaborationState, {
+      snapshot: snapshot([event(101), event(102)], 0, {
+        group: { ...group, last_sequence: 200 },
+        history_page: {
+          after_sequence: null,
+          before_sequence: null,
+          direction: "initial",
+          has_more: true,
+          limit: 2,
+          next_after_sequence: null,
+          next_before_sequence: 101,
+          range_end_sequence: 102,
+          range_start_sequence: 101,
+          snapshot_sequence: 200,
+          through_sequence: 200,
+        },
+      }),
+      type: "snapshot",
+    });
+
+    expect(initial.reconciledSequence).toBe(200);
+    expect(initial.historyBeforeSequence).toBe(101);
+    expect(initial.historyHasMore).toBe(true);
+
+    const partialForward = collaborationReducer(initial, {
+      snapshot: snapshot([event(201)], 200, {
+        group: { ...group, last_sequence: 202 },
+        history_page: {
+          after_sequence: 200,
+          before_sequence: null,
+          direction: "forward",
+          has_more: true,
+          limit: 1,
+          next_after_sequence: 201,
+          next_before_sequence: null,
+          range_end_sequence: 201,
+          range_start_sequence: 201,
+          snapshot_sequence: 202,
+          through_sequence: 202,
+        },
+      }),
+      type: "snapshot",
+    });
+
+    expect(partialForward.reconciledSequence).toBe(200);
+    expect(partialForward.historyBeforeSequence).toBe(101);
+    expect(partialForward.historyHasMore).toBe(true);
+
+    const completedForward = collaborationReducer(partialForward, {
+      snapshot: snapshot([event(202)], 201, {
+        group: { ...group, last_sequence: 202 },
+        history_page: {
+          after_sequence: 201,
+          before_sequence: null,
+          direction: "forward",
+          has_more: false,
+          limit: 1,
+          next_after_sequence: 202,
+          next_before_sequence: null,
+          range_end_sequence: 202,
+          range_start_sequence: 202,
+          snapshot_sequence: 202,
+          through_sequence: 202,
+        },
+      }),
+      type: "snapshot",
+    });
+
+    expect(completedForward.reconciledSequence).toBe(202);
+    expect(completedForward.historyBeforeSequence).toBe(101);
+    expect(completedForward.historyHasMore).toBe(true);
+  });
+
+  it("accepts a legacy reconciliation-only snapshot during a rolling deployment", () => {
+    const legacy = snapshot([event(1), event(2)]);
+    delete legacy.history_page;
+
+    const loaded = collaborationReducer(initialCollaborationState, {
+      snapshot: legacy,
+      type: "snapshot",
+    });
+
+    expect(Object.keys(loaded.eventsBySequence).map(Number)).toEqual([1, 2]);
+    expect(loaded.reconciledSequence).toBe(2);
+    expect(loaded.historyHasMore).toBe(false);
+  });
+
+  it("preserves a live event that arrives before the initial snapshot", () => {
+    const live = collaborationReducer(initialCollaborationState, {
+      event: gatewayEvent("collaboration.event.appended", event(3) as unknown as Record<string, unknown>),
+      type: "event",
+    });
+    const loaded = collaborationReducer(live, {
+      snapshot: snapshot([event(1), event(2)], 0, {
+        group: { ...group, last_sequence: 2 },
+        history_page: {
+          after_sequence: null,
+          before_sequence: null,
+          direction: "initial",
+          has_more: false,
+          limit: 100,
+          next_after_sequence: null,
+          next_before_sequence: null,
+          range_end_sequence: 2,
+          range_start_sequence: 1,
+          snapshot_sequence: 2,
+          through_sequence: 2,
+        },
+      }),
+      type: "snapshot",
+    });
+
+    expect(Object.keys(loaded.eventsBySequence).map(Number)).toEqual([1, 2, 3]);
+    expect(loaded.lastSequence).toBe(3);
+    expect(loaded.reconciledSequence).toBe(2);
+  });
+
+  it("fills a low sequence gap after observing a higher live event", () => {
+    let state = collaborationReducer(initialCollaborationState, {
+      snapshot: snapshot([event(1)], 0, {
+        group: { ...group, last_sequence: 3 },
+        history_page: {
+          after_sequence: null,
+          before_sequence: null,
+          direction: "initial",
+          has_more: false,
+          limit: 100,
+          next_after_sequence: null,
+          next_before_sequence: null,
+          range_end_sequence: 1,
+          range_start_sequence: 1,
+          snapshot_sequence: 1,
+          through_sequence: 1,
+        },
+      }),
+      type: "snapshot",
+    });
+    state = collaborationReducer(state, {
+      event: gatewayEvent("collaboration.event.appended", event(3) as unknown as Record<string, unknown>),
+      type: "event",
+    });
+    state = collaborationReducer(state, {
+      snapshot: snapshot([event(2), event(3)], 1, {
+        group: { ...group, last_sequence: 3 },
+        history_page: {
+          after_sequence: 1,
+          before_sequence: null,
+          direction: "forward",
+          has_more: false,
+          limit: 100,
+          next_after_sequence: 3,
+          next_before_sequence: null,
+          range_end_sequence: 3,
+          range_start_sequence: 2,
+          snapshot_sequence: 3,
+          through_sequence: 3,
+        },
+      }),
+      type: "snapshot",
+    });
+
+    expect(Object.keys(state.eventsBySequence).map(Number)).toEqual([1, 2, 3]);
+    expect(state.lastSequence).toBe(3);
+    expect(state.reconciledSequence).toBe(3);
+  });
+
+  it("rejects duplicate, invalid, and cross-group appended events idempotently", () => {
     const loaded = collaborationReducer(initialCollaborationState, {
       snapshot: snapshot([event(1)]),
       type: "snapshot",

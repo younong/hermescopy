@@ -27,6 +27,7 @@ from starlette.responses import StreamingResponse
 
 
 from hermes_cli.latency_trace import log_latency_stage
+from hermes_cli.owner_worker.tokens import OWP1_MAX_MESSAGE_BYTES
 
 
 _log = logging.getLogger(__name__)
@@ -2114,6 +2115,7 @@ def run_worker(argv: list[str] | None = None) -> None:
         uds=str(socket_path),
         log_level="warning",
         access_log=False,
+        ws_max_size=OWP1_MAX_MESSAGE_BYTES,
     )
 
 

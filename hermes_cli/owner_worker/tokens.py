@@ -47,6 +47,8 @@ SCOPE_OWNER_WORKER_HTTP = "owner-worker:http"
 SCOPE_OWNER_WORKER_WS = "owner-worker:ws"
 SCOPE_OWNER_WORKER_BOOTSTRAP = "owner-worker:bootstrap"
 _BOOTSTRAP_PROTOCOL_VERSION = "owp1"
+# Covers the largest supported 50 MiB attachment after base64 and JSON framing.
+OWP1_MAX_MESSAGE_BYTES = 80 * 1024 * 1024
 _DEFAULT_BOOTSTRAP_TTL_SECONDS = 20
 _MAX_BOOTSTRAP_TTL_SECONDS = 60
 
@@ -625,26 +627,35 @@ def admit_owner_worker_bootstrap(
     return claims
 
 
+def _encode_owp1(payload: Mapping[str, Any]) -> str:
+    return json.dumps(
+        payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
 def owp1_hello(claims: OwnerWorkerBootstrapClaims) -> str:
     """Encode the sole permitted initial peer hello."""
-    return json.dumps({
+    return _encode_owp1({
         "v": _BOOTSTRAP_PROTOCOL_VERSION,
         "type": "hello",
         "connection_id": claims.connection_id,
         "nonce": claims.nonce,
         "sequence": 0,
-    }, sort_keys=True, separators=(",", ":"))
+    })
 
 
 def owp1_ack(claims: OwnerWorkerBootstrapClaims) -> str:
     """Encode the Worker acknowledgement for a validated hello."""
-    return json.dumps({
+    return _encode_owp1({
         "v": _BOOTSTRAP_PROTOCOL_VERSION,
         "type": "ack",
         "connection_id": claims.connection_id,
         "nonce": claims.nonce,
         "sequence": 0,
-    }, sort_keys=True, separators=(",", ":"))
+    })
 
 
 def validate_owp1_control(
@@ -680,7 +691,7 @@ def owp1_data(
     if (text is None) == (data is None) or int(sequence) < 1:
         raise ValueError("owp1 data requires one payload and a positive sequence")
     payload = {"kind": "text", "data": text} if text is not None else {"kind": "bytes", "data": _b64url(data or b"")}
-    return json.dumps({
+    return _encode_owp1({
         "v": _BOOTSTRAP_PROTOCOL_VERSION,
         "type": "data",
         "direction": direction,
@@ -688,7 +699,7 @@ def owp1_data(
         "nonce": claims.nonce,
         "sequence": int(sequence),
         "payload": payload,
-    }, sort_keys=True, separators=(",", ":"))
+    })
 
 
 def parse_owp1_data(
