@@ -28,7 +28,6 @@ import {
 } from "@/lib/api";
 
 import { guiChatTranslations, useI18n } from "@/i18n";
-import type { GuiChatModelSwitchResponse } from "../api";
 import { GuiChatWorkspaceDialog } from "./GuiChatWorkspaceDialog";
 
 interface GuiChatModelsPaneProps {
@@ -36,12 +35,7 @@ interface GuiChatModelsPaneProps {
   canSwitchChat: boolean;
   currentModel?: string;
   currentProvider?: string;
-  onActivateCode?: (registration: ModelRegistration) => Promise<void>;
   onSelectChat(registration: ModelRegistration): void;
-  onSetDefaultChat(
-    registration: ModelRegistration,
-    confirmExpensiveModel?: boolean,
-  ): Promise<GuiChatModelSwitchResponse>;
 }
 
 interface RegistrationFormState {
@@ -55,11 +49,6 @@ interface RegistrationFormState {
   provider: string;
   source: ModelRegistrationSource;
   useGateway: boolean;
-}
-
-interface PendingChatSwitch {
-  message: string;
-  registration: ModelRegistration;
 }
 
 const EMPTY_FORM: RegistrationFormState = {
@@ -79,12 +68,12 @@ function hasCatalog(kind: ModelRegistrationKind): boolean {
   return ["chat", "code", "image", "video", "voice", "vector"].includes(kind);
 }
 
-function defaultSource(kind: ModelRegistrationKind): ModelRegistrationSource {
-  return kind === "voice" || kind === "vector" ? "manual" : "catalog";
+function defaultSource(_kind: ModelRegistrationKind): ModelRegistrationSource {
+  return "catalog";
 }
 
-function isActivatable(kind: ModelRegistrationKind): kind is "image" | "video" {
-  return kind === "image" || kind === "video";
+function isActivatable(kind: ModelRegistrationKind): kind is "code" | "image" | "video" | "voice" | "vector" {
+  return kind !== "chat";
 }
 
 function supportsGateway(kind: ModelRegistrationKind): kind is "image" | "video" {
@@ -122,9 +111,7 @@ export function GuiChatModelsPane({
   canSwitchChat,
   currentModel,
   currentProvider,
-  onActivateCode,
   onSelectChat,
-  onSetDefaultChat,
 }: GuiChatModelsPaneProps) {
   const { t } = useI18n();
   const text = guiChatTranslations(t).models;
@@ -153,7 +140,6 @@ export function GuiChatModelsPane({
   const [saving, setSaving] = useState(false);
   const [workingId, setWorkingId] = useState<string | null>(null);
   const [pendingDelete, setPendingDelete] = useState<ModelRegistration | null>(null);
-  const [pendingChatSwitch, setPendingChatSwitch] = useState<PendingChatSwitch | null>(null);
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -188,7 +174,6 @@ export function GuiChatModelsPane({
   }, []);
 
   useEffect(() => {
-    if (busy) setPendingChatSwitch(null);
   }, [busy]);
 
   const loadCatalog = useCallback(async (kind: ModelRegistrationKind) => {
@@ -332,22 +317,12 @@ export function GuiChatModelsPane({
     onSelectChat(registration);
   };
 
-  const setDefaultChat = async (
-    registration: ModelRegistration,
-    confirmExpensiveModel = false,
-  ) => {
-    if (workingId || busy || !canSwitchChat) return;
+  const setDefaultChat = async (registration: ModelRegistration) => {
+    if (workingId || busy) return;
     setWorkingId(registration.id);
     setError(null);
     try {
-      const result = await onSetDefaultChat(registration, confirmExpensiveModel);
-      if (result.confirm_required) {
-        setPendingChatSwitch({
-          message: result.confirm_message || result.warning || text.expensiveWarning,
-          registration,
-        });
-        return;
-      }
+      await api.activateModelRegistration(registration.id);
       await load();
     } catch (cause) {
       setError(errorMessage(cause));
@@ -489,32 +464,13 @@ export function GuiChatModelsPane({
                     </button>
                     <button
                       className="gui-chat-model-action"
-                      disabled={!canSwitchChat || busy || working || (current && configured)}
+                      disabled={busy || working || (current && configured)}
                       onClick={() => void setDefaultChat(registration)}
-                      title={!canSwitchChat ? text.startConversationForDefault : undefined}
                       type="button"
                     >
                       {configured ? text.default : text.useAsDefault}
                     </button>
                   </>
-                ) : registration.kind === "code" ? (
-                  <button
-                    className="gui-chat-model-action"
-                    disabled={working || !onActivateCode}
-                    onClick={() => {
-                      if (!onActivateCode) return;
-                      setWorkingId(registration.id);
-                      setError(null);
-                      void onActivateCode(registration)
-                        .then(() => load())
-                        .catch((cause) => setError(errorMessage(cause)))
-                        .finally(() => setWorkingId(null));
-                    }}
-                    title={!onActivateCode ? text.codeUnavailable : undefined}
-                    type="button"
-                  >
-                    {working ? text.activating : configured ? text.default : text.useAsCodeModel}
-                  </button>
                 ) : activatable && !configured ? (
                   <button
                     className="gui-chat-model-action"
@@ -522,7 +478,7 @@ export function GuiChatModelsPane({
                     onClick={() => void activateMedia(registration)}
                     type="button"
                   >
-                    {working ? text.activating : text.activate}
+                    {working ? text.activating : registration.kind === "code" ? text.useAsCodeModel : text.activate}
                   </button>
                 ) : null}
                 {registration.mutable ? (
@@ -588,27 +544,6 @@ export function GuiChatModelsPane({
         </GuiChatWorkspaceDialog>
       ) : null}
 
-      {pendingChatSwitch ? (
-        <GuiChatWorkspaceDialog
-          busy={workingId === pendingChatSwitch.registration.id}
-          description={pendingChatSwitch.message}
-          onClose={() => setPendingChatSwitch(null)}
-          title={text.expensiveWarningTitle}
-        >
-          <div className="gui-chat-workspace-dialog-actions">
-            <button onClick={() => setPendingChatSwitch(null)} type="button">{t.common.cancel}</button>
-            <button
-              className="is-destructive"
-              onClick={() => {
-                const pending = pendingChatSwitch;
-                setPendingChatSwitch(null);
-                void setDefaultChat(pending.registration, true);
-              }}
-              type="button"
-            >{text.switchAnyway}            </button>
-          </div>
-        </GuiChatWorkspaceDialog>
-      ) : null}
     </section>
   );
 }
@@ -698,11 +633,11 @@ function RegistrationDialog({
           <FormField label={text.source}>
             <select
               aria-label={text.source}
-              disabled={saving || editing !== null || form.kind === "voice" || form.kind === "vector"}
+              disabled={saving || editing !== null}
               onChange={(event) => onSourceChange(event.target.value as ModelRegistrationSource)}
               value={form.source}
             >
-              {hasCatalog(form.kind) && form.kind !== "voice" && form.kind !== "vector" ? <option value="catalog">{text.catalog}</option> : null}
+              {hasCatalog(form.kind) ? <option value="catalog">{text.catalog}</option> : null}
               {form.source === "manual" ? <option value="manual">{text.manual}</option> : null}
               {form.kind === "chat" ? <option value="custom">{text.customEndpoint}</option> : null}
             </select>

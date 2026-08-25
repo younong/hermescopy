@@ -20,6 +20,7 @@ from hermes_cli.config import (
 
 from hermes_cli.model_plane.kinds import (
     ACTIVATABLE_KINDS,
+    CHAT,
     CODE,
     GATEWAY_KINDS,
     KINDS,
@@ -440,44 +441,43 @@ def _public_registration(registration_id: str, item: dict[str, Any], env: dict[s
     return result
 
 
-def _active(config: dict[str, Any], registrations: dict[str, dict[str, Any]]) -> dict[str, Any]:
-    model_cfg = config.get("model")
-    if isinstance(model_cfg, dict):
-        selections = {
-            "chat": (model_cfg.get("provider"), model_cfg.get("default", model_cfg.get("name"))),
-        }
+def _selection_section(config: dict[str, Any], kind: str) -> dict[str, Any]:
+    if kind == CHAT:
+        section = config.get("model")
+        if isinstance(section, str):
+            return {"default": section}
     else:
-        selections = {"chat": (None, model_cfg)}
-    code_section = config.get(selection_section(CODE))
-    selections[CODE] = (
-        code_section.get("provider") if isinstance(code_section, dict) else None,
-        code_section.get("model") if isinstance(code_section, dict) else None,
-    )
-    for kind in _ACTIVATABLE_KINDS:
         section = config.get(selection_section(kind))
-        selections[kind] = (
-            section.get("provider") if isinstance(section, dict) else None,
-            section.get("model") if isinstance(section, dict) else None,
-        )
+    return section if isinstance(section, dict) else {}
+
+
+def _active(config: dict[str, Any], registrations: dict[str, dict[str, Any]]) -> dict[str, Any]:
     result: dict[str, Any] = {}
-    for kind, (provider, model) in selections.items():
-        registration_id = next((
-            rid for rid, item in registrations.items()
-            if isinstance(item, dict)
-            and item.get("kind") == kind
-            and item.get("provider") == provider
-            and item.get("model") == model
-        ), None)
+    for kind in _KINDS:
+        section = _selection_section(config, kind)
+        configured_id = str(section.get("registration_id") or "").strip()
+        item = registrations.get(configured_id) if configured_id else None
+        if not isinstance(item, dict) or item.get("kind") != kind:
+            item = None
+        provider = str(section.get("provider") or "").strip()
+        model_key = "default" if kind == CHAT else "model"
+        model = str(section.get(model_key) or section.get("name") or "").strip()
+        if item is None and not configured_id:
+            item = next((
+                candidate for candidate in registrations.values()
+                if isinstance(candidate, dict)
+                and candidate.get("kind") == kind
+                and str(candidate.get("provider") or "").strip().casefold() == provider.casefold()
+                and str(candidate.get("model") or "").strip().casefold() == model.casefold()
+            ), None)
+        registration_id = next((rid for rid, candidate in registrations.items() if candidate is item), None)
+        if item is not None:
+            provider = str(item.get("provider") or "").strip()
+            model = str(item.get("model") or "").strip()
         result[kind] = {
             "registration_id": registration_id,
-            "provider": provider or "",
-            "model": model or "",
-        }
-    for kind in _KINDS - selections.keys():
-        result[kind] = {
-            "registration_id": None,
-            "provider": "",
-            "model": "",
+            "provider": provider,
+            "model": model,
         }
     return result
 
@@ -717,54 +717,54 @@ def activate_model_registration(registration_id: str) -> dict[str, Any]:
         item = registrations.get(registration_id)
         if not isinstance(item, dict):
             raise ModelRegistrationNotFound("Registration not found")
-        kind = item.get("kind")
-        if kind == CODE:
+        kind = str(item.get("kind") or "")
+        provider = str(item.get("provider") or "").strip()
+        model = str(item.get("model") or "").strip()
+        if kind not in _KINDS:
+            raise ModelRegistrationError("Unknown model registration kind")
+        if kind == CHAT:
+            section = config.get("model")
+            if not isinstance(section, dict):
+                section = {}
+                config["model"] = section
+            section.update({"registration_id": registration_id, "provider": provider, "default": model})
+            save_config(config, preserve_keys={("model",)})
+        elif kind == CODE:
             section = config.setdefault(selection_section(CODE), {})
             if not isinstance(section, dict):
                 section = {}
                 config[selection_section(CODE)] = section
-            section.update({
-                "provider": str(item.get("provider") or ""),
-                "model": str(item.get("model") or ""),
-            })
+            section.update({"registration_id": registration_id, "provider": provider, "model": model})
             save_config(config, preserve_keys={(selection_section(CODE),)})
-            return {
-                "ok": True,
-                "registration_id": registration_id,
-                "kind": kind,
-                "provider": item["provider"],
-                "model": item["model"],
-            }
-        if kind not in _ACTIVATABLE_KINDS:
-            raise ModelRegistrationError(
-                "Only code, image, video, voice, and vector registrations can be activated"
+        else:
+            from hermes_cli.tools_config import select_media_model
+
+            catalog = None
+            if item.get("scope") == "admin":
+                catalog = {
+                    candidate["model"]: {}
+                    for candidate in registrations.values()
+                    if candidate.get("scope") == "admin"
+                    and candidate.get("kind") == kind
+                    and candidate.get("provider") == provider
+                }
+            select_media_model(
+                config,
+                kind=kind,
+                provider_name=provider,
+                model=model,
+                use_gateway=bool(item.get("use_gateway", False)),
+                catalog=catalog,
             )
-        from hermes_cli.tools_config import select_media_model
-
-        catalog = None
-        if item.get("scope") == "admin":
-            catalog = {
-                candidate["model"]: {}
-                for candidate in registrations.values()
-                if candidate.get("scope") == "admin"
-                and candidate.get("kind") == kind
-                and candidate.get("provider") == item.get("provider")
-            }
-
-        select_media_model(
-            config,
-            kind=kind,
-            provider_name=str(item.get("provider") or ""),
-            model=str(item.get("model") or ""),
-            use_gateway=bool(item.get("use_gateway", False)),
-            catalog=catalog,
-        )
-        save_config(config, preserve_keys={(selection_section(kind),)})
+            section = config.get(selection_section(kind))
+            if isinstance(section, dict):
+                section["registration_id"] = registration_id
+            save_config(config, preserve_keys={(selection_section(kind),)})
         return {
             "ok": True,
             "registration_id": registration_id,
             "kind": kind,
-            "provider": item["provider"],
-            "model": item["model"],
+            "provider": provider,
+            "model": model,
         }
 
