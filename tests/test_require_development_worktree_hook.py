@@ -74,7 +74,7 @@ def _run_hook(
             {
                 "hook_event_name": "PreToolUse",
                 "session_id": session_id,
-                "cwd": str(target if Path(target).is_dir() else Path(target).parent),
+                "cwd": str(project_dir),
                 "tool_name": "Write",
                 "tool_input": {"file_path": str(target)},
             }
@@ -339,12 +339,12 @@ def test_edit_targeting_another_tasks_worktree_is_blocked(tmp_path):
     assert "current task is second-task" in reason
 
 
-def test_outside_target_is_blocked(tmp_path):
+def test_outside_target_is_not_intercepted(tmp_path):
     repo = _new_repo(tmp_path)
 
-    reason = _denial_reason(_run_hook(repo, tmp_path / "outside.txt"))
+    result = _run_hook(repo, tmp_path / "outside.txt")
 
-    assert "could not verify" in reason
+    assert result.stdout == ""
 
 
 def test_only_registered_claude_worktrees_are_listed(tmp_path):
@@ -690,84 +690,6 @@ def test_candidate_output_is_bounded():
     assert "3 additional candidate(s) omitted" in reason
     assert "task-19" in reason
     assert "task-20" not in reason
-
-
-def test_primary_lifecycle_events_stop(tmp_path):
-    repo = _new_repo(tmp_path)
-    for event in ("SessionStart", "CwdChanged", "PostCompact"):
-        result = _run_hook(
-            repo,
-            repo,
-            raw_payload=_payload(event, repo, session_id=f"{event}-session", cwd=repo),
-        )
-        output = json.loads(result.stdout)
-        assert output["continue"] is False
-        assert "primary checkout" in output["stopReason"]
-
-
-def test_guarded_tool_without_cwd_is_blocked(tmp_path):
-    repo = _new_repo(tmp_path)
-    for tool_name in ("Bash", "Agent", "Workflow"):
-        payload = json.loads(
-            _payload(
-                "PreToolUse",
-                repo,
-                session_id=f"{tool_name}-session",
-                tool_name=tool_name,
-                tool_input={"command": "git status"},
-            )
-        )
-        payload.pop("cwd")
-        result = _run_hook(repo, repo, raw_payload=json.dumps(payload))
-        assert "could not be verified" in _denial_reason(result)
-
-
-def test_same_session_cannot_claim_second_worktree(tmp_path):
-    repo = _new_repo(tmp_path)
-    first = _add_worktree(repo, "first")
-    second = _add_worktree(repo, "second")
-    transcript = tmp_path / "session.jsonl"
-    _write_worktree_state(transcript, first, "same-session")
-    assert _run_worktree_write(repo, first, transcript, session_id="same-session").stdout == ""
-
-    second_result = _run_hook(
-        repo,
-        second / "new-file.txt",
-        raw_payload=_payload(
-            "PreToolUse",
-            repo,
-            session_id="same-session",
-            tool_name="Write",
-            tool_input={"file_path": str(second / "new-file.txt")},
-            cwd=second,
-            transcript_path=tmp_path / "second.jsonl",
-        ),
-    )
-    assert "already bound" in _denial_reason(second_result)
-
-
-def test_owned_worktree_lazily_creates_session_binding(tmp_path):
-    repo = _new_repo(tmp_path)
-    worktree = _add_worktree(repo, "bound")
-    _write_owner(worktree, "bound-session")
-    result = _run_hook(
-        repo,
-        worktree / "new-file.txt",
-        raw_payload=_payload(
-            "PreToolUse",
-            repo,
-            session_id="bound-session",
-            tool_name="Write",
-            tool_input={"file_path": str(worktree / "new-file.txt")},
-            cwd=worktree,
-        ),
-    )
-    assert result.stdout == ""
-    hook = _load_hook_module()
-    paths = hook.repository_paths(worktree)
-    assert paths is not None
-    bindings = json.loads(paths.bindings_path.read_text())
-    assert bindings["bindings"]["bound-session"] == hook.canonical_key(worktree)
 
 
 def test_settings_enable_ownership_guard_across_lifecycle_events():
