@@ -1142,7 +1142,7 @@ def test_supervisor_resource_membership_failure_releases_reservation(tmp_path):
         os.close(fd)
 
 
-def test_supervisor_does_not_reclaim_starting_orphan_lease(tmp_path):
+def test_supervisor_does_not_reclaim_starting_orphan_without_identity(tmp_path):
     owner = _Owner("ok1_starting_orphan", tmp_path / "owner")
     spawned: list[dict] = []
 
@@ -1173,6 +1173,36 @@ def test_supervisor_does_not_reclaim_starting_orphan_lease(tmp_path):
     assert generation.state is WorkerGenerationState.STARTING
     assert stale.lease == current
     assert len(spawned) == 0
+
+
+def test_supervisor_reclaims_stale_starting_lease(tmp_path):
+    owner = _Owner("ok1_stale_starting", tmp_path / "owner")
+    spawned = []
+
+    def fake_process_factory(*args, **kwargs):
+        spawned.append(args)
+        argv = args[0]
+        Path(argv[argv.index("--socket") + 1]).touch()
+        return _FakeProcess()
+
+    supervisor = OwnerWorkerSupervisor(
+        control_home=tmp_path / "control",
+        client_cls=_FakeClient,
+        process_factory=fake_process_factory,
+        startup_timeout=0.1,
+        startup_cooldown=0,
+    )
+    stale = supervisor.authority_store.claim_worker_start(owner.owner_key, worker_id="stale")
+    binding = supervisor.authority_store.bind_worker_process(
+        stale.lease, process_token=stale.process_token, pid=4321, now=1
+    )
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr("hermes_cli.owner_worker.supervisor.time.time", lambda: 10)
+        handle = supervisor.get_or_start(owner)
+    assert handle.worker_generation == 2
+    assert len(spawned) == 1
+    assert supervisor.authority_store.read_owner_worker_lease(owner.owner_key).state is WorkerLeaseState.ACTIVE
+    supervisor.shutdown()
 
 
 def test_supervisor_reclaims_conclusively_absent_orphan_lease(tmp_path):

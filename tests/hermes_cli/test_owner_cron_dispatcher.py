@@ -5,6 +5,8 @@ import json
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 from hermes_cli.dashboard_auth.authority import AuthorizationScope, AuthorityStore
 from hermes_cli.dashboard_auth.owner_context import owner_context_from_registry
 from hermes_cli.owner_runtime import ensure_owner_runtime_dirs
@@ -39,7 +41,8 @@ class _InProcessSupervisor:
             active_uses=0,
         )
 
-    def get_or_start(self, owner):
+    def get_or_start(self, owner, *, timeout=None):
+        del timeout
         assert owner.owner_key == self.handle.owner_key
         assert owner.owner_home == self.handle.owner_home
         return self.handle
@@ -191,6 +194,102 @@ def test_dispatcher_enqueues_and_acks_canonical_delivery(tmp_path, monkeypatch):
         "fire_id": "fire-a",
         "payload": "result",
     }]
+
+
+def test_cron_retries_only_worker_startup_and_posts_once(monkeypatch):
+    from hermes_cli.owner_worker import cron_dispatcher
+
+    owner_context = SimpleNamespace(owner_key="ok1_retry", owner_home=Path("/tmp/owner"))
+    owner = cron_dispatcher._StoredOwner(owner_context)
+    handle = SimpleNamespace(
+        owner_key=owner.owner_key,
+        owner_home=owner.owner_home,
+        worker_generation=1,
+        worker_id="worker-1",
+        lease_version=1,
+        recovery_generation=0,
+        socket_path=Path("/tmp/worker.sock"),
+    )
+
+    class Supervisor:
+        def __init__(self):
+            self.starts = 0
+            self.uses = 0
+
+        def get_or_start(self, _owner, *, timeout=None):
+            assert timeout == 30.0
+            self.starts += 1
+            if self.starts < 3:
+                raise TimeoutError("starting")
+            return handle
+
+        def acquire_use(self, _handle):
+            self.uses += 1
+            class Lease:
+                def __enter__(self):
+                    return self
+                def __exit__(self, *_args):
+                    return False
+            return Lease()
+
+    class Response:
+        def raise_for_status(self):
+            pass
+        def json(self):
+            return {"executed": 1}
+
+    requests = []
+    class Client:
+        def __init__(self, *_args, **_kwargs):
+            pass
+        def request(self, *args, **kwargs):
+            requests.append((args, kwargs))
+            return Response()
+
+    supervisor = Supervisor()
+    monkeypatch.delenv("HERMES_OWNER_CRON_STARTUP_TIMEOUT", raising=False)
+    monkeypatch.setattr(cron_dispatcher, "OwnerWorkerClient", Client)
+    monkeypatch.setattr(cron_dispatcher.time, "sleep", lambda _delay: None)
+
+    assert cron_dispatcher._dispatch_owner_request(
+        supervisor, owner, "/internal/cron/tick", cron_startup=True
+    ) == {"executed": 1}
+    assert supervisor.starts == 3
+    assert len(requests) == 1
+
+
+def test_cron_post_timeout_is_not_retried(monkeypatch):
+    from hermes_cli.owner_worker import cron_dispatcher
+
+    owner = cron_dispatcher._StoredOwner(SimpleNamespace(
+        owner_key="ok1_post_timeout", owner_home=Path("/tmp/owner")
+    ))
+    handle = SimpleNamespace(
+        owner_key=owner.owner_key, owner_home=owner.owner_home,
+        worker_generation=1, worker_id="worker-1", lease_version=1,
+        recovery_generation=0, socket_path=Path("/tmp/worker.sock"),
+    )
+    calls = []
+    class Supervisor:
+        def get_or_start(self, _owner, *, timeout=None):
+            calls.append(timeout)
+            return handle
+        def acquire_use(self, _handle):
+            class Lease:
+                def __enter__(self): return self
+                def __exit__(self, *_args): return False
+            return Lease()
+    class Client:
+        def __init__(self, *_args, **_kwargs): pass
+        def request(self, *_args, **_kwargs):
+            calls.append("post")
+            raise TimeoutError("post")
+    monkeypatch.setattr(cron_dispatcher, "OwnerWorkerClient", Client)
+    with pytest.raises(TimeoutError, match="post"):
+        cron_dispatcher._dispatch_owner_request(
+            Supervisor(), owner, "/internal/cron/tick", cron_startup=True
+        )
+    assert calls == [30.0, "post"]
 
 
 def test_dispatcher_never_enumerates_owner_directories(tmp_path, monkeypatch):
