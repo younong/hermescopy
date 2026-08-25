@@ -211,11 +211,11 @@ describe("SessionsPage session management", () => {
 });
 
 describe("SessionMessageList", () => {
-  it("loads earlier messages on upward scrolling but not at initial top", async () => {
+  it("loads earlier messages automatically at the initial top and while scrolling upward", async () => {
     const container = document.createElement("div");
     document.body.appendChild(container);
     const root = createRoot(container);
-    const onLoadEarlier = vi.fn();
+    const onLoadEarlier = vi.fn().mockResolvedValue(undefined);
 
     await act(async () => root.render(
       <SessionMessageList
@@ -226,6 +226,8 @@ describe("SessionMessageList", () => {
         sessionId="session-1"
       />,
     ));
+    expect(onLoadEarlier).toHaveBeenCalledTimes(1);
+    onLoadEarlier.mockClear();
     const scroller = container.querySelector<HTMLElement>("[aria-busy=false]")!;
     expect(container.textContent).toContain("Scroll up for earlier messages");
     expect(container.textContent).not.toContain("Load earlier messages");
@@ -235,7 +237,7 @@ describe("SessionMessageList", () => {
     await act(async () => scroll(scroller, 100));
     await act(async () => scroll(scroller, 80));
 
-    expect(onLoadEarlier).toHaveBeenCalledTimes(1);
+    expect(onLoadEarlier).toHaveBeenCalledTimes(2);
     await act(async () => root.unmount());
   });
 
@@ -282,7 +284,7 @@ describe("SessionMessageList", () => {
     const container = document.createElement("div");
     document.body.appendChild(container);
     const root = createRoot(container);
-    const onLoadEarlier = vi.fn();
+    const onLoadEarlier = vi.fn().mockResolvedValue(undefined);
     let scrollHeight = 900;
 
     await act(async () => root.render(
@@ -302,7 +304,7 @@ describe("SessionMessageList", () => {
     scroller.scrollTop = 300;
     await act(async () => scroll(scroller, 300));
     await act(async () => scroll(scroller, 100));
-    expect(onLoadEarlier).toHaveBeenCalledTimes(1);
+    expect(onLoadEarlier).toHaveBeenCalledTimes(2);
 
     await act(async () => root.render(
       <SessionMessageList

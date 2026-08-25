@@ -407,7 +407,7 @@ describe("MessageList", () => {
     await act(async () => root.unmount());
   });
 
-  it("automatically loads near the top and keeps manual loading for errors only", async () => {
+  it("automatically loads at the initial top and keeps manual loading for errors only", async () => {
     const container = document.createElement("div");
     document.body.appendChild(container);
     const root = createRoot(container);

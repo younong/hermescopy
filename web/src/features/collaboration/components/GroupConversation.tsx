@@ -96,7 +96,7 @@ export function GroupConversation({ employees, onLoadEarlier, state }: GroupConv
     }
   }, [rows, virtualizer]);
 
-  const { handleScroll: handleHistoryScroll, retry, syncScrollPosition } = useLoadEarlierOnScroll({
+  const { checkTop, handleScroll: handleHistoryScroll, retry, syncScrollPosition } = useLoadEarlierOnScroll({
     autoEnabled: !state.historyError,
     canLoad: state.historyHasMore && state.historyBeforeSequence !== undefined,
     loading: state.historyLoading,
@@ -117,7 +117,8 @@ export function GroupConversation({ employees, onLoadEarlier, state }: GroupConv
     const element = event.currentTarget;
     followBottomRef.current = element.scrollHeight - element.scrollTop - element.clientHeight <= BOTTOM_THRESHOLD_PX;
     handleHistoryScroll(event);
-  }, [handleHistoryScroll]);
+    checkTop(element.scrollTop);
+  }, [checkTop, handleHistoryScroll]);
 
   useLayoutEffect(() => {
     const groupId = state.group?.group_id;
@@ -125,6 +126,12 @@ export function GroupConversation({ employees, onLoadEarlier, state }: GroupConv
     initializedGroupRef.current = groupId;
     scrollToBottom(true);
   }, [scrollToBottom, state.group?.group_id, state.loading]);
+
+  useLayoutEffect(() => {
+    const element = containerRef.current;
+    if (!element || state.loading || state.historyLoading || !state.historyHasMore || state.historyBeforeSequence === undefined) return;
+    if (element.scrollTop <= 200) checkTop(element.scrollTop);
+  }, [checkTop, rows.length, state.historyBeforeSequence, state.historyHasMore, state.historyLoading, state.loading, totalSize]);
 
   useLayoutEffect(() => {
     if (!state.historyLoading && anchorRef.current) {
@@ -142,7 +149,11 @@ export function GroupConversation({ employees, onLoadEarlier, state }: GroupConv
       return;
     }
     if (followBottomRef.current) scrollToBottom();
-  }, [rows, scrollToBottom, state.historyLoading, syncScrollPosition, totalSize, virtualizer]);
+    else if (!state.historyLoading && state.historyHasMore && state.historyBeforeSequence !== undefined) {
+      const element = containerRef.current;
+      if (element && !anchorRef.current && element.scrollTop <= 200) checkTop(element.scrollTop);
+    }
+  }, [checkTop, rows, scrollToBottom, state.historyBeforeSequence, state.historyHasMore, state.historyLoading, syncScrollPosition, totalSize, virtualizer]);
 
   if (state.loading) {
     return <div className="flex flex-1 items-center justify-center gap-2 text-xs text-[#777c84]"><Spinner /> {copy.loadingGroup}</div>;

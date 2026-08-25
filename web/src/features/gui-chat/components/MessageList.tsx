@@ -143,7 +143,7 @@ export function MessageList({
     }
   }, [rows, virtualizer]);
 
-  const { handleScroll: handleHistoryScroll, retry, syncScrollPosition } =
+  const { checkTop, handleScroll: handleHistoryScroll, retry, syncScrollPosition } =
     useLoadEarlierOnScroll({
       autoEnabled: !state.historyError && !state.safeguardReached,
       canLoad: state.historyHasMore && !!state.historyCursor,
@@ -164,7 +164,8 @@ export function MessageList({
   const handleScroll = useCallback((event: UIEvent<HTMLDivElement>) => {
     followBottomRef.current = isNearBottom(event.currentTarget);
     handleHistoryScroll(event);
-  }, [handleHistoryScroll]);
+    checkTop(event.currentTarget.scrollTop);
+  }, [checkTop, handleHistoryScroll]);
 
   useLayoutEffect(() => {
     if (forceBottomKey === lastForceBottomKeyRef.current) return;
@@ -206,7 +207,11 @@ export function MessageList({
       anchorRef.current = null;
     }
     if (followBottomRef.current) scrollToBottom();
-  }, [rows, scrollToBottom, state.historyLoading, syncScrollPosition, totalSize, virtualizer]);
+    else if (!state.historyLoading && state.historyHasMore && state.historyCursor) {
+      const element = containerRef.current;
+      if (element && !anchorRef.current && element.scrollTop <= 200) checkTop(element.scrollTop);
+    }
+  }, [checkTop, rows, scrollToBottom, state.historyCursor, state.historyHasMore, state.historyLoading, syncScrollPosition, totalSize, virtualizer]);
 
   if (rows.length === 0) {
     return (

@@ -324,7 +324,7 @@ export function SessionMessageList({
     };
   }, []);
 
-  const { handleScroll, retry, syncScrollPosition } = useLoadEarlierOnScroll({
+  const { checkTop, handleScroll, retry, syncScrollPosition } = useLoadEarlierOnScroll({
     autoEnabled: !historyError,
     canLoad: canLoadEarlier,
     loading: historyLoading,
@@ -336,11 +336,15 @@ export function SessionMessageList({
   useLayoutEffect(() => {
     const container = containerRef.current;
     const anchor = anchorRef.current;
-    if (!container || !anchor || historyLoading) return;
-    container.scrollTop = anchor.scrollTop + (container.scrollHeight - anchor.scrollHeight);
-    syncScrollPosition(container.scrollTop);
-    anchorRef.current = null;
-  }, [historyLoading, messages, syncScrollPosition]);
+    if (container && anchor && !historyLoading) {
+      container.scrollTop = anchor.scrollTop + (container.scrollHeight - anchor.scrollHeight);
+      syncScrollPosition(container.scrollTop);
+      anchorRef.current = null;
+    }
+    if (container && !anchorRef.current && !historyLoading && canLoadEarlier && container.scrollTop <= 200) {
+      checkTop(container.scrollTop);
+    }
+  }, [canLoadEarlier, checkTop, historyLoading, messages, syncScrollPosition]);
 
   useEffect(() => {
     if (!highlight || !containerRef.current) return;

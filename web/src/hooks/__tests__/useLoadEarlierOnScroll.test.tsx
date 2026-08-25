@@ -20,7 +20,7 @@ function Harness({
   onLoadEarlier,
   resetKey = "session-1",
 }: HarnessProps) {
-  const { handleScroll, retry } = useLoadEarlierOnScroll({
+  const { checkTop, handleScroll, retry } = useLoadEarlierOnScroll({
     autoEnabled,
     canLoad,
     loading,
@@ -30,6 +30,7 @@ function Harness({
   return (
     <>
       <div data-testid="scroller" onScroll={handleScroll} />
+      <div data-testid="check-top" onClick={() => checkTop(0)} />
       <button onClick={retry} type="button">Retry</button>
     </>
   );
@@ -64,6 +65,19 @@ describe("useLoadEarlierOnScroll", () => {
     await act(async () => scroll(scroller, 260));
     await act(async () => scroll(scroller, 180));
     await act(async () => scroll(scroller, 120));
+
+    expect(onLoadEarlier).toHaveBeenCalledTimes(1);
+    await act(async () => root.unmount());
+  });
+
+  it("loads when the top check runs at the initial scroll position", async () => {
+    const container = document.createElement("div");
+    document.body.appendChild(container);
+    const root = createRoot(container);
+    const onLoadEarlier = vi.fn();
+
+    await act(async () => root.render(<Harness onLoadEarlier={onLoadEarlier} />));
+    await act(async () => container.querySelector<HTMLElement>("[data-testid=check-top]")?.click());
 
     expect(onLoadEarlier).toHaveBeenCalledTimes(1);
     await act(async () => root.unmount());

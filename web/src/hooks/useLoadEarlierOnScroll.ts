@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef } from "react";
+import { useCallback, useEffect, useLayoutEffect, useRef } from "react";
 import type { UIEvent } from "react";
 
 const DEFAULT_TOP_THRESHOLD_PX = 200;
@@ -26,7 +26,7 @@ export function useLoadEarlierOnScroll({
   const requestPendingRef = useRef(false);
   const sawLoadingRef = useRef(false);
 
-  useEffect(() => {
+  useLayoutEffect(() => {
     previousScrollTopRef.current = null;
     requestPendingRef.current = false;
     sawLoadingRef.current = false;
@@ -78,10 +78,13 @@ export function useLoadEarlierOnScroll({
     }
   }, [load, thresholdPx]);
 
+  const checkTop = useCallback((scrollTop: number) => {
+    if (scrollTop <= thresholdPx) load(true);
+  }, [load, thresholdPx]);
   const retry = useCallback(() => load(false), [load]);
   const syncScrollPosition = useCallback((scrollTop: number) => {
     previousScrollTopRef.current = scrollTop;
   }, []);
 
-  return { handleScroll, retry, syncScrollPosition };
+  return { checkTop, handleScroll, retry, syncScrollPosition };
 }
