@@ -15,7 +15,7 @@ __all__ = [
 
 
 def __getattr__(name: str) -> Any:
-    if name in {"SessionReaderClient", "SessionReaderHealthError"}:
+    if name in {"SessionReaderClient", "SessionReaderHealthError", "classify_session_reader_error"}:
         from .client import (
             SessionReaderClient,
             SessionReaderHealthError,
