@@ -3,6 +3,32 @@
 import tools.terminal_tool as terminal_tool
 
 
+def test_literal_echo_and_printf_are_pseudo_replies():
+    assert terminal_tool.is_pseudo_reply_command(
+        "echo I am here and ready to help with whatever you need today."
+    )
+    assert terminal_tool.is_pseudo_reply_command(
+        r"printf '%s\n' I am here and ready to help with whatever you need today."
+    )
+    assert terminal_tool.is_pseudo_reply_command(
+        "/bin/echo I am here and ready to help with whatever you need today."
+    )
+    assert terminal_tool.is_pseudo_reply_command(
+        "command printf '%s' I am here and ready to help with whatever you need today."
+    )
+    assert terminal_tool.is_pseudo_reply_command(
+        "builtin echo I am here and ready to help with whatever you need today."
+    )
+
+
+def test_shell_composition_and_ambiguous_commands_fail_open():
+    assert not terminal_tool.is_pseudo_reply_command("echo $HOME")
+    assert not terminal_tool.is_pseudo_reply_command("echo hello | tee out.txt")
+    assert not terminal_tool.is_pseudo_reply_command("echo hello > out.txt")
+    assert not terminal_tool.is_pseudo_reply_command("echo 'unterminated")
+    assert not terminal_tool.is_pseudo_reply_command("python -c 'print(1)'")
+
+
 def setup_function():
     terminal_tool._reset_cached_sudo_passwords()
 

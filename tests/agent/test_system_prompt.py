@@ -3,7 +3,11 @@
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from agent.prompt_builder import DEFAULT_AGENT_IDENTITY, RESPONSE_STYLE_GUIDANCE
+from agent.prompt_builder import (
+    DEFAULT_AGENT_IDENTITY,
+    RESPONSE_STYLE_GUIDANCE,
+    TEXT_RESPONSE_TOOL_GUIDANCE,
+)
 from agent.system_prompt import build_system_prompt_parts
 
 
@@ -80,6 +84,16 @@ class TestResponseStyleGuidance:
         assert DEFAULT_AGENT_IDENTITY not in stable
         assert stable.count(RESPONSE_STYLE_GUIDANCE) == 1
         assert stable.index(custom_soul) < stable.index(RESPONSE_STYLE_GUIDANCE)
+
+
+class TestTextResponseToolGuidance:
+    def test_present_once_when_tools_are_loaded(self):
+        stable = _stable_prompt(_make_agent(valid_tool_names=["terminal"]))
+        assert stable.count(TEXT_RESPONSE_TOOL_GUIDANCE) == 1
+
+    def test_absent_without_tools(self):
+        stable = _stable_prompt(_make_agent(valid_tool_names=[]))
+        assert TEXT_RESPONSE_TOOL_GUIDANCE not in stable
 
 
 class TestSkillsPromptWiring:

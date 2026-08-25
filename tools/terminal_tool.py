@@ -41,6 +41,7 @@ import time
 import threading
 import atexit
 import shutil
+import shlex
 import subprocess
 from pathlib import Path
 from typing import Optional, Dict, Any, List
@@ -952,6 +953,48 @@ from tools.environments.modal import ModalEnvironment as _ModalEnvironment
 from tools.environments.managed_modal import ManagedModalEnvironment as _ManagedModalEnvironment
 from tools.managed_tool_gateway import is_managed_tool_gateway_ready
 import sys
+
+
+def is_pseudo_reply_command(command: Any) -> bool:
+    """Return whether *command* is an unambiguous text-only pseudo-reply.
+
+    This intentionally has a narrow, fail-open definition. Only a single
+    ``echo``/``printf`` command with literal arguments is blocked. Pipelines,
+    redirections, shell substitutions, and malformed syntax may represent real
+    shell work and are therefore left to the normal command guards.
+    """
+    if not isinstance(command, str) or not command.strip():
+        return False
+    if any(token in command for token in ("$", "`", ";", "&&", "||", "|", ">", "<")):
+        return False
+    try:
+        tokens = shlex.split(command, posix=True)
+    except (ValueError, TypeError):
+        return False
+    if not tokens or any("\n" in token for token in tokens):
+        return False
+
+    index = 0
+    while index < len(tokens) and tokens[index] in {"command", "builtin"}:
+        index += 1
+    if index >= len(tokens):
+        return False
+
+    executable = tokens[index].rsplit("/", 1)[-1].lower()
+    if executable not in {"echo", "printf"}:
+        return False
+
+    # Keep ordinary shell diagnostics such as ``echo hello`` usable. The
+    # accidental transport pattern is a longer natural-language sentence (or
+    # non-ASCII conversational text), not every literal echo invocation.
+    literal = " ".join(tokens[index + 1:])
+    if not literal:
+        return False
+    return (
+        len(literal) >= 32
+        or any(ord(char) > 127 for char in literal)
+        or bool(re.search(r"[.!?。！？]", literal))
+    )
 
 
 # Tool description for LLM
@@ -2042,6 +2085,17 @@ def terminal_tool(
                 "exit_code": -1,
                 "error": f"Invalid command: expected string, got {type(command).__name__}",
                 "status": "error",
+            }, ensure_ascii=False)
+
+        if is_pseudo_reply_command(command):
+            return json.dumps({
+                "output": "",
+                "exit_code": -1,
+                "error": (
+                    "Blocked terminal pseudo-reply: send purely textual responses "
+                    "directly in the assistant message instead of using echo or printf."
+                ),
+                "status": "blocked",
             }, ensure_ascii=False)
 
         # Get configuration

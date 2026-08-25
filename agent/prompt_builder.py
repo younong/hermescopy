@@ -143,6 +143,14 @@ RESPONSE_STYLE_GUIDANCE = (
     "completion merely to be brief."
 )
 
+TEXT_RESPONSE_TOOL_GUIDANCE = (
+    "# Text-only replies\n"
+    "When the response is purely textual, reply directly in the assistant message. "
+    "Do not use terminal, echo, printf, or shell commands to generate or display "
+    "the response. Use terminal only when the user explicitly requires command "
+    "execution or the task genuinely needs shell access."
+)
+
 DEFAULT_AGENT_INSTRUCTIONS = (
     f"{DEFAULT_AGENT_IDENTITY}\n\n{RESPONSE_STYLE_GUIDANCE}"
 )
