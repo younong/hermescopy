@@ -25,10 +25,10 @@ def test_skips_non_repository(tmp_path):
     assert "不是有效的 Git worktree" in result["systemMessage"]
 
 
-def test_result_is_stop_hook_json(tmp_path):
+def test_result_does_not_rewake_model(tmp_path):
     result = module._result("message")
-    assert result["hookSpecificOutput"]["hookEventName"] == "Stop"
-    assert result["hookSpecificOutput"]["additionalContext"] == "message"
+    assert result["systemMessage"] == "message"
+    assert "hookSpecificOutput" not in result
     json.dumps(result, ensure_ascii=False)
 
 

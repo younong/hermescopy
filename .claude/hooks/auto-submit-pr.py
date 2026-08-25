@@ -21,10 +21,6 @@ def _result(message: str) -> dict[str, Any]:
     return {
         "systemMessage": message,
         "suppressOutput": False,
-        "hookSpecificOutput": {
-            "hookEventName": "Stop",
-            "additionalContext": message,
-        },
     }
 
 
