@@ -10,6 +10,7 @@ from typing import Any
 
 from hermes_cli.dashboard_auth.authority import OwnerWorkerAuthorityLease, WorkerLeaseState
 from hermes_cli.owner_worker.tokens import (
+    OWP1_MAX_MESSAGE_BYTES,
     mint_owner_worker_bootstrap,
     normalize_connection_purpose,
     owner_worker_capability_public_config,
@@ -27,6 +28,7 @@ async def connect_owner_worker_ws(
     *,
     open_timeout: float = 10.0,
     max_queue: int = 64,
+    max_size: int = OWP1_MAX_MESSAGE_BYTES,
 ) -> Any:
     try:
         import websockets
@@ -35,7 +37,11 @@ async def connect_owner_worker_ws(
     unix_connect = getattr(websockets, "unix_connect", None)
     if unix_connect is None:
         raise RuntimeError("websockets.unix_connect is unavailable")
-    kwargs = {"open_timeout": open_timeout, "max_queue": max_queue}
+    kwargs = {
+        "open_timeout": open_timeout,
+        "max_queue": max_queue,
+        "max_size": max_size,
+    }
     try:
         return await unix_connect(uri=uri, path=str(socket_path), **kwargs)
     except TypeError:

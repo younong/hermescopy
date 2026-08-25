@@ -47,6 +47,7 @@ import {
 import { JsonRpcGatewayError, type GatewayEvent } from "@/lib/gatewayClient";
 import { emitChatDiagnostic } from "@/lib/chatDiagnostics";
 import { dashboardAuthTransition } from "@/lib/dashboardAuthTransition";
+import { DEFAULT_HISTORY_PAGE_SIZE } from "@/lib/historyPagination";
 import { useDashboardAuthIdentity } from "@/lib/useDashboardAuthIdentity";
 import { cn } from "@/lib/utils";
 import {
@@ -467,7 +468,7 @@ export function GuiChatShell() {
       const startedAt = performance.now();
       void api.getSessionMessages(
         requestedSessionId,
-        { limit: 100, signal: controller.signal },
+        { limit: DEFAULT_HISTORY_PAGE_SIZE, signal: controller.signal },
       ).then((response) => {
         if (controller.signal.aborted || !switchCoordinator.isGenerationCurrent(nextGeneration)) return;
         dispatch({
@@ -964,7 +965,7 @@ export function GuiChatShell() {
     try {
       const response = await api.getSessionMessages(
         sessionId,
-        { before: cursor, limit: 100, signal: controller.signal },
+        { before: cursor, limit: DEFAULT_HISTORY_PAGE_SIZE, signal: controller.signal },
       );
       if (controller.signal.aborted) return;
       dispatch({ type: "history.prepend.succeeded", generation, response });

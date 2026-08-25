@@ -9,6 +9,10 @@ import uuid
 from collections.abc import Iterable, Mapping
 from typing import Any
 
+from hermes_cli.history_pagination import (
+    DEFAULT_HISTORY_PAGE_SIZE,
+    MAX_HISTORY_PAGE_SIZE,
+)
 from hermes_state import SessionDB
 
 from .models import (
@@ -28,6 +32,27 @@ def _identifier(value: str, label: str) -> str:
     if not normalized:
         raise ValueError(f"{label} is required")
     return normalized
+
+
+def _optional_sequence(value: int | None, label: str, *, minimum: int) -> int | None:
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
+        raise ValueError(f"{label} must be an integer greater than or equal to {minimum}")
+    return value
+
+
+def _reconciliation_ids(values: Iterable[str], label: str) -> tuple[str, ...]:
+    if isinstance(values, (str, bytes)):
+        raise ValueError(f"reconcile_{label}_ids must be an array")
+    ids = tuple(dict.fromkeys(_identifier(value, f"{label} ID") for value in values))
+    if len(ids) > 512:
+        raise ValueError(f"reconcile_{label}_ids exceeds 512 entries")
+    return ids
+
+
+def _sql_placeholders(values: tuple[str, ...]) -> str:
+    return ",".join("?" for _ in values)
 
 
 def _json_object(value: Mapping[str, Any] | None) -> str:
@@ -1965,57 +1990,198 @@ class CollaborationStore:
         self,
         group_id: str,
         *,
+        limit: int = DEFAULT_HISTORY_PAGE_SIZE,
+        before_sequence: int | None = None,
         after_sequence: int | None = None,
+        through_sequence: int | None = None,
+        reconcile_membership_ids: Iterable[str] = (),
+        reconcile_target_ids: Iterable[str] = (),
+        reconcile_approval_ids: Iterable[str] = (),
     ) -> dict[str, Any]:
-        group = self.get_group(group_id)
-        requested_after = 0 if after_sequence is None else max(0, int(after_sequence))
+        group_id = _identifier(group_id, "group ID")
+        if (
+            isinstance(limit, bool)
+            or not isinstance(limit, int)
+            or not 1 <= limit <= MAX_HISTORY_PAGE_SIZE
+        ):
+            raise ValueError(
+                f"collaboration history limit must be between 1 and {MAX_HISTORY_PAGE_SIZE}"
+            )
+        if before_sequence is not None and after_sequence is not None:
+            raise ValueError("before_sequence and after_sequence are mutually exclusive")
+        if through_sequence is not None and after_sequence is None:
+            raise ValueError("through_sequence requires after_sequence")
+        requested_before = _optional_sequence(before_sequence, "before_sequence", minimum=1)
+        requested_after = _optional_sequence(after_sequence, "after_sequence", minimum=0)
+        requested_through = _optional_sequence(through_sequence, "through_sequence", minimum=0)
+        membership_ids = _reconciliation_ids(reconcile_membership_ids, "membership")
+        target_ids = _reconciliation_ids(reconcile_target_ids, "target")
+        approval_ids = _reconciliation_ids(reconcile_approval_ids, "approval")
+
         with self.db._lock:
-            memberships = self.db._conn.execute(
-                "SELECT * FROM collaboration_memberships WHERE group_id=? "
-                "ORDER BY join_sequence, membership_id",
-                (group.group_id,),
+            conn = self.db._conn
+            group_row = self._owned_group_row(conn, group_id)
+            if group_row is None:
+                raise RuntimeError("collaboration group is unavailable")
+            group = self._group(dict(group_row))
+            high_water = group.last_sequence if requested_through is None else requested_through
+            if high_water > group.last_sequence:
+                raise ValueError("through_sequence exceeds the group high-water mark")
+            if requested_after is not None and high_water < requested_after:
+                raise ValueError("through_sequence must not precede after_sequence")
+
+            if requested_after is not None:
+                direction = "forward"
+                rows = conn.execute(
+                    "SELECT * FROM collaboration_events WHERE group_id=? "
+                    "AND sequence>? AND sequence<=? ORDER BY sequence LIMIT ?",
+                    (group_id, requested_after, high_water, limit + 1),
+                ).fetchall()
+                has_more = len(rows) > limit
+                event_rows = rows[:limit]
+            else:
+                direction = "backward" if requested_before is not None else "initial"
+                upper_bound = min(requested_before or high_water + 1, high_water + 1)
+                rows = conn.execute(
+                    "SELECT * FROM collaboration_events WHERE group_id=? "
+                    "AND sequence<? ORDER BY sequence DESC LIMIT ?",
+                    (group_id, upper_bound, limit + 1),
+                ).fetchall()
+                has_more = len(rows) > limit
+                event_rows = list(reversed(rows[:limit]))
+
+            events = [self._event(dict(row)).__dict__ for row in event_rows]
+            event_ids = tuple(str(item["event_id"]) for item in events)
+            effective_target_ids = set(target_ids)
+            if approval_ids:
+                approval_target_rows = conn.execute(
+                    "SELECT a.target_id FROM collaboration_approvals a "
+                    "JOIN collaboration_turn_targets tt ON tt.target_id=a.target_id "
+                    "JOIN collaboration_turns t ON t.turn_id=tt.turn_id "
+                    f"WHERE t.group_id=? AND a.approval_id IN ({_sql_placeholders(approval_ids)})",
+                    (group_id, *approval_ids),
+                ).fetchall()
+                effective_target_ids.update(str(row["target_id"]) for row in approval_target_rows)
+            ordered_target_ids = tuple(sorted(effective_target_ids))
+            turn_terms = ["t.status NOT IN ('completed','partial','failed','ambiguous','cancelled')"]
+            turn_args: list[Any] = [group_id]
+            if event_ids:
+                turn_terms.append(f"t.event_id IN ({_sql_placeholders(event_ids)})")
+                turn_args.extend(event_ids)
+            if ordered_target_ids:
+                turn_terms.append(
+                    "EXISTS (SELECT 1 FROM collaboration_turn_targets rt "
+                    f"WHERE rt.turn_id=t.turn_id AND rt.target_id IN ({_sql_placeholders(ordered_target_ids)}))"
+                )
+                turn_args.extend(ordered_target_ids)
+            turns = conn.execute(
+                "SELECT t.* FROM collaboration_turns t WHERE t.group_id=? AND ("
+                + " OR ".join(turn_terms)
+                + ") ORDER BY t.created_at, t.turn_id",
+                tuple(turn_args),
             ).fetchall()
-            events = self.db._conn.execute(
-                "SELECT * FROM collaboration_events WHERE group_id=? AND sequence>? "
-                "ORDER BY sequence",
-                (group.group_id, requested_after),
-            ).fetchall()
-            turns = self.db._conn.execute(
-                "SELECT * FROM collaboration_turns WHERE group_id=? ORDER BY created_at, turn_id",
-                (group.group_id,),
-            ).fetchall()
-            targets = self.db._conn.execute(
+            turn_ids = tuple(str(row["turn_id"]) for row in turns)
+
+            target_terms = ["tt.status IN ('queued','running','waiting_approval')"]
+            target_args: list[Any] = [group_id]
+            if turn_ids:
+                target_terms.append(f"tt.turn_id IN ({_sql_placeholders(turn_ids)})")
+                target_args.extend(turn_ids)
+            if ordered_target_ids:
+                target_terms.append(f"tt.target_id IN ({_sql_placeholders(ordered_target_ids)})")
+                target_args.extend(ordered_target_ids)
+            targets = conn.execute(
                 "SELECT tt.* FROM collaboration_turn_targets tt "
-                "JOIN collaboration_turns t ON t.turn_id=tt.turn_id "
-                "WHERE t.group_id=? ORDER BY t.created_at, tt.employee_id",
-                (group.group_id,),
+                "JOIN collaboration_turns t ON t.turn_id=tt.turn_id WHERE t.group_id=? AND ("
+                + " OR ".join(target_terms)
+                + ") ORDER BY t.created_at, tt.employee_id, tt.target_id",
+                tuple(target_args),
             ).fetchall()
-            approvals = self.db._conn.execute(
+            included_target_ids = tuple(str(row["target_id"]) for row in targets)
+
+            approval_terms = ["a.status='pending'"]
+            approval_args: list[Any] = [group_id]
+            if included_target_ids:
+                approval_terms.append(f"a.target_id IN ({_sql_placeholders(included_target_ids)})")
+                approval_args.extend(included_target_ids)
+            if approval_ids:
+                approval_terms.append(f"a.approval_id IN ({_sql_placeholders(approval_ids)})")
+                approval_args.extend(approval_ids)
+            approvals = conn.execute(
                 "SELECT a.*, tt.execution_id, tt.turn_id, t.group_id "
                 "FROM collaboration_approvals a "
                 "JOIN collaboration_turn_targets tt ON tt.target_id=a.target_id "
-                "JOIN collaboration_turns t ON t.turn_id=tt.turn_id "
-                "WHERE t.group_id=? ORDER BY a.created_at, a.approval_id",
-                (group.group_id,),
+                "JOIN collaboration_turns t ON t.turn_id=tt.turn_id WHERE t.group_id=? AND ("
+                + " OR ".join(approval_terms)
+                + ") ORDER BY a.created_at, a.approval_id",
+                tuple(approval_args),
             ).fetchall()
-            attachments = self.db._conn.execute(
-                "SELECT attachment_id, group_id, event_id, filename, media_type, "
-                "size_bytes, content_sha256, created_at FROM collaboration_attachments "
-                "WHERE group_id=? ORDER BY created_at, attachment_id",
-                (group.group_id,),
+
+            referenced_memberships = set(membership_ids)
+            referenced_memberships.update(
+                str(event["actor_membership_id"])
+                for event in events
+                if event.get("actor_membership_id")
+            )
+            for event in events:
+                mentions = event.get("body", {}).get("mentions", [])
+                if isinstance(mentions, list):
+                    referenced_memberships.update(str(value) for value in mentions if value)
+            referenced_memberships.update(str(row["membership_id"]) for row in targets)
+            membership_terms = ["leave_sequence IS NULL"]
+            membership_args: list[Any] = [group_id]
+            if referenced_memberships:
+                ordered_memberships = tuple(sorted(referenced_memberships))
+                membership_terms.append(
+                    f"membership_id IN ({_sql_placeholders(ordered_memberships)})"
+                )
+                membership_args.extend(ordered_memberships)
+            memberships = conn.execute(
+                "SELECT * FROM collaboration_memberships WHERE group_id=? AND ("
+                + " OR ".join(membership_terms)
+                + ") ORDER BY join_sequence, membership_id",
+                tuple(membership_args),
             ).fetchall()
+
+            attachments = []
+            if event_ids:
+                attachments = conn.execute(
+                    "SELECT attachment_id, group_id, event_id, filename, media_type, "
+                    "size_bytes, content_sha256, created_at FROM collaboration_attachments "
+                    f"WHERE group_id=? AND event_id IN ({_sql_placeholders(event_ids)}) "
+                    "ORDER BY created_at, attachment_id",
+                    (group_id, *event_ids),
+                ).fetchall()
+
+        range_start = int(event_rows[0]["sequence"]) if event_rows else None
+        range_end = int(event_rows[-1]["sequence"]) if event_rows else None
+        next_before = range_start if has_more and direction != "forward" else None
+        next_after = range_end if direction == "forward" and event_rows else requested_after
         return {
             "group": group.__dict__,
             "memberships": [self._membership(dict(row)).__dict__ for row in memberships],
-            "events": [self._event(dict(row)).__dict__ for row in events],
+            "events": events,
             "turns": [dict(row) for row in turns],
             "targets": [dict(row) for row in targets],
             "approvals": [dict(row) for row in approvals],
             "attachments": [dict(row) for row in attachments],
-            "reconciliation": {
+            "history_page": {
+                "direction": direction,
+                "limit": limit,
+                "snapshot_sequence": high_water,
+                "range_start_sequence": range_start,
+                "range_end_sequence": range_end,
+                "before_sequence": requested_before,
+                "next_before_sequence": next_before,
                 "after_sequence": requested_after,
-                "last_sequence": group.last_sequence,
-                "next_after_sequence": group.last_sequence,
+                "next_after_sequence": next_after,
+                "through_sequence": high_water,
+                "has_more": has_more,
+            },
+            "reconciliation": {
+                "after_sequence": requested_after or 0,
+                "last_sequence": high_water,
+                "next_after_sequence": next_after if direction == "forward" else high_water,
                 "snapshot_authoritative": True,
             },
         }

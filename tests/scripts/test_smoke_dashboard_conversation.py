@@ -58,7 +58,7 @@ def test_generated_smoke_uses_public_ticket_and_full_session_lifecycle(smoke_mod
     assert "message.complete" in javascript
     assert "cold resume did not restore the smoke transcript" in javascript
     assert "api/sessions?limit=30&offset=0&order=recent&compact=true" in javascript
-    assert "api/sessions/${encodeURIComponent(storedSessionId)}/messages?limit=100" in javascript
+    assert "api/sessions/${encodeURIComponent(storedSessionId)}/messages?limit=10" in javascript
     assert "public_session_reader_list" in javascript
     assert "public_session_reader_messages" in javascript
     assert "response.status !== 503" in javascript

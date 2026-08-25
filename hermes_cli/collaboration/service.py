@@ -18,6 +18,7 @@ from hermes_cli.channel_identity import (
 from hermes_cli.controlled_roots import RootKind
 from hermes_cli.employee_catalog import employee_catalog_payload
 from hermes_cli.employee_policy import employee_policy_with_workspace
+from hermes_cli.history_pagination import DEFAULT_HISTORY_PAGE_SIZE
 from hermes_state import SessionDB
 
 from .agent_tools import CollaborationAgentContext
@@ -102,10 +103,25 @@ class CollaborationService:
         self,
         group_id: str,
         *,
+        limit: int = DEFAULT_HISTORY_PAGE_SIZE,
+        before_sequence: int | None = None,
         after_sequence: int | None = None,
+        through_sequence: int | None = None,
+        reconcile_membership_ids: Iterable[str] = (),
+        reconcile_target_ids: Iterable[str] = (),
+        reconcile_approval_ids: Iterable[str] = (),
     ) -> dict[str, Any]:
         return self._public_snapshot(
-            self.store.snapshot_payload(group_id, after_sequence=after_sequence)
+            self.store.snapshot_payload(
+                group_id,
+                limit=limit,
+                before_sequence=before_sequence,
+                after_sequence=after_sequence,
+                through_sequence=through_sequence,
+                reconcile_membership_ids=reconcile_membership_ids,
+                reconcile_target_ids=reconcile_target_ids,
+                reconcile_approval_ids=reconcile_approval_ids,
+            )
         )
 
     def create_group(
@@ -769,6 +785,7 @@ class CollaborationService:
             "targets": [cls._without_internal(dict(item)) for item in snapshot["targets"]],
             "approvals": [cls._public_approval(dict(item)) for item in snapshot["approvals"]],
             "attachments": [dict(item) for item in snapshot["attachments"]],
+            "history_page": dict(snapshot["history_page"]),
             "reconciliation": dict(snapshot["reconciliation"]),
         }
 

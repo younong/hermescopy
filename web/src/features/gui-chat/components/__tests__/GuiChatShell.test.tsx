@@ -647,6 +647,19 @@ describe("GuiChatShell", () => {
         status: "active",
         updated_at: 1,
       },
+      history_page: {
+        after_sequence: null,
+        before_sequence: null,
+        direction: "initial",
+        has_more: false,
+        limit: 10,
+        next_after_sequence: null,
+        next_before_sequence: null,
+        range_end_sequence: null,
+        range_start_sequence: null,
+        snapshot_sequence: 0,
+        through_sequence: 0,
+      },
       memberships: [],
       reconciliation: {
         after_sequence: 0,
@@ -1329,7 +1342,7 @@ describe("GuiChatShell", () => {
     expect(document.querySelector("[data-files-pane]")).toBeNull();
     expect(connection.collaboration.getGroup).toHaveBeenCalledWith(
       "group-archived",
-      undefined,
+      { limit: 10 },
       expect.any(AbortSignal),
     );
   });
@@ -1382,6 +1395,19 @@ describe("GuiChatShell", () => {
         name: "Group A",
         status: "active",
         updated_at: 1_700_000_000,
+      },
+      history_page: {
+        after_sequence: null,
+        before_sequence: null,
+        direction: "initial",
+        has_more: false,
+        limit: 10,
+        next_after_sequence: null,
+        next_before_sequence: null,
+        range_end_sequence: null,
+        range_start_sequence: null,
+        snapshot_sequence: 0,
+        through_sequence: 0,
       },
       memberships: [],
       reconciliation: {
@@ -1581,7 +1607,7 @@ describe("GuiChatShell", () => {
 
     expect(mocks.getSessionMessages).toHaveBeenCalledWith(
       "requested",
-      expect.objectContaining({ limit: 100, signal: expect.any(AbortSignal) }),
+      expect.objectContaining({ limit: 10, signal: expect.any(AbortSignal) }),
     );
     expect(connection.createOrAttach).toHaveBeenCalledOnce();
     expect(container.textContent).toContain("saved answer");

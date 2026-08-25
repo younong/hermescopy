@@ -8,6 +8,7 @@ import type {
 } from "./protocol";
 import type {
   CollaborationApprovalChoice,
+  CollaborationGetOptions,
   CollaborationSnapshot,
   CollaborationSubmitMessage,
 } from "./types";
@@ -24,7 +25,7 @@ interface CollaborationRequestClient {
 
 export interface CollaborationApi {
   listGroups(includeArchived?: boolean, signal?: AbortSignal): Promise<CollaborationGroupsResponse>;
-  getGroup(groupId: string, afterSequence?: number, signal?: AbortSignal): Promise<CollaborationSnapshot>;
+  getGroup(groupId: string, options?: CollaborationGetOptions, signal?: AbortSignal): Promise<CollaborationSnapshot>;
   createGroup(name: string, employeeIds: string[], clientIdempotencyKey: string): Promise<CollaborationSnapshot>;
   archiveGroup(groupId: string): Promise<CollaborationGroupsResponse["groups"][number]>;
   updateMembers(groupId: string, employeeIds: string[]): Promise<CollaborationSnapshot>;
@@ -62,13 +63,10 @@ export function createCollaborationApi(
         employee_ids: employeeIds,
         name,
       }),
-    getGroup: (groupId, afterSequence, signal) =>
+    getGroup: (groupId, options = {}, signal) =>
       request(
         "collaboration.group.get",
-        {
-          group_id: groupId,
-          ...(afterSequence === undefined ? {} : { after_sequence: afterSequence }),
-        },
+        { group_id: groupId, ...options },
         signal,
       ),
     interruptTarget: (targetId) =>

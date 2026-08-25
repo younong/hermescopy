@@ -387,6 +387,19 @@ def test_mentioned_turn_snapshots_members_and_attachment_grants_atomically(db):
     assert [event["sequence"] for event in snapshot["events"]] == list(
         range(1, all_submitted.event.sequence + 1)
     )
+    assert snapshot["history_page"] == {
+        "direction": "initial",
+        "limit": 10,
+        "snapshot_sequence": all_submitted.event.sequence,
+        "range_start_sequence": 1,
+        "range_end_sequence": all_submitted.event.sequence,
+        "before_sequence": None,
+        "next_before_sequence": None,
+        "after_sequence": None,
+        "next_after_sequence": None,
+        "through_sequence": all_submitted.event.sequence,
+        "has_more": False,
+    }
     incremental = store.snapshot_payload(
         group.group_id, after_sequence=submitted.event.sequence
     )
@@ -396,6 +409,19 @@ def test_mentioned_turn_snapshots_members_and_attachment_grants_atomically(db):
     assert len(incremental["memberships"]) == 2
     assert len(incremental["turns"]) == 2
     assert len(incremental["targets"]) == 3
+    assert incremental["history_page"] == {
+        "direction": "forward",
+        "limit": 10,
+        "snapshot_sequence": all_submitted.event.sequence,
+        "range_start_sequence": all_submitted.event.sequence,
+        "range_end_sequence": all_submitted.event.sequence,
+        "before_sequence": None,
+        "next_before_sequence": None,
+        "after_sequence": submitted.event.sequence,
+        "next_after_sequence": all_submitted.event.sequence,
+        "through_sequence": all_submitted.event.sequence,
+        "has_more": False,
+    }
     assert incremental["reconciliation"] == {
         "after_sequence": submitted.event.sequence,
         "last_sequence": all_submitted.event.sequence,
@@ -408,6 +434,118 @@ def test_mentioned_turn_snapshots_members_and_attachment_grants_atomically(db):
     assert len(page["events"]) == 1
     assert page["has_more"] is False
     assert page["next_after_sequence"] == all_submitted.event.sequence
+
+
+def test_snapshot_pages_latest_backward_and_fixed_forward_ranges(db):
+    store = CollaborationStore(db, owner_key="owner-a")
+    group = store.create_group("History")
+    created = [
+        store.submit_owner_message(group.group_id, text=f"消息 {index}").event
+        for index in range(250)
+    ]
+
+    latest = store.snapshot_payload(group.group_id, limit=100)
+    assert [event["sequence"] for event in latest["events"]] == list(range(152, 252))
+    assert latest["history_page"]["has_more"] is True
+    assert latest["history_page"]["next_before_sequence"] == 152
+    assert latest["history_page"]["snapshot_sequence"] == 251
+
+    older = store.snapshot_payload(
+        group.group_id,
+        limit=100,
+        before_sequence=latest["history_page"]["next_before_sequence"],
+    )
+    assert [event["sequence"] for event in older["events"]] == list(range(52, 152))
+    assert older["history_page"]["next_before_sequence"] == 52
+
+    oldest = store.snapshot_payload(group.group_id, limit=100, before_sequence=52)
+    assert [event["sequence"] for event in oldest["events"]] == list(range(1, 52))
+    assert oldest["history_page"]["has_more"] is False
+    assert oldest["history_page"]["next_before_sequence"] is None
+
+    store.submit_owner_message(group.group_id, text="late event")
+    forward = store.snapshot_payload(
+        group.group_id,
+        limit=40,
+        after_sequence=100,
+        through_sequence=created[-1].sequence,
+    )
+    assert [event["sequence"] for event in forward["events"]] == list(range(101, 141))
+    assert forward["history_page"]["through_sequence"] == 251
+    assert forward["history_page"]["next_after_sequence"] == 140
+    assert forward["history_page"]["has_more"] is True
+
+
+def test_snapshot_bounds_related_entities_and_reconciles_terminal_overlays(db):
+    store = CollaborationStore(db, owner_key="owner-a")
+    group = store.create_group("History", members=[_member("employee-a")])
+    membership = store.active_memberships(group.group_id)[0]
+    first = store.submit_owner_message(
+        group.group_id,
+        text="old target",
+        mentioned_membership_ids=[membership.membership_id],
+    )
+    assert first.turn is not None
+    target = first.turn.targets[0]
+    old_attachment = store.create_attachment(
+        group.group_id,
+        filename="old.txt",
+        media_type="text/plain",
+        size_bytes=3,
+        storage_key="groups/history/old",
+        content_sha256="a" * 64,
+    )
+    with db._lock:
+        db._conn.execute(
+            "UPDATE collaboration_attachments SET event_id=? WHERE attachment_id=?",
+            (first.event.event_id, old_attachment["attachment_id"]),
+        )
+        db._conn.execute(
+            "UPDATE collaboration_turn_targets SET status='completed' WHERE target_id=?",
+            (target.target_id,),
+        )
+        db._conn.execute(
+            "UPDATE collaboration_turns SET status='completed' WHERE turn_id=?",
+            (first.turn.turn_id,),
+        )
+        db._conn.commit()
+
+    for index in range(210):
+        store.submit_owner_message(group.group_id, text=f"new {index}")
+
+    latest = store.snapshot_payload(group.group_id, limit=100)
+    assert target.target_id not in {item["target_id"] for item in latest["targets"]}
+    assert first.turn.turn_id not in {item["turn_id"] for item in latest["turns"]}
+    assert old_attachment["attachment_id"] not in {
+        item["attachment_id"] for item in latest["attachments"]
+    }
+
+    reconciled = store.snapshot_payload(
+        group.group_id,
+        after_sequence=store.get_group(group.group_id).last_sequence,
+        reconcile_membership_ids=[membership.membership_id],
+        reconcile_target_ids=[target.target_id],
+    )
+    assert reconciled["events"] == []
+    assert {item["membership_id"] for item in reconciled["memberships"]} == {
+        membership.membership_id
+    }
+    assert target.target_id in {item["target_id"] for item in reconciled["targets"]}
+    assert first.turn.turn_id in {item["turn_id"] for item in reconciled["turns"]}
+
+
+def test_snapshot_rejects_invalid_page_contract(db):
+    store = CollaborationStore(db, owner_key="owner-a")
+    group = store.create_group("History")
+
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        store.snapshot_payload(group.group_id, before_sequence=2, after_sequence=1)
+    with pytest.raises(ValueError, match="requires"):
+        store.snapshot_payload(group.group_id, through_sequence=1)
+    with pytest.raises(ValueError, match="limit"):
+        store.snapshot_payload(group.group_id, limit=201)
+    with pytest.raises(ValueError, match="array"):
+        store.snapshot_payload(group.group_id, reconcile_target_ids="target-a")
 
 
 def test_discussion_advancement_is_durable_idempotent_and_copies_first_round(db):

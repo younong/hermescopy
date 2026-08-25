@@ -3,12 +3,74 @@
 from __future__ import annotations
 
 import json
+import sys
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
 
-from hermes_cli.owner_worker.gateway_client import OwnerWorkerGatewayClient
+from hermes_cli.owner_worker.gateway_client import (
+    OWP1_MAX_MESSAGE_BYTES,
+    OwnerWorkerGatewayClient,
+    connect_owner_worker_ws,
+)
+
+
+@pytest.mark.asyncio
+async def test_connect_owner_worker_ws_sets_bounded_message_size(monkeypatch):
+    calls = []
+    socket = object()
+
+    async def unix_connect(*args, **kwargs):
+        calls.append((args, kwargs))
+        return socket
+
+    monkeypatch.setitem(sys.modules, "websockets", SimpleNamespace(unix_connect=unix_connect))
+
+    result = await connect_owner_worker_ws(Path(str(Path("/tmp/worker.sock"))), "ws://worker/api/ws")
+
+    assert result is socket
+    assert calls == [
+        ((), {
+            "uri": "ws://worker/api/ws",
+            "path": str(Path("/tmp/worker.sock")),
+            "open_timeout": 10.0,
+            "max_queue": 64,
+            "max_size": OWP1_MAX_MESSAGE_BYTES,
+        })
+    ]
+
+
+@pytest.mark.asyncio
+async def test_connect_owner_worker_ws_legacy_signature_keeps_message_size(monkeypatch):
+    calls = []
+    socket = object()
+
+    async def unix_connect(*args, **kwargs):
+        calls.append((args, kwargs))
+        if not args:
+            raise TypeError("legacy signature")
+        return socket
+
+    monkeypatch.setitem(sys.modules, "websockets", SimpleNamespace(unix_connect=unix_connect))
+
+    result = await connect_owner_worker_ws(
+        Path(str(Path("/tmp/worker.sock"))),
+        "ws://worker/api/ws",
+        max_size=4096,
+    )
+
+    assert result is socket
+    assert calls[-1] == (
+        (str(Path("/tmp/worker.sock")),),
+        {
+            "uri": "ws://worker/api/ws",
+            "open_timeout": 10.0,
+            "max_queue": 64,
+            "max_size": 4096,
+        },
+    )
 
 
 class _Socket:
@@ -157,7 +219,7 @@ async def test_failed_handshake_releases_lease():
         worker_id="worker",
         lease_version=1,
         recovery_generation=0,
-        socket_path="/tmp/worker.sock",
+        socket_path=str(Path("/tmp/worker.sock")),
     )
     use_lease = Mock()
     supervisor = SimpleNamespace(

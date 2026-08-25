@@ -24,6 +24,10 @@ from typing import Any, Optional
 from hermes_constants import get_hermes_home
 from hermes_cli.display_transcript import format_display_transcript
 from hermes_cli.env_loader import load_hermes_dotenv
+from hermes_cli.history_pagination import (
+    DEFAULT_HISTORY_PAGE_SIZE,
+    MAX_HISTORY_PAGE_SIZE,
+)
 from hermes_cli.latency_trace import clean_latency_trace_id, log_latency_stage
 from hermes_cli.owner_runtime import is_owner_worker_env, resolve_workspace_cwd
 from hermes_cli.owner_worker.tokens import (
@@ -1015,12 +1019,12 @@ def _resume_history(db, target: str, *, include_ancestors: bool, recovery_scope:
 def _display_history_request(params: dict) -> tuple[bool, int]:
     config = params.get("display_history")
     if not isinstance(config, dict):
-        return False, 100
+        return False, DEFAULT_HISTORY_PAGE_SIZE
     try:
-        limit = int(config.get("limit", 100))
+        limit = int(config.get("limit", DEFAULT_HISTORY_PAGE_SIZE))
     except (TypeError, ValueError):
-        limit = 100
-    return True, max(1, min(limit, 200))
+        limit = DEFAULT_HISTORY_PAGE_SIZE
+    return True, max(1, min(limit, MAX_HISTORY_PAGE_SIZE))
 
 
 def _display_history_page(
@@ -6965,15 +6969,70 @@ def _collaboration_groups_list(rid, params: dict) -> dict:
 
 @method("collaboration.group.get")
 def _collaboration_group_get(rid, params: dict) -> dict:
-    if set(params) - {"group_id", "after_sequence"} or "group_id" not in params:
+    allowed = {
+        "group_id",
+        "limit",
+        "before_sequence",
+        "after_sequence",
+        "through_sequence",
+        "reconcile_membership_ids",
+        "reconcile_target_ids",
+        "reconcile_approval_ids",
+    }
+    if set(params) - allowed or "group_id" not in params:
         return _err(rid, -32602, "collaboration group get params are invalid")
+    before_sequence = params.get("before_sequence")
     after_sequence = params.get("after_sequence")
-    if after_sequence is not None and (isinstance(after_sequence, bool) or not isinstance(after_sequence, int)):
-        return _err(rid, -32602, "after_sequence must be an integer")
+    through_sequence = params.get("through_sequence")
+    if before_sequence is not None and after_sequence is not None:
+        return _err(rid, -32602, "before_sequence and after_sequence are mutually exclusive")
+    if through_sequence is not None and after_sequence is None:
+        return _err(rid, -32602, "through_sequence requires after_sequence")
+    limit = params.get("limit", DEFAULT_HISTORY_PAGE_SIZE)
+    if (
+        isinstance(limit, bool)
+        or not isinstance(limit, int)
+        or not 1 <= limit <= MAX_HISTORY_PAGE_SIZE
+    ):
+        return _err(
+            rid,
+            -32602,
+            f"limit must be an integer between 1 and {MAX_HISTORY_PAGE_SIZE}",
+        )
+    for name, minimum in (
+        ("before_sequence", 1),
+        ("after_sequence", 0),
+        ("through_sequence", 0),
+    ):
+        value = params.get(name)
+        if value is not None and (
+            isinstance(value, bool) or not isinstance(value, int) or value < minimum
+        ):
+            return _err(rid, -32602, f"{name} must be an integer greater than or equal to {minimum}")
+    id_params = (
+        "reconcile_membership_ids",
+        "reconcile_target_ids",
+        "reconcile_approval_ids",
+    )
+    for name in id_params:
+        values = params.get(name, [])
+        if (
+            not isinstance(values, list)
+            or len(values) > 512
+            or any(not isinstance(value, str) or not value.strip() for value in values)
+        ):
+            return _err(rid, -32602, f"{name} must be an array of at most 512 IDs")
     return _collaboration_call(
         rid,
         lambda service: service.get_group(
-            str(params.get("group_id") or ""), after_sequence=after_sequence
+            str(params.get("group_id") or ""),
+            limit=limit,
+            before_sequence=before_sequence,
+            after_sequence=after_sequence,
+            through_sequence=through_sequence,
+            reconcile_membership_ids=params.get("reconcile_membership_ids", []),
+            reconcile_target_ids=params.get("reconcile_target_ids", []),
+            reconcile_approval_ids=params.get("reconcile_approval_ids", []),
         ),
     )
 
@@ -7208,7 +7267,7 @@ def _session_create(rid, params: dict) -> dict:
                 **params,
                 "session_id": key,
                 "_dashboard_attach": True,
-                "display_history": {"limit": 100},
+                "display_history": {"limit": DEFAULT_HISTORY_PAGE_SIZE},
                 # Freshly resolved current policy: lets the resume fast path
                 # re-pin a still-live session whose profile was edited.
                 "_employee_policy_repin": direct_employee_policy,
@@ -10432,7 +10491,13 @@ def _(rid, params: dict) -> dict:
     if cursor is not None and not isinstance(cursor, str):
         return _err(rid, 4002, "cursor must be a string")
     try:
-        limit = max(1, min(int(params.get("limit", 100)), 200))
+        limit = max(
+            1,
+            min(
+                int(params.get("limit", DEFAULT_HISTORY_PAGE_SIZE)),
+                MAX_HISTORY_PAGE_SIZE,
+            ),
+        )
     except (TypeError, ValueError):
         return _err(rid, 4002, "limit must be an integer")
     recovery_scope = _retained_owner_recovery_scope()

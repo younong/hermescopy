@@ -1,0 +1,2 @@
+export const DEFAULT_HISTORY_PAGE_SIZE = 10;
+export const MAX_HISTORY_PAGE_SIZE = 200;

@@ -3,6 +3,7 @@ import { collaborationGroupId, isCollaborationEvent } from "./protocol";
 import type {
   CollaborationApproval,
   CollaborationEvent,
+  CollaborationHistoryDirection,
   CollaborationSnapshot,
   CollaborationState,
   CollaborationTarget,
@@ -11,10 +12,10 @@ import { initialCollaborationState } from "./types";
 
 export type CollaborationAction =
   | { type: "connection"; state: CollaborationState["connection"] }
-  | { type: "load.started"; incremental: boolean }
+  | { type: "load.started"; mode: CollaborationHistoryDirection }
   | { type: "snapshot"; snapshot: CollaborationSnapshot }
   | { type: "event"; event: GatewayEvent }
-  | { type: "error"; message: string }
+  | { type: "load.failed"; mode: CollaborationHistoryDirection; message: string }
   | { type: "clear" };
 
 export function collaborationReducer(
@@ -29,19 +30,22 @@ export function collaborationReducer(
         ...(action.state === "open" ? {} : { executionsById: {} }),
       };
     case "load.started":
-      return {
-        ...state,
-        error: undefined,
-        loading: !action.incremental,
-        reconciling: action.incremental,
-        executionsById: {},
-      };
+      return action.mode === "backward"
+        ? { ...state, historyError: undefined, historyLoading: true }
+        : {
+          ...state,
+          error: undefined,
+          loading: action.mode === "initial",
+          reconciling: action.mode === "forward",
+        };
     case "snapshot":
       return applySnapshot(state, action.snapshot);
     case "event":
       return applyGatewayEvent(state, action.event);
-    case "error":
-      return { ...state, error: action.message, loading: false, reconciling: false };
+    case "load.failed":
+      return action.mode === "backward"
+        ? { ...state, historyError: action.message, historyLoading: false }
+        : { ...state, error: action.message, loading: false, reconciling: false };
     case "clear":
       return { ...initialCollaborationState, connection: state.connection };
   }
@@ -51,32 +55,40 @@ function applySnapshot(
   state: CollaborationState,
   snapshot: CollaborationSnapshot,
 ): CollaborationState {
-  const incremental = snapshot.reconciliation.after_sequence > 0;
-  const incomingEvents = Object.fromEntries(
-    snapshot.events.map((event) => [event.sequence, event]),
-  );
-  const incomingEventIds = Object.fromEntries(
-    snapshot.events.map((event) => [event.event_id, event.sequence]),
-  );
-  const mergedEvents = incremental ? mergeEvents(state, snapshot.events) : undefined;
-  const eventsBySequence = mergedEvents?.eventsBySequence ?? incomingEvents;
-  const eventSequenceById = mergedEvents?.eventSequenceById ?? incomingEventIds;
+  const direction = snapshot.history_page?.direction
+    ?? ((snapshot.reconciliation?.after_sequence ?? 0) > 0 ? "forward" : "initial");
+  const snapshotSequence = snapshot.history_page?.snapshot_sequence
+    ?? snapshot.reconciliation?.last_sequence
+    ?? snapshot.group.last_sequence;
+  const merged = direction === "initial"
+    ? replaceInitialEvents(state, snapshot, snapshotSequence)
+    : mergeEvents(state, snapshot.events);
+  const nextBefore = snapshot.history_page?.next_before_sequence ?? undefined;
+  const hasMore = snapshot.history_page?.has_more ?? false;
+  const updatesHistory = direction !== "forward";
+  const reconciliationComplete = direction === "initial" || (direction === "forward" && !hasMore);
 
   return {
     ...state,
-    approvalsById: byId(snapshot.approvals, "approval_id"),
-    attachmentsById: byId(snapshot.attachments, "attachment_id"),
+    attachmentsById: mergeEntityPage(state.attachmentsById, snapshot.attachments, "attachment_id", direction),
     error: undefined,
-    eventsBySequence,
-    eventSequenceById,
-    executionsById: {},
+    eventsBySequence: merged.eventsBySequence,
+    eventSequenceById: merged.eventSequenceById,
     group: snapshot.group,
-    lastSequence: Math.max(snapshot.group.last_sequence, snapshot.reconciliation.last_sequence),
+    historyBeforeSequence: updatesHistory ? nextBefore : state.historyBeforeSequence,
+    historyError: updatesHistory ? undefined : state.historyError,
+    historyHasMore: updatesHistory ? hasMore : state.historyHasMore,
+    historyLoading: updatesHistory ? false : state.historyLoading,
+    lastSequence: Math.max(state.lastSequence, snapshot.group.last_sequence, snapshotSequence),
+    reconciledSequence: reconciliationComplete
+      ? snapshot.history_page?.through_sequence ?? snapshot.reconciliation?.next_after_sequence ?? snapshotSequence
+      : state.reconciledSequence,
     loading: false,
-    membershipsById: byId(snapshot.memberships, "membership_id"),
+    membershipsById: mergeEntityPage(state.membershipsById, snapshot.memberships, "membership_id", direction),
     reconciling: false,
-    targetsById: byId(snapshot.targets, "target_id"),
-    turnsById: byId(snapshot.turns, "turn_id"),
+    targetsById: mergeVersionedTargets(state.targetsById, snapshot.targets, direction),
+    turnsById: mergeEntityPage(state.turnsById, snapshot.turns, "turn_id", direction),
+    approvalsById: mergeVersionedApprovals(state.approvalsById, snapshot.approvals, direction),
   };
 }
 
@@ -94,7 +106,7 @@ function applyGatewayEvent(state: CollaborationState, event: GatewayEvent): Coll
     }
     case "collaboration.event.appended": {
       const appended = payload as unknown as CollaborationEvent;
-      if (appended.sequence <= state.lastSequence || !validEventForState(state, appended)) return state;
+      if (!validEventForState(state, appended)) return state;
       const merged = mergeEvents(state, [appended]);
       if (merged.eventsBySequence === state.eventsBySequence) return state;
       return {
@@ -144,10 +156,7 @@ function applyGatewayEvent(state: CollaborationState, event: GatewayEvent): Coll
       const approval = payload as unknown as CollaborationApproval;
       if (!approval.approval_id || !approval.target_id || !approval.execution_id) return state;
       const existing = state.approvalsById[approval.approval_id];
-      if (existing && approvalVersion(approval) < approvalVersion(existing)) return state;
-      if (existing && approvalVersion(approval) === approvalVersion(existing)) {
-        if (approvalStatusRank(approval.status) <= approvalStatusRank(existing.status)) return state;
-      }
+      if (existing && !preferApproval(approval, existing)) return state;
       return {
         ...state,
         approvalsById: {
@@ -159,31 +168,88 @@ function applyGatewayEvent(state: CollaborationState, event: GatewayEvent): Coll
   }
 }
 
-function validEventForState(state: CollaborationState, event: CollaborationEvent): boolean {
+function replaceInitialEvents(
+  state: Pick<CollaborationState, "group" | "eventsBySequence" | "eventSequenceById">,
+  snapshot: CollaborationSnapshot,
+  snapshotSequence: number,
+) {
+  const liveEvents = Object.values(state.eventsBySequence)
+    .filter((event) => event.group_id === snapshot.group.group_id && event.sequence > snapshotSequence);
+  const events = [...snapshot.events, ...liveEvents];
+  return {
+    eventsBySequence: Object.fromEntries(events.map((event) => [event.sequence, event])),
+    eventSequenceById: Object.fromEntries(events.map((event) => [event.event_id, event.sequence])),
+  };
+}
+
+function validEventForState(state: Pick<CollaborationState, "group" | "eventsBySequence" | "eventSequenceById">, event: CollaborationEvent): boolean {
   if (!event.event_id || !Number.isInteger(event.sequence) || event.sequence <= 0) return false;
   if (state.group && event.group_id !== state.group.group_id) return false;
-  const knownSequence = state.eventSequenceById[event.event_id];
-  if (knownSequence !== undefined) return false;
-  const existing = state.eventsBySequence[event.sequence];
-  return existing === undefined;
+  return state.eventSequenceById[event.event_id] === undefined && state.eventsBySequence[event.sequence] === undefined;
 }
 
 function mergeEvents(
-  state: Pick<CollaborationState, "eventsBySequence" | "eventSequenceById">,
+  state: Pick<CollaborationState, "group" | "eventsBySequence" | "eventSequenceById">,
   events: CollaborationEvent[],
 ): Pick<CollaborationState, "eventsBySequence" | "eventSequenceById"> {
   let eventsBySequence = state.eventsBySequence;
   let eventSequenceById = state.eventSequenceById;
   for (const event of [...events].sort((a, b) => a.sequence - b.sequence)) {
-    if (!validEventForState({ ...state, eventsBySequence, eventSequenceById } as CollaborationState, event)) {
-      continue;
-    }
+    if (!validEventForState({ ...state, eventsBySequence, eventSequenceById }, event)) continue;
     if (eventsBySequence === state.eventsBySequence) eventsBySequence = { ...eventsBySequence };
     if (eventSequenceById === state.eventSequenceById) eventSequenceById = { ...eventSequenceById };
     eventsBySequence[event.sequence] = event;
     eventSequenceById[event.event_id] = event.sequence;
   }
   return { eventsBySequence, eventSequenceById };
+}
+
+function mergeEntityPage<T, K extends keyof T>(
+  current: Record<string, T>,
+  values: T[],
+  key: K,
+  direction: CollaborationHistoryDirection,
+): Record<string, T> {
+  const incoming = byId(values, key);
+  return direction === "initial" ? incoming : { ...current, ...incoming };
+}
+
+function mergeVersionedTargets(
+  current: Record<string, CollaborationTarget>,
+  values: CollaborationTarget[],
+  direction: CollaborationHistoryDirection,
+) {
+  if (direction === "initial") return byId(values, "target_id");
+  const next = { ...current };
+  for (const target of values) {
+    const existing = next[target.target_id];
+    if (!existing || targetVersion(target) > targetVersion(existing)
+      || (targetVersion(target) === targetVersion(existing) && targetStatusRank(target.status) > targetStatusRank(existing.status))) {
+      next[target.target_id] = { ...existing, ...target };
+    }
+  }
+  return next;
+}
+
+function mergeVersionedApprovals(
+  current: Record<string, CollaborationApproval>,
+  values: CollaborationApproval[],
+  direction: CollaborationHistoryDirection,
+) {
+  if (direction === "initial") return byId(values, "approval_id");
+  const next = { ...current };
+  for (const approval of values) {
+    const existing = next[approval.approval_id];
+    if (!existing || preferApproval(approval, existing)) next[approval.approval_id] = { ...existing, ...approval };
+  }
+  return next;
+}
+
+function preferApproval(incoming: CollaborationApproval, existing: CollaborationApproval): boolean {
+  const incomingVersion = approvalVersion(incoming);
+  const existingVersion = approvalVersion(existing);
+  return incomingVersion > existingVersion
+    || (incomingVersion === existingVersion && approvalStatusRank(incoming.status) > approvalStatusRank(existing.status));
 }
 
 function targetVersion(target: CollaborationTarget): number {
