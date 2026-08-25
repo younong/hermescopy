@@ -8,7 +8,13 @@ import pytest
 from agent.image_gen_provider import ImageGenProvider
 from agent.video_gen_provider import VideoGenProvider
 from hermes_cli import model_registrations
-from hermes_cli.config import DEFAULT_CONFIG, load_config, load_env, save_config
+from hermes_cli.config import (
+    DEFAULT_CONFIG,
+    load_config,
+    load_env,
+    read_raw_config,
+    save_config,
+)
 from hermes_cli.deployment_inference import DeploymentInferenceRouteDescriptor
 from hermes_cli.deployment_media import (
     POLICY_ID_ENV,
@@ -256,6 +262,56 @@ def test_admin_chat_registration_resolves_from_owner_worker_descriptor(monkeypat
     assert resolved["provider"] == "deployment-provider"
     assert resolved["model"] == "model-a"
     assert resolved["selection_source"] == "deployment"
+
+
+def test_admin_chat_activation_persists_only_registration_id(monkeypatch):
+    route = DeploymentInferenceRouteDescriptor(
+        provider="custom:deployment",
+        model="gpt-safe",
+        api_mode="chat_completions",
+        name="Managed Chat",
+    )
+    monkeypatch.setattr(
+        "hermes_cli.deployment_inference.route_descriptors_from_control_plane",
+        lambda: (route,),
+    )
+    monkeypatch.setattr(model_registrations, "_admin_media_descriptor", lambda: None)
+    registration_id = model_registrations._admin_registration_id(
+        "chat", route.provider, route.model
+    )
+    config = load_config()
+    config["model"] = {
+        "registration_id": "old-registration",
+        "provider": "custom:old",
+        "default": "old-default",
+        "model": "old-model",
+        "base_url": "https://old.example/v1",
+        "api_mode": "responses",
+        "api_key": "old-secret",
+        "reasoning": {"effort": "high"},
+        "context_length": 131072,
+    }
+    save_config(config, preserve_keys={("model",)})
+
+    activated = model_registrations.activate_model_registration(registration_id)
+
+    assert activated == {
+        "ok": True,
+        "registration_id": registration_id,
+        "kind": "chat",
+        "provider": route.provider,
+        "model": route.model,
+    }
+    assert read_raw_config()["model"] == {
+        "registration_id": registration_id,
+        "reasoning": {"effort": "high"},
+        "context_length": 131072,
+    }
+    assert model_registrations.get_model_registrations_payload()["active"]["chat"] == {
+        "registration_id": registration_id,
+        "provider": route.provider,
+        "model": route.model,
+    }
 
 
 def test_admin_registrations_control_plane_derives_media_from_policy(monkeypatch):
@@ -938,6 +994,24 @@ def test_payload_is_lightweight_and_catalog_is_safe(monkeypatch):
         "kind": "vector",
         "providers": [],
     }
+    config = load_config()
+    config["model"] = {
+        "registration_id": "old-registration",
+        "provider": "old-provider",
+        "default": "old-model",
+        "base_url": "https://owner.example/v1",
+        "api_mode": "messages",
+        "reasoning": {"effort": "medium"},
+    }
+    save_config(config, preserve_keys={("model",)})
+
     activated = model_registrations.activate_model_registration(chat["id"])
     assert activated["kind"] == "chat"
-    assert load_config()["model"]["registration_id"] == chat["id"]
+    assert read_raw_config()["model"] == {
+        "registration_id": chat["id"],
+        "provider": "anthropic",
+        "default": "claude-test",
+        "base_url": "https://owner.example/v1",
+        "api_mode": "messages",
+        "reasoning": {"effort": "medium"},
+    }
