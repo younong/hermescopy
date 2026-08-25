@@ -727,7 +727,23 @@ def activate_model_registration(registration_id: str) -> dict[str, Any]:
             if not isinstance(section, dict):
                 section = {}
                 config["model"] = section
-            section.update({"registration_id": registration_id, "provider": provider, "default": model})
+            if item.get("scope") == "admin":
+                section["registration_id"] = registration_id
+                for key in (
+                    "provider",
+                    "default",
+                    "model",
+                    "base_url",
+                    "api_mode",
+                    "api_key",
+                ):
+                    section.pop(key, None)
+            else:
+                section.update({
+                    "registration_id": registration_id,
+                    "provider": provider,
+                    "default": model,
+                })
             save_config(config, preserve_keys={("model",)})
         elif kind == CODE:
             section = config.setdefault(selection_section(CODE), {})

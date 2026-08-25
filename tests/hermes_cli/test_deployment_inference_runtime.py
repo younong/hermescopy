@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+from hermes_cli import model_registrations
 from hermes_cli import runtime_provider as rp
+from hermes_cli.config import load_config, read_raw_config, save_config
 from hermes_cli.deployment_inference import DeploymentInferenceRouteDescriptor
 
 
@@ -35,6 +37,57 @@ def test_blank_owner_uses_deployment_relay(monkeypatch):
     monkeypatch.setattr(rp, "read_raw_config", lambda: {})
 
     resolved = rp.resolve_runtime_provider()
+
+    assert resolved == {
+        "provider": "custom:deployment",
+        "api_mode": "chat_completions",
+        "api_key": "deployment-inference-relay",
+        "source": "deployment-relay",
+        "selection_source": "deployment",
+        "policy_id": "policy-v1",
+        "model": "gpt-safe",
+        "base_url": "http://127.0.0.1:39123/v1",
+        "requested_provider": "custom:deployment",
+        "relay_provider": "custom:deployment",
+    }
+
+
+def test_admin_chat_activation_preserves_deployment_relay_startup(monkeypatch):
+    from tui_gateway import server
+
+    _deployment_env(monkeypatch)
+    monkeypatch.setattr(model_registrations, "_admin_media_descriptor", lambda: None)
+    config = load_config()
+    config["model"] = {
+        "provider": "custom:old",
+        "default": "old-model",
+        "base_url": "https://old.example/v1",
+        "api_mode": "responses",
+        "api_key": "old-secret",
+        "reasoning": {"effort": "high"},
+    }
+    save_config(config, preserve_keys={("model",)})
+    registration_id = model_registrations._admin_registration_id(
+        "chat", "custom:deployment", "gpt-safe"
+    )
+
+    model_registrations.activate_model_registration(registration_id)
+
+    assert read_raw_config()["model"] == {
+        "registration_id": registration_id,
+        "reasoning": {"effort": "high"},
+    }
+    assert rp._explicit_owner_model_selection() == {}
+    monkeypatch.setattr(server, "_cfg_cache", None)
+    monkeypatch.setattr(server, "_cfg_mtime", None)
+    monkeypatch.setattr(server, "_cfg_path", None)
+    model, provider = server._resolve_startup_runtime()
+    assert (model, provider) == ("gpt-safe", "custom:deployment")
+
+    resolved = server._resolve_runtime_with_fallback({
+        "requested": provider,
+        "target_model": model,
+    })
 
     assert resolved == {
         "provider": "custom:deployment",
