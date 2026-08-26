@@ -2,7 +2,7 @@
 
 This is the canonical instruction file for Codex CLI, Claude Code, and other
 coding agents working on the hermes-agent codebase. `CLAUDE.md` is a Claude Code
-entrypoint that points here; do not maintain a second copy of these rules.
+entrypoint that imports this file; do not maintain a second copy of these rules.
 
 **Never give up on the right solution.**
 
@@ -24,6 +24,23 @@ Two design constraints matter for almost every change:
 - Prefer `.venv` (`source .venv/bin/activate`), with `venv` as fallback.
 - Match surrounding code style and comments.
 - Before restricting behavior, read the original intent (`git log -p -S <symbol>`) and preserve the feature purpose.
+
+### Claude Code Subagent Concurrency
+
+- For Claude Code development in this repository, at most **2 `Agent`
+  subagents** may be active concurrently across a main session and its entire
+  descendant tree. Direct children and nested descendants share the same two
+  slots.
+- This is a concurrency limit, not a lifetime call budget. A subagent that
+  completes, fails, or is stopped releases its slot.
+- `.claude/settings.json` enforces ordinary direct and nested `Agent` starts via
+  `CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS`. Do not use Workflow, teams/teammates,
+  ultracode, `/subtask`, resume paths, or another orchestration route to evade
+  the two-subagent policy.
+- The native limit is scoped to one Claude Code session; independent sessions
+  do not share a repository-wide counter.
+- This policy concerns coding agents developing Hermes. It does not constrain
+  Hermes product-runtime delegation through `delegate_task` or `delegation.*`.
 
 ### Engineering Paths
 
