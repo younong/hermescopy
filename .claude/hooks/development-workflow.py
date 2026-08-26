@@ -328,9 +328,6 @@ def _verify_command(argv: list[str], environ: dict[str, str]) -> int:
         return 2
     cwd = Path.cwd().resolve()
     try:
-        plan = read_plan(session_id, environ)
-        if plan is None or plan.get("approved") is not True:
-            raise WorkflowError("the current session has no approved plan state")
         verify_worktree_owner(cwd, session_id)
     except WorkflowError as exc:
         print(str(exc), file=sys.stderr)

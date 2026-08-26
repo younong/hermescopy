@@ -233,12 +233,6 @@ def process(payload: dict[str, Any], environ: dict[str, str] | None = None) -> d
     session_id = str(payload.get("session_id") or "").strip()
     if not session_id:
         return _result("自动提交 PR 已跳过：Stop 事件缺少 session_id。")
-    try:
-        plan = workflow.read_plan(session_id, env)
-    except workflow.WorkflowError as exc:
-        return _result(f"自动提交 PR 已跳过：无法读取开发流程状态（{exc}）。")
-    if plan is None or plan.get("approved") is not True:
-        return _result("自动提交 PR 已跳过：本次会话没有已批准的开发计划。")
     cwd = _current_worktree(payload, env)
     if cwd is None:
         fallback = Path(str(payload.get("cwd") or env.get("CLAUDE_PROJECT_DIR") or ".")).resolve()

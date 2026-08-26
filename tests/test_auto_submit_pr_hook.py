@@ -89,12 +89,15 @@ def test_main_accepts_utf8_bom_payload(tmp_path, monkeypatch, capsys):
     assert "缺少 session_id" in output["systemMessage"]
 
 
-def test_unapproved_session_is_passive(tmp_path):
-    result = module.process(
-        {"session_id": "one", "cwd": str(tmp_path)}, _env(tmp_path)
-    )
-    assert "没有已批准" in result["systemMessage"]
-    assert "decision" not in result
+def test_missing_plan_does_not_block_worktree_checks(tmp_path):
+    session_id = "task-session"
+    _origin, repo, _worktree = _repositories(tmp_path, session_id)
+    env = _env(tmp_path)
+
+    result = module.process({"session_id": session_id, "cwd": str(repo)}, env)
+
+    assert result["decision"] == "block"
+    assert "primary checkout" in result["reason"]
 
 
 def test_approved_session_in_primary_checkout_is_blocked_with_bound(tmp_path):
@@ -164,7 +167,6 @@ def test_verified_stop_commits_pushes_creates_pr_and_is_idempotent(tmp_path, mon
     session_id = "task-session"
     origin, _repo, worktree = _repositories(tmp_path, session_id)
     env = _env(tmp_path)
-    _approve(session_id, worktree, env)
     (worktree / "tracked.txt").write_text("implemented\n")
     module.workflow.write_verification(worktree, session_id, ["pytest"], env)
     gh_calls: list[tuple[str, ...]] = []
