@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -9,6 +10,7 @@ import sftpProtocol from "ssh2/lib/protocol/SFTP.js";
 import {
   createKnownHostsVerifier,
   quoteRemoteArg,
+  remoteCommand,
   runPasswordSsh,
   uploadPasswordFile,
 } from "../../deploy/ssh-transport.mjs";
@@ -118,6 +120,21 @@ function closeServer(server) {
 
 test("remote argument quoting preserves apostrophes", () => {
   assert.equal(quoteRemoteArg("a'b"), `'a'"'"'b'`);
+});
+
+test("remote command string survives the sshd argv re-join", (t) => {
+  // sshd joins command argv with spaces before the remote shell parses it, so
+  // the string built by remoteCommand() must still evaluate to the original
+  // argv (#339). Run it through a real shell the way the remote host would.
+  const script = "printf 'HERMES_DEPLOY_CONNECTION_OK\\n'; uname -s; test -x /bin/bash";
+  const joined = remoteCommand("bash", ["-lc", script]);
+  const result = spawnSync("sh", ["-c", joined], { encoding: "utf8" });
+  if (result.error) {
+    t.skip(`no POSIX shell available: ${result.error.message}`);
+    return;
+  }
+  assert.equal(result.status, 0, result.stderr);
+  assert.ok(result.stdout.includes("HERMES_DEPLOY_CONNECTION_OK"), result.stdout);
 });
 
 test("known-host verifier accepts only the pinned key", () => {
