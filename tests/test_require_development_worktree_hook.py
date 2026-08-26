@@ -588,7 +588,66 @@ def test_lifecycle_event_rejects_another_tasks_worktree(tmp_path):
     assert "belongs to task first-session" in output["stopReason"]
 
 
-def test_bash_in_another_tasks_worktree_is_blocked(tmp_path):
+@pytest.mark.parametrize(
+    ("tool_name", "tool_input"),
+    [
+        ("Agent", {"prompt": "implement"}),
+        ("Bash", {"command": "git status"}),
+        ("Monitor", {"command": "git status"}),
+        ("PowerShell", {"command": "git status"}),
+        ("Workflow", {"script": "return null"}),
+    ],
+)
+def test_development_tools_in_primary_checkout_are_blocked(
+    tmp_path, tool_name, tool_input
+):
+    repo = _new_repo(tmp_path)
+
+    reason = _denial_reason(
+        _run_hook(
+            repo,
+            repo,
+            raw_payload=_payload(
+                "PreToolUse",
+                repo,
+                session_id="task-session",
+                tool_name=tool_name,
+                tool_input=tool_input,
+                cwd=repo,
+            ),
+        )
+    )
+
+    assert "primary checkout" in reason
+    assert "EnterWorktree" in reason
+
+
+@pytest.mark.parametrize("tool_name", ["Agent", "Bash", "Monitor", "PowerShell", "Workflow"])
+def test_development_tools_in_owned_worktree_are_allowed(tmp_path, tool_name):
+    repo = _new_repo(tmp_path)
+    worktree = _add_worktree(repo, "active-task")
+    _write_owner(worktree, "task-session")
+
+    result = _run_hook(
+        repo,
+        worktree,
+        raw_payload=_payload(
+            "PreToolUse",
+            repo,
+            session_id="task-session",
+            tool_name=tool_name,
+            tool_input={"command": "git status"},
+            cwd=worktree,
+        ),
+    )
+
+    assert result.stdout == ""
+
+
+@pytest.mark.parametrize("tool_name", ["Agent", "Bash", "Monitor", "PowerShell", "Workflow"])
+def test_development_tools_in_another_tasks_worktree_are_blocked(
+    tmp_path, tool_name
+):
     repo = _new_repo(tmp_path)
     worktree = _add_worktree(repo, "first-task")
     _write_owner(worktree, "first-session")
@@ -601,7 +660,7 @@ def test_bash_in_another_tasks_worktree_is_blocked(tmp_path):
                 "PreToolUse",
                 repo,
                 session_id="second-session",
-                tool_name="Bash",
+                tool_name=tool_name,
                 tool_input={"command": "git status"},
                 cwd=worktree,
             ),
@@ -700,7 +759,7 @@ def test_settings_enable_ownership_guard_across_lifecycle_events():
         entry
         for entry in settings["hooks"]["PreToolUse"]
         if entry.get("matcher")
-        == "EnterWorktree|Write|Edit|NotebookEdit|Bash|Agent|Workflow"
+        == "EnterWorktree|Write|Edit|NotebookEdit|Bash|PowerShell|Monitor|Agent|Workflow"
     ]
     assert len(pretool_hooks) == 1
     require_hooks = [

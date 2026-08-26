@@ -4,6 +4,7 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import sys
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -56,7 +57,7 @@ def _run_hook(
     env = os.environ.copy()
     env["CLAUDE_PROJECT_DIR"] = str(REPO_ROOT)
     return subprocess.run(
-        ["python3", str(HOOK_PATH)],
+        [sys.executable, str(HOOK_PATH)],
         input=json.dumps(payload),
         env=env,
         capture_output=True,
@@ -230,4 +231,7 @@ def test_settings_apply_hook_to_agents_and_workflows():
     ]
 
     assert len(review_hooks) == 1
-    assert "block-review-agents.py" in review_hooks[0]["hooks"][0]["command"]
+    hook = review_hooks[0]["hooks"][0]
+    assert hook["command"] == "python"
+    assert hook["args"][0] == "-c"
+    assert "block-review-agents.py" in " ".join(hook["args"])
