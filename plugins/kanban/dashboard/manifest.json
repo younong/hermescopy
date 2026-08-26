@@ -21,8 +21,7 @@
         "label": "Kanban",
         "description": "Multi-agent collaboration board",
         "icon": "SquareKanban",
-        "position": "after:files",
-        "admin_only": true
+        "position": "after:files"
       }
     ]
   }

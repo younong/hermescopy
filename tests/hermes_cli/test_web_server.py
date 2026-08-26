@@ -5281,6 +5281,52 @@ def test_authenticated_member_plugin_api_is_denied(monkeypatch):
         refresh_token="refresh",
     )
     request = SimpleNamespace(
+        url=SimpleNamespace(path="/api/plugins/secret-board/board"),
+        method="GET",
+        state=SimpleNamespace(session=session),
+        headers={},
+        app=SimpleNamespace(state=SimpleNamespace(auth_required=True)),
+    )
+    monkeypatch.setattr(web_server, "_local_dashboard_account_role", lambda _request: "member")
+    # Plugin declares an admin_only workspace → its API stays admin-only.
+    monkeypatch.setattr(
+        web_server,
+        "_get_dashboard_plugins",
+        lambda: [
+            {
+                "name": "secret-board",
+                "chat": {
+                    "workspaces": [
+                        {"id": "secret", "path": "/chat/secret", "admin_only": True},
+                    ]
+                },
+            }
+        ],
+    )
+
+    response = web_server._authenticated_owner_control_plane_gate_response(request)
+
+    assert response is not None
+    assert response.status_code == 403
+    assert response.body == b'{"detail":"Administrator access required"}'
+
+
+def test_authenticated_member_non_admin_only_plugin_api_passes(monkeypatch):
+    from types import SimpleNamespace
+    from hermes_cli.dashboard_auth.base import Session
+    from hermes_cli import web_server
+
+    session = Session(
+        user_id="member-1",
+        email="member@example.com",
+        display_name="Member",
+        org_id="org-1",
+        provider="basic",
+        expires_at=9999999999,
+        access_token="access",
+        refresh_token="refresh",
+    )
+    request = SimpleNamespace(
         url=SimpleNamespace(path="/api/plugins/kanban/board"),
         method="GET",
         state=SimpleNamespace(session=session),
@@ -5288,6 +5334,50 @@ def test_authenticated_member_plugin_api_is_denied(monkeypatch):
         app=SimpleNamespace(state=SimpleNamespace(auth_required=True)),
     )
     monkeypatch.setattr(web_server, "_local_dashboard_account_role", lambda _request: "member")
+    # Kanban after #327 has no admin_only workspace → gate must not 403 members.
+    monkeypatch.setattr(
+        web_server,
+        "_get_dashboard_plugins",
+        lambda: [
+            {
+                "name": "kanban",
+                "chat": {
+                    "workspaces": [
+                        {"id": "kanban", "path": "/chat/kanban", "admin_only": False},
+                    ]
+                },
+            }
+        ],
+    )
+
+    assert web_server._authenticated_owner_control_plane_gate_response(request) is None
+
+
+def test_authenticated_member_unknown_plugin_api_is_denied(monkeypatch):
+    """Unknown plugin names default to admin-only (fail-closed)."""
+    from types import SimpleNamespace
+    from hermes_cli.dashboard_auth.base import Session
+    from hermes_cli import web_server
+
+    session = Session(
+        user_id="member-1",
+        email="member@example.com",
+        display_name="Member",
+        org_id="org-1",
+        provider="basic",
+        expires_at=9999999999,
+        access_token="access",
+        refresh_token="refresh",
+    )
+    request = SimpleNamespace(
+        url=SimpleNamespace(path="/api/plugins/ghost-plugin/board"),
+        method="GET",
+        state=SimpleNamespace(session=session),
+        headers={},
+        app=SimpleNamespace(state=SimpleNamespace(auth_required=True)),
+    )
+    monkeypatch.setattr(web_server, "_local_dashboard_account_role", lambda _request: "member")
+    monkeypatch.setattr(web_server, "_get_dashboard_plugins", lambda: [])
 
     response = web_server._authenticated_owner_control_plane_gate_response(request)
 
