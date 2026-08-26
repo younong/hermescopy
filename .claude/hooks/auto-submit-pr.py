@@ -51,6 +51,14 @@ def _block(message: str) -> dict[str, Any]:
     }
 
 
+def _final_result(message: str) -> dict[str, Any]:
+    """Make the completed PR result available before the model finally stops."""
+    return _block(
+        f"{message}\n\n"
+        "请在最终回复中准确报告这个 PR 结果，不要声称 PR 尚未创建或更新。"
+    )
+
+
 def _run(command: list[str], cwd: Path) -> tuple[bool, str, str]:
     try:
         completed = subprocess.run(
@@ -317,7 +325,7 @@ def process(payload: dict[str, Any], environ: dict[str, str] | None = None) -> d
             url = next((line.strip() for line in reversed(output.splitlines()) if line.strip()), "")
             message = f"自动提交 PR 完成：{url or 'PR 已创建。'}"
         _mark_done(done_path, message)
-        return _result(message)
+        return _final_result(message)
     finally:
         _release_lock(lock_path)
 

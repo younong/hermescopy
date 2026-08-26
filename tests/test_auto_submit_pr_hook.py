@@ -80,6 +80,15 @@ def test_result_does_not_rewake_model():
     json.dumps(result, ensure_ascii=False)
 
 
+def test_final_result_rewakes_model_with_exact_pr_outcome():
+    result = module._final_result("自动提交 PR 完成：https://example.invalid/pr/1。")
+
+    assert result["decision"] == "block"
+    assert "https://example.invalid/pr/1" in result["reason"]
+    assert "准确报告" in result["reason"]
+    assert "不要声称 PR 尚未创建或更新" in result["reason"]
+
+
 def test_main_accepts_utf8_bom_payload(tmp_path, monkeypatch, capsys):
     monkeypatch.setattr(sys, "stdin", __import__("io").StringIO("﻿{}"))
 
@@ -187,7 +196,8 @@ def test_verified_stop_commits_pushes_creates_pr_and_is_idempotent(tmp_path, mon
     result = module.process({"session_id": session_id, "cwd": str(worktree)}, env)
     again = module.process({"session_id": session_id, "cwd": str(worktree)}, env)
 
-    assert "https://example.invalid/pr/1" in result["systemMessage"]
+    assert result["decision"] == "block"
+    assert "https://example.invalid/pr/1" in result["reason"]
     branch_head = _git(origin, "rev-parse", "refs/heads/worktree-task")
     assert branch_head == _git(worktree, "rev-parse", "HEAD")
     assert _git(worktree, "show", "HEAD:tracked.txt") == "implemented"
@@ -221,7 +231,8 @@ def test_open_pr_is_updated_but_terminal_pr_is_not_pushed(tmp_path, monkeypatch)
         result = module.process({"session_id": session_id, "cwd": str(worktree)}, env)
 
         if state == "OPEN":
-            assert "已更新现有 PR" in result["systemMessage"]
+            assert result["decision"] == "block"
+            assert "已更新现有 PR" in result["reason"]
             assert _git(origin, "rev-parse", "refs/heads/worktree-task") != before
         else:
             assert state in result["systemMessage"]
