@@ -1,11 +1,22 @@
 #!/usr/bin/env node
 
-import { spawnSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { homedir, tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+
+import {
+  formatCommand,
+  moveDirectory,
+  requireFile,
+  requireLocalCommand,
+  resolvePythonCommand,
+  runLocal,
+  runLocalText,
+} from "./local-platform.mjs";
+import { createReleaseArchiveFile, extractSourceArchive } from "./archive.mjs";
+import { runPasswordSsh, uploadPasswordFile } from "./ssh-transport.mjs";
 
 const DEFAULT_HOST = "106.15.186.104";
 const DEFAULT_USER = "root";
@@ -62,13 +73,15 @@ Options:
   --initial-continuity-transition
                            Allow the one-time upgrade from a release that cannot yet
                            emit planned-restart 1012 or participate in continuity smoke.
+  --check-connection       Verify SSH host key, authentication, and remote Bash only.
+                           Does not inspect Git, build, upload, or change remote state.
   --dry-run                Print commands without changing local or remote state.
   -h, --help               Show this help.
 
 Authentication:
-  Prefer SSH keys. For a temporary password-based deploy, set
-  HERMES_DEPLOY_PASSWORD in your local environment and install sshpass.
-  The password is never printed by this tool.
+  Prefer SSH keys; the key path uses your system OpenSSH client. For temporary
+  password authentication, set HERMES_DEPLOY_PASSWORD. The built-in SSH/SFTP
+  transport supports native Windows and never prints the password.
 
 Environment:
   HERMES_DEPLOY_NPM_REGISTRY  npm registry used while building release artifacts.
@@ -160,6 +173,9 @@ function parseArgs(argv) {
       case "--initial-continuity-transition":
         args.initialContinuityTransition = true;
         break;
+      case "--check-connection":
+        args.checkConnection = true;
+        break;
       case "--dry-run":
         args.dryRun = true;
         break;
@@ -173,11 +189,14 @@ function parseArgs(argv) {
   }
 
   const sourceCount = [args.tag, args.createTag].filter(Boolean).length;
-  if (!args.help && sourceCount !== 1) {
+  if (!args.help && !args.checkConnection && sourceCount !== 1) {
     throw new Error("Pass exactly one of --tag or --create-tag.");
   }
   if (!args.help && args.allowNonMain && !args.createTag) {
     throw new Error("--allow-non-main is only valid with --create-tag.");
+  }
+  if (args.checkConnection && sourceCount !== 0) {
+    throw new Error("--check-connection cannot be combined with --tag or --create-tag.");
   }
 
   let publicUrl;
@@ -214,66 +233,16 @@ function parsePositiveInteger(value, name) {
   return parsed;
 }
 
-function formatCommand(command, commandArgs) {
-  return [command, ...commandArgs.map((arg) => (/[\s'"$`\\]/.test(arg) ? JSON.stringify(arg) : arg))].join(" ");
-}
-
 function run(command, commandArgs, options = {}) {
-  const { dryRun = false, input, env, quiet = false, cwd = repoRoot } = options;
-  if (dryRun) {
-    console.log(`[dry-run] ${formatCommand(command, commandArgs)}`);
-    return { stdout: "", stderr: "", status: 0 };
-  }
-
-  if (!quiet) {
-    console.log(`$ ${formatCommand(command, commandArgs)}`);
-  }
-
-  const result = spawnSync(command, commandArgs, {
-    cwd,
-    encoding: "utf8",
-    input,
-    stdio: input === undefined ? "pipe" : ["pipe", "pipe", "pipe"],
-    env: env ? { ...process.env, ...env } : process.env,
-    maxBuffer: 64 * 1024 * 1024,
-  });
-
-  if (result.error) {
-    throw result.error;
-  }
-  const stdout = result.stdout?.trim() ?? "";
-  const stderr = result.stderr?.trim() ?? "";
-  if (result.status !== 0) {
-    const error = new Error(`${formatCommand(command, commandArgs)} failed${stderr ? `:\n${stderr}` : stdout ? `:\n${stdout}` : ""}`);
-    error.commandResult = result;
-    throw error;
-  }
-  if (!quiet) {
-    if (stdout) {
-      console.log(stdout);
-    }
-    if (stderr) {
-      console.error(stderr);
-    }
-  }
-  return result;
+  return runLocal(command, commandArgs, { cwd: repoRoot, ...options });
 }
 
 function runText(command, commandArgs, options = {}) {
-  return run(command, commandArgs, { ...options, quiet: true }).stdout.trim();
+  return runLocalText(command, commandArgs, { cwd: repoRoot, ...options });
 }
 
 function requireBinary(name) {
-  const result = spawnSync(name, [], {
-    encoding: "utf8",
-    windowsHide: true,
-  });
-  if (result.error?.code === "ENOENT") {
-    throw new Error(`Required command not found: ${name}`);
-  }
-  if (result.error) {
-    throw new Error(`Required command could not be executed: ${name}: ${result.error.message}`);
-  }
+  requireLocalCommand(name);
 }
 
 function validateTag(tag) {
@@ -313,11 +282,15 @@ function assertReleaseBranch(branch, { allowNonMain }) {
 }
 
 function tagExists(tag, { cwd = repoRoot } = {}) {
-  const result = spawnSync("git", ["rev-parse", "--quiet", "--verify", `refs/tags/${tag}`], {
-    cwd,
-    encoding: "utf8",
-  });
-  return result.status === 0;
+  try {
+    run("git", ["rev-parse", "--quiet", "--verify", `refs/tags/${tag}`], {
+      cwd,
+      quiet: true,
+    });
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 function remoteRefs(refs, { cwd = repoRoot } = {}) {
@@ -380,17 +353,18 @@ function verifyPublishedEmergencyRelease(tag, branch, preparedCommit, { cwd = re
 }
 
 function isAncestor(ancestor, descendant, { cwd = repoRoot } = {}) {
-  const result = spawnSync("git", ["merge-base", "--is-ancestor", ancestor, descendant], {
-    cwd,
-    encoding: "utf8",
-  });
-  if (result.status === 0) {
+  try {
+    run("git", ["merge-base", "--is-ancestor", ancestor, descendant], { cwd, quiet: true });
     return true;
+  } catch (error) {
+    if (error.commandResult?.status === 1) {
+      return false;
+    }
+    throw new Error(
+      error.commandResult?.stderr || "Unable to compare the local and remote main histories.",
+      { cause: error },
+    );
   }
-  if (result.status === 1) {
-    return false;
-  }
-  throw new Error(result.stderr?.trim() || "Unable to compare the local and remote main histories.");
 }
 
 function assertMainSynchronized(localMain, remoteMain, { cwd = repoRoot } = {}) {
@@ -592,34 +566,28 @@ export function prepareCreateTag(tag, { allowNonMain = false, dryRun = false, cw
     : prepareEmergencyNonMainCreateTag(tag, branch, { dryRun, cwd });
 }
 
-export function createReleaseArchive(buildDir, archivePath, { dryRun = false } = {}) {
-  const archiveDir = path.dirname(archivePath);
-  const archiveName = path.basename(archivePath);
-  run(
-    "tar",
-    [
-      "-czf",
-      archiveName,
-      "--no-xattrs",
-      "--exclude=._*",
-      "--exclude=*/._*",
-      "--exclude=./node_modules",
-      "--exclude=./web/node_modules",
-      "--exclude=./deploy/powerpoint-runtime/runtime-modules/.package-lock.json",
-      "--exclude=./tests",
-      "--exclude=./website",
-      "--exclude=./.github",
-      "--exclude=./docs",
-      "-C",
-      buildDir,
-      ".",
-    ],
-    { dryRun, cwd: archiveDir, env: { COPYFILE_DISABLE: "1" } },
-  );
-  if (!dryRun) {
-    const archiveBytes = statSync(archivePath).size;
-    console.log(`Release archive: ${archiveBytes} bytes (${(archiveBytes / 1024 / 1024).toFixed(2)} MiB)`);
+export function createReleaseArchive(
+  buildDir,
+  archivePath,
+  { dryRun = false, gitModes = new Map() } = {},
+) {
+  if (dryRun) {
+    console.log(`[dry-run] create release archive ${archivePath}`);
+    return;
   }
+  const archiveBytes = createReleaseArchiveFile(buildDir, archivePath, { gitModes });
+  console.log(`Release archive: ${archiveBytes} bytes (${(archiveBytes / 1024 / 1024).toFixed(2)} MiB)`);
+}
+
+function gitTreeModes(sourceCommit) {
+  const output = runText("git", ["ls-tree", "-rz", "--full-tree", sourceCommit]);
+  const modes = new Map();
+  for (const record of output.split("\0")) {
+    if (!record) continue;
+    const match = record.match(/^(\d+)\s+\w+\s+[0-9a-f]+\t(.+)$/s);
+    if (match) modes.set(match[2].replaceAll("\\", "/"), match[1]);
+  }
+  return modes;
 }
 
 export function releaseManifest({ releaseId, sourceCommit, sourceTag }) {
@@ -648,8 +616,9 @@ export function createArchive(args, { dryRun }) {
   }
   const archiveEnv = { COPYFILE_DISABLE: "1" };
   run("git", ["archive", "--format=tar", "--output", sourceArchive, sourceCommit], { dryRun, env: archiveEnv });
-  run("tar", ["-xf", sourceArchive, "-C", buildDir], { dryRun, env: archiveEnv });
+  const gitModes = dryRun ? new Map() : gitTreeModes(sourceCommit);
   if (!dryRun) {
+    extractSourceArchive(sourceArchive, buildDir);
     writeFileSync(
       path.join(buildDir, ".hermes-release.json"),
       `${JSON.stringify(releaseManifest({ releaseId, sourceCommit, sourceTag }), null, 2)}\n`,
@@ -658,15 +627,14 @@ export function createArchive(args, { dryRun }) {
   }
 
   buildArtifact(buildDir, { dryRun });
-  run(
-    "mv",
-    [
-      path.join(buildDir, "deploy/powerpoint-runtime/node_modules"),
-      path.join(buildDir, "deploy/powerpoint-runtime/runtime-modules"),
-    ],
-    { dryRun },
-  );
-  createReleaseArchive(buildDir, archivePath, { dryRun });
+  const runtimeModulesSource = path.join(buildDir, "deploy/powerpoint-runtime/node_modules");
+  const runtimeModulesTarget = path.join(buildDir, "deploy/powerpoint-runtime/runtime-modules");
+  if (dryRun) {
+    console.log(`[dry-run] move ${runtimeModulesSource} ${runtimeModulesTarget}`);
+  } else {
+    moveDirectory(runtimeModulesSource, runtimeModulesTarget);
+  }
+  createReleaseArchive(buildDir, archivePath, { dryRun, gitModes });
   return { tmp, archivePath };
 }
 
@@ -696,11 +664,24 @@ function buildArtifact(buildDir, { dryRun }) {
     ["ci", "--omit=dev", "--ignore-scripts", "--no-audit"],
     { dryRun, cwd: path.join(buildDir, "deploy/powerpoint-runtime") },
   );
-  run("test", ["-f", path.join(buildDir, "hermes_cli/web_dist/index.html")], { dryRun, cwd: buildDir });
+  const webEntry = path.join(buildDir, "hermes_cli/web_dist/index.html");
+  if (dryRun) {
+    console.log(`[dry-run] verify web build ${webEntry}`);
+  } else {
+    requireFile(webEntry, "Web build entry point");
+  }
 }
 
 function sshBaseArgs(args) {
-  const base = ["-p", args.port, "-o", "BatchMode=no", ...SSH_CONNECTION_ARGS];
+  const base = [
+    "-p",
+    args.port,
+    "-o",
+    "BatchMode=yes",
+    "-o",
+    "PreferredAuthentications=publickey",
+    ...SSH_CONNECTION_ARGS,
+  ];
   if (args.identityFile) {
     base.push("-i", args.identityFile);
   }
@@ -708,57 +689,51 @@ function sshBaseArgs(args) {
 }
 
 function scpBaseArgs(args) {
-  const base = ["-P", args.port, "-o", "BatchMode=no", ...SSH_CONNECTION_ARGS];
+  const base = [
+    "-P",
+    args.port,
+    "-o",
+    "BatchMode=yes",
+    "-o",
+    "PreferredAuthentications=publickey",
+    ...SSH_CONNECTION_ARGS,
+  ];
   if (args.identityFile) {
     base.push("-i", args.identityFile);
   }
   return base;
 }
 
-function withSshpass(command, commandArgs, { dryRun }) {
-  if (!process.env.HERMES_DEPLOY_PASSWORD) {
-    return { command, commandArgs, env: undefined };
-  }
-  if (!dryRun) {
-    requireBinary("sshpass");
-  }
-  return {
-    command: "sshpass",
-    commandArgs: ["-e", command, ...commandArgs],
-    env: { SSHPASS: process.env.HERMES_DEPLOY_PASSWORD },
-  };
-}
-
 function remoteTarget(args) {
   return `${args.user}@${args.host}`;
 }
 
-function runSsh(args, remoteArgs, options = {}) {
+async function runSsh(args, remoteArgs, options = {}) {
   if (args.dryRun && options.input) {
     console.log(`[dry-run] remote script:\n${options.input}`);
   }
-  const sshArgs = [...sshBaseArgs(args), remoteTarget(args), ...remoteArgs];
-  const wrapped = withSshpass("ssh", sshArgs, { dryRun: args.dryRun });
-  if (args.dryRun && process.env.HERMES_DEPLOY_PASSWORD) {
-    console.log("[dry-run] HERMES_DEPLOY_PASSWORD is set; would run SSH through sshpass -e (password hidden).");
+  if (process.env.HERMES_DEPLOY_PASSWORD) {
+    if (args.dryRun) {
+      console.log("[dry-run] password SSH transport (password hidden)");
+      console.log(`[dry-run] remote ${formatCommand(remoteArgs[0], remoteArgs.slice(1))}`);
+      return { stdout: "", stderr: "", status: 0 };
+    }
+    return runPasswordSsh(args, remoteArgs, { input: options.input });
   }
-  return run(wrapped.command, wrapped.commandArgs, {
-    dryRun: args.dryRun,
-    input: options.input,
-    env: wrapped.env,
-  });
+  const sshArgs = [...sshBaseArgs(args), remoteTarget(args), ...remoteArgs];
+  return run("ssh", sshArgs, { dryRun: args.dryRun, input: options.input });
 }
 
-function runScp(args, localPath, remotePath) {
-  const scpArgs = [...scpBaseArgs(args), localPath, `${remoteTarget(args)}:${remotePath}`];
-  const wrapped = withSshpass("scp", scpArgs, { dryRun: args.dryRun });
-  if (args.dryRun && process.env.HERMES_DEPLOY_PASSWORD) {
-    console.log("[dry-run] HERMES_DEPLOY_PASSWORD is set; would run SCP through sshpass -e (password hidden).");
+async function runScp(args, localPath, remotePath) {
+  if (process.env.HERMES_DEPLOY_PASSWORD) {
+    if (args.dryRun) {
+      console.log(`[dry-run] password SFTP upload ${localPath} ${remotePath} (password hidden)`);
+      return { stdout: "", stderr: "", status: 0 };
+    }
+    return uploadPasswordFile(args, localPath, remotePath);
   }
-  return run(wrapped.command, wrapped.commandArgs, {
-    dryRun: args.dryRun,
-    env: wrapped.env,
-  });
+  const scpArgs = [...scpBaseArgs(args), localPath, `${remoteTarget(args)}:${remotePath}`];
+  return run("scp", scpArgs, { dryRun: args.dryRun });
 }
 
 function remoteDeployScript() {
@@ -1826,13 +1801,13 @@ echo "Runtime retention: $runtime_pruning_status"
 `;
 }
 
-function deployArchive(args, archivePath) {
+async function deployArchive(args, archivePath) {
   const remoteRoot = args.remoteRoot.replace(/\/+$/, "");
   const stagingId = args.dryRun ? "dry-run" : randomUUID();
   const remoteArchive = `${remoteRoot}/tmp/hermes-${args.releaseId}-${stagingId}.tar.gz`;
 
-  runSsh(args, ["mkdir", "-p", `${remoteRoot}/tmp`, `${remoteRoot}/releases`, `${remoteRoot}/shared/.hermes`]);
-  runScp(args, archivePath, remoteArchive);
+  await runSsh(args, ["mkdir", "-p", `${remoteRoot}/tmp`, `${remoteRoot}/releases`, `${remoteRoot}/shared/.hermes`]);
+  await runScp(args, archivePath, remoteArchive);
   return runSsh(
     args,
     [
@@ -1876,7 +1851,9 @@ function parseSmokeResult(output, kind) {
 }
 
 function runContinuityConversationSmoke(args, phase) {
+  const python = args.pythonCommand || resolvePythonCommand();
   const commandArgs = [
+    ...python.argsPrefix,
     path.join(repoRoot, "scripts", "smoke_dashboard_conversation.py"),
     "--url",
     args.dashboardPublicUrl,
@@ -1888,7 +1865,7 @@ function runContinuityConversationSmoke(args, phase) {
     phase,
   ];
   try {
-    const commandResult = run("python3", commandArgs, { dryRun: args.dryRun });
+    const commandResult = run(python.command, commandArgs, { dryRun: args.dryRun });
     return {
       status: args.dryRun ? "planned" : "passed",
       result: args.dryRun
@@ -1905,7 +1882,9 @@ function runContinuityConversationSmoke(args, phase) {
 }
 
 function runPublicConversationSmoke(args) {
+  const python = args.pythonCommand || resolvePythonCommand();
   const commandArgs = [
+    ...python.argsPrefix,
     path.join(repoRoot, "scripts", "smoke_dashboard_conversation.py"),
     "--url",
     args.dashboardPublicUrl,
@@ -1913,7 +1892,7 @@ function runPublicConversationSmoke(args) {
     "180",
   ];
   try {
-    const commandResult = run("python3", commandArgs, { dryRun: args.dryRun });
+    const commandResult = run(python.command, commandArgs, { dryRun: args.dryRun });
     return {
       status: args.dryRun ? "planned" : "passed",
       result: args.dryRun
@@ -2048,18 +2027,36 @@ function printSummary(args, result) {
   console.log("Rollback example: npm run deploy -- --tag <previous-tag>");
 }
 
-function main() {
-  const args = parseArgs(process.argv.slice(2));
+export async function main({ argv = process.argv.slice(2), cwd = repoRoot } = {}) {
+  const args = parseArgs(argv);
   if (args.help) {
     usage();
     return;
   }
 
+  if (args.checkConnection) {
+    if (!process.env.HERMES_DEPLOY_PASSWORD) {
+      requireBinary("ssh");
+    }
+    const result = await runSsh(args, [
+      "bash",
+      "-lc",
+      "printf 'HERMES_DEPLOY_CONNECTION_OK\\n'; uname -s; test -x /bin/bash",
+    ]);
+    if (!args.dryRun && !result.stdout.includes("HERMES_DEPLOY_CONNECTION_OK")) {
+      throw new Error("SSH connection check completed without the expected marker.");
+    }
+    console.log(`Connection check passed: ${args.user}@${args.host}:${args.port}`);
+    return;
+  }
+
   requireBinary("git");
-  if (!args.dryRun) {
+  requireBinary("npm");
+  if (!args.dryRun && !process.env.HERMES_DEPLOY_PASSWORD) {
     requireBinary("ssh");
     requireBinary("scp");
   }
+  args.pythonCommand = resolvePythonCommand();
 
   if (args.force) {
     throw new Error("--force is no longer supported for immutable releases.");
@@ -2069,6 +2066,7 @@ function main() {
     const prepared = prepareCreateTag(args.createTag, {
       allowNonMain: args.allowNonMain,
       dryRun: args.dryRun,
+      cwd,
     });
     args.sourceTag = args.createTag;
     args.sourceCommit = prepared.sourceCommit;
@@ -2104,7 +2102,7 @@ function main() {
       throw new Error("cross-release continuity preparation failed before remote deployment");
     }
     try {
-      const remoteResult = deployArchive(args, archivePath);
+      const remoteResult = await deployArchive(args, archivePath);
       authorityConcurrencyResult = args.dryRun
         ? null
         : parseSmokeResult(remoteResult.stdout, "hermes.authority-concurrency-smoke");
@@ -2194,10 +2192,8 @@ function main() {
 }
 
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
-  try {
-    main();
-  } catch (error) {
+  main().catch((error) => {
     console.error(`deploy failed: ${error.message}`);
-    process.exit(1);
-  }
+    process.exitCode = 1;
+  });
 }

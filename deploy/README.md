@@ -138,22 +138,41 @@ npm run deploy -- --tag v2026.7.4
 npm run deploy -- --tag v2026.7.3
 ```
 
-## SSH 认证
+## SSH 认证与本机平台
 
-推荐使用 SSH key：
+发布发起端支持原生 Windows、macOS 和 Linux；远端仍必须是当前支持的 Linux/systemd 主机。Key 模式调用本机 OpenSSH `ssh`/`scp`，可使用 agent 或显式私钥：
 
 ```bash
 npm run deploy -- --tag v2026.7.4 --identity-file ~/.ssh/hermes-alicloud
 ```
 
-临时密码登录只允许使用本机环境变量，不要写入仓库：
+首次连接前必须通过独立可信渠道核对服务器 host fingerprint，并把确认过的 key 写入本机 OpenSSH `known_hosts`。可以先执行只读连接检查；它只验证 host key、认证和远端 Bash，不检查 Git、不构建、不上传，也不创建远端目录：
+
+```bash
+npm run deploy -- --check-connection
+```
+
+临时密码登录由内置 SSH/SFTP transport 提供，不需要 `sshpass`。密码只允许放在当前本机进程环境中，不要写入仓库、命令参数或文件。
+
+Bash：
 
 ```bash
 export HERMES_DEPLOY_PASSWORD='***'
-npm run deploy -- --tag v2026.7.4
+npm run deploy -- --check-connection
+npm run deploy -- --tag v2026.7.4 --dry-run
+unset HERMES_DEPLOY_PASSWORD
 ```
 
-如果使用密码自动登录，本机需要安装 `sshpass`。密码不会被脚本打印。
+PowerShell：
+
+```powershell
+$env:HERMES_DEPLOY_PASSWORD = '***'
+npm run deploy -- --check-connection
+npm run deploy -- --tag v2026.7.4 --dry-run
+Remove-Item Env:HERMES_DEPLOY_PASSWORD
+```
+
+推荐顺序是：在获得连接授权后运行 `--check-connection`，再运行目标发布的 `--dry-run`，确认结果并获得正式发布批准后，才执行非 dry-run 发布。
 
 ## APIYI 图像模型环境变量
 

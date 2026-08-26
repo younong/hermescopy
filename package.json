@@ -27,7 +27,10 @@
   "homepage": "https://github.com/NousResearch/Hermes-Agent#readme",
   "dependencies": {
     "@streamdown/math": "^1.0.2",
-    "agent-browser": "^0.26.0"
+    "agent-browser": "^0.26.0",
+    "cross-spawn": "^7.0.6",
+    "ssh2": "^1.17.0",
+    "tar": "^7.5.22"
   },
   "overrides": {
     "lodash": "4.18.1",
