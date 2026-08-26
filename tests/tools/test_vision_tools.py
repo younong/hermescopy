@@ -193,6 +193,25 @@ class TestHandleVisionAnalyze:
             result.close()
 
     @pytest.mark.asyncio
+    async def test_forwards_main_runtime(self):
+        runtime = {"provider": "custom:codex", "model": "gpt-5.6-sol"}
+        with (
+            patch(
+                "tools.vision_tools.vision_analyze_tool", new_callable=AsyncMock
+            ) as mock_tool,
+            patch(
+                "tools.vision_tools._should_use_native_vision_fast_path",
+                return_value=False,
+            ),
+        ):
+            mock_tool.return_value = json.dumps({"result": "ok"})
+            await _handle_vision_analyze(
+                {"image_url": "https://example.com/img.png", "question": "describe"},
+                main_runtime=runtime,
+            )
+        assert mock_tool.await_args.kwargs["main_runtime"] == runtime
+
+    @pytest.mark.asyncio
     async def test_prompt_contains_question(self):
         """The full prompt should incorporate the user's question."""
         with (

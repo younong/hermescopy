@@ -60,6 +60,21 @@ class TestSessionIdForwarding:
         assert "session_id" in captured
         assert captured["session_id"] is None
 
+    def test_main_runtime_is_forwarded(self):
+        """The active session runtime reaches registry-dispatched tools."""
+        captured = {}
+        runtime = {"provider": "custom:codex", "model": "gpt-5.6-sol"}
+        with patch("model_tools.registry", _make_registry(captured)):
+            from model_tools import handle_function_call
+            handle_function_call(
+                "vision_analyze",
+                {"image_url": "x", "question": "describe"},
+                task_id="t1",
+                main_runtime=runtime,
+                skip_pre_tool_call_hook=True,
+            )
+        assert captured["main_runtime"] == runtime
+
     def test_task_id_still_forwarded(self):
         """Existing task_id forwarding is not broken by this change."""
         captured = {}
