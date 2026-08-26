@@ -113,14 +113,21 @@ def _ref(repo: Path, ref: str) -> str:
     return _git(repo, "rev-parse", ref).stdout.strip()
 
 
-def _install_deploy_script(repo: Path) -> Path:
-    script = repo / "deploy" / "deploy.mjs"
-    script.parent.mkdir()
-    shutil.copy2(DEPLOY_SCRIPT, script)
-    _git(repo, "add", script.relative_to(repo).as_posix())
-    _git(repo, "commit", "-m", "add deploy script")
-    _git(repo, "push", "origin", "main")
-    return script
+def _run_deploy_cli(work: Path, *args: str) -> subprocess.CompletedProcess[str]:
+    source = f"""
+import {{ main }} from {json.dumps(DEPLOY_SCRIPT.as_uri())};
+try {{
+  await main({{ argv: process.argv.slice(1), cwd: process.cwd() }});
+}} catch (error) {{
+  console.error(`deploy failed: ${{error.message}}`);
+  process.exitCode = 1;
+}}
+"""
+    return _run(
+        ["node", "--input-type=module", "--eval", source, "--", *args],
+        work,
+        check=False,
+    )
 
 
 def _move_remote_branch_before_push(
@@ -133,25 +140,43 @@ def _move_remote_branch_before_push(
 ) -> dict[str, str]:
     wrapper_dir = tmp_path / "git-wrapper"
     wrapper_dir.mkdir()
-    wrapper = wrapper_dir / "git"
     counter = wrapper_dir / "push-count"
     real_git = shutil.which("git")
     assert real_git is not None
-    wrapper.write_text(
-        "#!/bin/sh\n"
-        f'counter="{counter}"\n'
-        'if [ "$1" = push ]; then\n'
-        '  count=0\n'
-        '  [ ! -f "$counter" ] || count="$(cat "$counter")"\n'
-        '  count=$((count + 1))\n'
-        '  printf "%s\n" "$count" > "$counter"\n'
-        f'  if [ "$count" -eq {push_number} ]; then\n'
-        f'    "{real_git}" --git-dir="{origin}" update-ref refs/heads/{branch} {commit}\n'
-        "  fi\n"
-        "fi\n"
-        f'exec "{real_git}" "$@"\n'
-    )
-    wrapper.chmod(0o755)
+    if os.name == "nt":
+        wrapper = wrapper_dir / "git.cmd"
+        wrapper.write_text(
+            "@echo off\n"
+            "setlocal EnableDelayedExpansion\n"
+            'if "%~1"=="push" (\n'
+            "  set count=0\n"
+            f'  if exist "{counter}" set /p count=<"{counter}"\n'
+            "  set /a count+=1\n"
+            f'  >"{counter}" echo !count!\n'
+            f"  if !count!=={push_number} (\n"
+            f'    "{real_git}" --git-dir="{origin}" update-ref refs/heads/{branch} {commit}\n'
+            "  )\n"
+            ")\n"
+            f'"{real_git}" %*\n'
+            "exit /b %errorlevel%\n"
+        )
+    else:
+        wrapper = wrapper_dir / "git"
+        wrapper.write_text(
+            "#!/bin/sh\n"
+            f'counter="{counter}"\n'
+            'if [ "$1" = push ]; then\n'
+            '  count=0\n'
+            '  [ ! -f "$counter" ] || count="$(cat "$counter")"\n'
+            '  count=$((count + 1))\n'
+            '  printf "%s\n" "$count" > "$counter"\n'
+            f'  if [ "$count" -eq {push_number} ]; then\n'
+            f'    "{real_git}" --git-dir="{origin}" update-ref refs/heads/{branch} {commit}\n'
+            "  fi\n"
+            "fi\n"
+            f'exec "{real_git}" "$@"\n'
+        )
+        wrapper.chmod(0o755)
     return {**os.environ, "PATH": f"{wrapper_dir}{os.pathsep}{os.environ['PATH']}"}
 
 
@@ -300,12 +325,11 @@ def test_main_dry_run_reports_tag_only_publication_without_changing_refs(tmp_pat
 
 def test_create_tag_cli_dry_run_remains_tag_sourced(tmp_path):
     _origin, _seed, work = _repositories(tmp_path)
-    script = _install_deploy_script(work)
-
-    result = _run(
-        ["node", str(script), "--create-tag", "v-test-cli", "--dry-run"],
+    result = _run_deploy_cli(
         work,
-        check=False,
+        "--create-tag",
+        "v-test-cli",
+        "--dry-run",
     )
 
     assert result.returncode == 0, result.stderr
@@ -317,19 +341,12 @@ def test_create_tag_cli_dry_run_remains_tag_sourced(tmp_path):
 
 def test_create_tag_cli_dry_run_reports_powerpoint_provisioning(tmp_path):
     _origin, _seed, work = _repositories(tmp_path)
-    script = _install_deploy_script(work)
-
-    result = _run(
-        [
-            "node",
-            str(script),
-            "--create-tag",
-            "v-test-powerpoint",
-            "--provision-powerpoint-deps",
-            "--dry-run",
-        ],
+    result = _run_deploy_cli(
         work,
-        check=False,
+        "--create-tag",
+        "v-test-powerpoint",
+        "--provision-powerpoint-deps",
+        "--dry-run",
     )
 
     assert result.returncode == 0, result.stderr
@@ -342,12 +359,13 @@ def test_create_tag_cli_dry_run_reports_powerpoint_provisioning(tmp_path):
 
 def test_cli_rejects_allow_non_main_with_existing_tag(tmp_path):
     _origin, _seed, work = _repositories(tmp_path)
-    script = _install_deploy_script(work)
 
-    result = _run(
-        ["node", str(script), "--tag", "v-test-existing", "--allow-non-main", "--dry-run"],
+    result = _run_deploy_cli(
         work,
-        check=False,
+        "--tag",
+        "v-test-existing",
+        "--allow-non-main",
+        "--dry-run",
     )
 
     assert result.returncode != 0
@@ -356,14 +374,9 @@ def test_cli_rejects_allow_non_main_with_existing_tag(tmp_path):
 
 def test_cli_rejects_removed_commit_ref_source(tmp_path):
     _origin, _seed, work = _repositories(tmp_path)
-    script = _install_deploy_script(work)
     commit = _ref(work, "HEAD")
 
-    result = _run(
-        ["node", str(script), "--ref", commit, "--dry-run"],
-        work,
-        check=False,
-    )
+    result = _run_deploy_cli(work, "--ref", commit, "--dry-run")
 
     assert result.returncode != 0
     assert "Unknown argument: --ref" in result.stderr
@@ -371,14 +384,9 @@ def test_cli_rejects_removed_commit_ref_source(tmp_path):
 
 def test_existing_tag_cli_rejects_local_only_tag(tmp_path):
     _origin, _seed, work = _repositories(tmp_path)
-    script = _install_deploy_script(work)
     _git(work, "tag", "-a", "v-test-local-only", "-m", "local only")
 
-    result = _run(
-        ["node", str(script), "--tag", "v-test-local-only", "--dry-run"],
-        work,
-        check=False,
-    )
+    result = _run_deploy_cli(work, "--tag", "v-test-local-only", "--dry-run")
 
     assert result.returncode != 0
     assert "Tag does not exist on origin" in result.stderr
@@ -386,18 +394,13 @@ def test_existing_tag_cli_rejects_local_only_tag(tmp_path):
 
 def test_existing_tag_cli_rejects_local_remote_commit_mismatch(tmp_path):
     _origin, seed, work = _repositories(tmp_path)
-    script = _install_deploy_script(work)
     local_commit = _ref(work, "HEAD")
     remote_commit = _commit_file(seed, "tagged.txt", "remote tag\n", "remote tag commit")
     _git(seed, "tag", "-a", "v-test-mismatch", "-m", "remote", remote_commit)
     _git(seed, "push", "origin", "refs/tags/v-test-mismatch")
     _git(work, "tag", "-a", "v-test-mismatch", "-m", "local", local_commit)
 
-    result = _run(
-        ["node", str(script), "--tag", "v-test-mismatch", "--dry-run"],
-        work,
-        check=False,
-    )
+    result = _run_deploy_cli(work, "--tag", "v-test-mismatch", "--dry-run")
 
     assert result.returncode != 0
     assert "do not resolve to the same commit" in result.stderr
@@ -405,16 +408,11 @@ def test_existing_tag_cli_rejects_local_remote_commit_mismatch(tmp_path):
 
 def test_existing_published_tag_cli_dry_run_succeeds(tmp_path):
     _origin, _seed, work = _repositories(tmp_path)
-    script = _install_deploy_script(work)
     commit = _ref(work, "HEAD")
     _git(work, "tag", "-a", "v-test-published", "-m", "published", commit)
     _git(work, "push", "origin", "refs/tags/v-test-published")
 
-    result = _run(
-        ["node", str(script), "--tag", "v-test-published", "--dry-run"],
-        work,
-        check=False,
-    )
+    result = _run_deploy_cli(work, "--tag", "v-test-published", "--dry-run")
 
     assert result.returncode == 0, result.stderr
     assert "Tag: v-test-published" in result.stdout

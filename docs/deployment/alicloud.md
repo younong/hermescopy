@@ -8,7 +8,7 @@ Hermes 的阿里云生产部署使用 `deploy/` 目录里的 Node.js 工具，�
 - User: `root`
 - Remote root: `/opt/hermes`
 
-> 不要把服务器密码、API key 或 `.env` 文件提交到仓库。建议尽快改用 SSH key 登录；如果临时使用密码，放在本机环境变量 `HERMES_DEPLOY_PASSWORD` 中，并安装 `sshpass`。
+> 不要把服务器密码、API key 或 `.env` 文件提交到仓库。建议使用 SSH key；如果临时使用密码，只放在本机环境变量 `HERMES_DEPLOY_PASSWORD` 中。内置 SSH/SFTP transport 不需要 `sshpass`。
 
 ## 服务器准备
 
@@ -106,29 +106,49 @@ hermes dashboard authority status --json
 
 恢复命令不修改来源文件。它在同目录 staging DB 上验证完整性和 schema，通过 SQLite backup 重建，推进 recovery generation，撤销旧 scope/ticket/bootstrap/Worker/Reader authority，并在 DB 与 browser-ticket keyring witness 均持久化一致后才清除 marker。禁止直接恢复陈旧 DB、手工删除 marker 或跳过 recovery fencing。
 
+## 本机发布端与 SSH host key
+
+发布工具可从原生 Windows、macOS 或 Linux 发起，但远端部署目标仍是 Linux/systemd。首次连接前必须通过独立可信渠道核对服务器 host fingerprint，并将确认过的 key 写入本机 OpenSSH `known_hosts`；未知、变化、revoked 或无法解析的 host key 都会被拒绝。
+
+获得连接授权后，可先运行只读检查。它只验证 host key、认证和远端 Bash，不检查 Git、不构建、不上传、不创建远端目录：
+
+```bash
+npm run deploy -- --check-connection
+```
+
 ## 推荐：使用 SSH key
+
+Key 模式使用系统 OpenSSH，可通过 agent 或私钥文件认证：
 
 ```bash
 ssh-keygen -t ed25519 -f ~/.ssh/hermes-alicloud
 ssh-copy-id -i ~/.ssh/hermes-alicloud.pub root@106.15.186.104
-```
-
-部署时指定 key：
-
-```bash
-npm run deploy -- --tag v2026.7.4 --identity-file ~/.ssh/hermes-alicloud
+npm run deploy -- --tag v2026.7.4 --identity-file ~/.ssh/hermes-alicloud --dry-run
 ```
 
 ## 临时：使用密码登录
 
-本工具不会读取仓库里的密码文件，也不会打印密码。若必须短期使用密码：
+密码模式使用内置 SSH/SFTP transport，不需要 `sshpass`，也不会把密码放入子进程参数、日志或临时文件。若必须短期使用密码：
+
+Bash：
 
 ```bash
 export HERMES_DEPLOY_PASSWORD='不要写进文档或仓库'
-npm run deploy -- --tag v2026.7.4
+npm run deploy -- --check-connection
+npm run deploy -- --tag v2026.7.4 --dry-run
+unset HERMES_DEPLOY_PASSWORD
 ```
 
-需要本机安装 `sshpass`，否则使用系统 SSH 的交互式密码输入。
+PowerShell：
+
+```powershell
+$env:HERMES_DEPLOY_PASSWORD = '不要写进文档或仓库'
+npm run deploy -- --check-connection
+npm run deploy -- --tag v2026.7.4 --dry-run
+Remove-Item Env:HERMES_DEPLOY_PASSWORD
+```
+
+推荐流程为：经授权执行 `--check-connection` → 执行发布命令的 `--dry-run` → 核对结果并获得明确批准 → 执行非 dry-run 发布。
 
 ## APIYI 图像模型生产配置
 

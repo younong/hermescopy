@@ -34,9 +34,10 @@ allowed-tools:
    - 优先建议 SSH key。
    - 临时密码登录只能使用本机环境变量 `HERMES_DEPLOY_PASSWORD`，且不要打印其值。
 
-3. **真实部署前先 dry-run**
-   - 对发布命令先执行 `--dry-run`。
-   - 检查 tag、host、remote root、SSH/SCP 命令是否符合预期。
+3. **真实部署前先检查连接并 dry-run**
+   - 在用户授权连接后先执行只读 `--check-connection`；它不得检查 Git、构建、上传或修改远端。
+   - 对发布命令再执行 `--dry-run`。
+   - 检查 tag、host、remote root 和所选 SSH transport 是否符合预期。
 
 4. **真实部署是外部变更**
    - 在执行非 dry-run 发布前，确认用户确实要发布到服务器。
@@ -89,24 +90,45 @@ npm run deploy -- --tag <previous-tag> --dry-run
 npm run deploy -- --tag <previous-tag>
 ```
 
-### 使用 SSH key
+### 只读连接检查
 
-默认使用本机私钥文件 `~/.ssh/hermes_apiyi_ed25519`（只记录文件路径，不记录私钥内容）：
+首次连接前必须让用户通过独立可信渠道核对 host fingerprint，并写入本机 OpenSSH `known_hosts`。获得连接授权后执行：
 
 ```bash
-npm run deploy -- --tag v2026.7.3 --identity-file ~/.ssh/hermes_apiyi_ed25519
+npm run deploy -- --check-connection
+```
+
+发布发起端可以是原生 Windows、macOS 或 Linux；远端仍必须是 Linux/systemd。
+
+### 使用 SSH key
+
+Key 模式使用系统 OpenSSH。默认使用本机私钥文件 `~/.ssh/hermes_apiyi_ed25519`（只记录文件路径，不记录私钥内容），也可使用 OpenSSH agent：
+
+```bash
+npm run deploy -- --tag v2026.7.3 --identity-file ~/.ssh/hermes_apiyi_ed25519 --dry-run
 ```
 
 ### 临时密码登录
 
-不要输出密码值。只提示用户在本会话中执行：
+密码模式使用内置 SSH/SFTP transport，不需要 `sshpass`。不要输出密码值；只提示用户在本会话中设置环境变量并在操作后清除。
+
+Bash：
 
 ```bash
 export HERMES_DEPLOY_PASSWORD='***'
-npm run deploy -- --tag v2026.7.3
+npm run deploy -- --check-connection
+npm run deploy -- --tag v2026.7.3 --dry-run
+unset HERMES_DEPLOY_PASSWORD
 ```
 
-如果缺少 `sshpass`，系统 SSH 可能会要求交互输入密码。
+PowerShell：
+
+```powershell
+$env:HERMES_DEPLOY_PASSWORD = '***'
+npm run deploy -- --check-connection
+npm run deploy -- --tag v2026.7.3 --dry-run
+Remove-Item Env:HERMES_DEPLOY_PASSWORD
+```
 
 ## APIYI 图像模型发布检查
 
