@@ -709,7 +709,9 @@ def _supports_media_in_tool_results(provider: str, model: str) -> bool:
     return False
 
 
-def _should_use_native_vision_fast_path() -> bool:
+def _should_use_native_vision_fast_path(
+    main_runtime: Optional[Dict[str, Any]] = None,
+) -> bool:
     """Whether vision tools should attach the image to the main model directly
     instead of routing through the auxiliary vision LLM.
 
@@ -725,8 +727,9 @@ def _should_use_native_vision_fast_path() -> bool:
         from agent.image_routing import decide_image_input_mode, _lookup_supports_vision
         from hermes_cli.config import load_config
 
-        provider = _read_main_provider()
-        model = _read_main_model()
+        runtime = main_runtime if isinstance(main_runtime, dict) else {}
+        provider = str(runtime.get("provider") or "").strip() or _read_main_provider()
+        model = str(runtime.get("model") or "").strip() or _read_main_model()
         cfg = load_config()
         if decide_image_input_mode(provider, model, cfg) != "native":
             return False
@@ -925,6 +928,8 @@ async def vision_analyze_tool(
     image_url: str,
     user_prompt: str,
     model: str = None,
+    *,
+    main_runtime: Optional[Dict[str, Any]] = None,
 ) -> str:
     """
     Analyze an image from a URL or local file path using vision AI.
@@ -1100,6 +1105,8 @@ async def vision_analyze_tool(
         }
         if model:
             call_kwargs["model"] = model
+        if main_runtime is not None:
+            call_kwargs["main_runtime"] = main_runtime
         # Try full-size image first; on size-related rejection, downscale and retry.
         try:
             response = await async_call_llm(**call_kwargs)
@@ -1325,6 +1332,7 @@ VISION_ANALYZE_SCHEMA = {
 async def _handle_vision_analyze(args: Dict[str, Any], **kw: Any) -> str:
     image_url = args.get("image_url", "")
     question = args.get("question", "")
+    main_runtime = kw.get("main_runtime")
 
     # The fan-out cap lives inside the encode/resize step (offloaded to the
     # bounded _vision_cpu_executor), NOT around the whole analysis — so a
@@ -1337,7 +1345,7 @@ async def _handle_vision_analyze(args: Dict[str, Any], **kw: Any) -> str:
     # return the image bytes as a multimodal tool-result envelope. The main
     # model sees the pixels directly on its next turn — no aux call, no
     # information loss, no extra latency.
-    if _should_use_native_vision_fast_path():
+    if _should_use_native_vision_fast_path(main_runtime=main_runtime):
         logger.info("vision_analyze: native fast path")
         return await _vision_analyze_native(image_url, question)
 
@@ -1347,7 +1355,12 @@ async def _handle_vision_analyze(args: Dict[str, Any], **kw: Any) -> str:
         f"following question:\n\n{question}"
     )
     model = os.getenv("AUXILIARY_VISION_MODEL", "").strip() or None
-    return await vision_analyze_tool(image_url, full_prompt, model)
+    return await vision_analyze_tool(
+        image_url,
+        full_prompt,
+        model,
+        main_runtime=main_runtime,
+    )
 
 
 registry.register(

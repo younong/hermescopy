@@ -4903,7 +4903,13 @@ class AIAgent:
             from tools.vision_tools import vision_analyze_tool
 
             result_json = asyncio.run(
-                vision_analyze_tool(image_url=vision_source, user_prompt=analysis_prompt)
+                vision_analyze_tool(
+                    image_url=vision_source,
+                    user_prompt=analysis_prompt,
+                    main_runtime=self._current_main_runtime(
+                        allow_deployment_relay=True
+                    ),
+                )
             )
             result = json.loads(result_json) if isinstance(result_json, str) else {}
             description = (result.get("analysis") or "").strip()

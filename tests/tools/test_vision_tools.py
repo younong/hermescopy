@@ -4,6 +4,7 @@ import json
 import logging
 import os
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Awaitable
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -410,6 +411,28 @@ class TestVisionConfig:
         assert result["success"] is True
         assert mock_llm.await_args.kwargs["temperature"] == 1.0
         assert mock_llm.await_args.kwargs["timeout"] == 77.0
+
+    @pytest.mark.asyncio
+    async def test_vision_forwards_active_main_runtime(self, tmp_path):
+        img = tmp_path / "runtime.png"
+        img.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 8)
+        mock_response = MagicMock()
+        mock_response.choices = [SimpleNamespace(message=SimpleNamespace(content="runtime image"))]
+        runtime = {
+            "provider": "custom:codex",
+            "model": "gpt-5.6-sol",
+            "base_url": "https://runtime.invalid/v1",
+            "api_key": "relay-marker",
+            "api_mode": "chat_completions",
+        }
+        with (
+            patch("tools.vision_tools._image_to_base64_data_url", return_value="data:image/png;base64,abc"),
+            patch("tools.vision_tools.async_call_llm", new_callable=AsyncMock, return_value=mock_response) as mock_llm,
+        ):
+            result = json.loads(await vision_analyze_tool(str(img), "describe", main_runtime=runtime))
+        assert result["success"] is True
+        assert mock_llm.await_args.kwargs["main_runtime"] == runtime
+        assert "provider" not in mock_llm.await_args.kwargs
 
     @pytest.mark.asyncio
     async def test_vision_defaults_temperature_when_config_omits_it(self, tmp_path):
