@@ -407,11 +407,11 @@ describe("MessageList", () => {
     await act(async () => root.unmount());
   });
 
-  it("automatically loads near the top and keeps manual loading for errors only", async () => {
+  it("automatically fills an initial short history and keeps manual loading for errors only", async () => {
     const container = document.createElement("div");
     document.body.appendChild(container);
     const root = createRoot(container);
-    const onLoadEarlier = vi.fn();
+    const onLoadEarlier = vi.fn().mockResolvedValue(undefined);
     const baseState = {
       ...initialGuiChatState,
       historyCursor: "cursor-1",
@@ -431,13 +431,16 @@ describe("MessageList", () => {
 
     expect(container.textContent).toContain("Scroll up for earlier messages");
     expect(container.textContent).not.toContain("Load earlier messages");
-    const scroller = container.querySelector<HTMLElement>("[aria-busy=false]")!;
-    await act(async () => {
-      scroller.scrollTop = 300;
-      scroller.dispatchEvent(new Event("scroll", { bubbles: true }));
-      scroller.scrollTop = 100;
-      scroller.dispatchEvent(new Event("scroll", { bubbles: true }));
-    });
+    expect(onLoadEarlier).toHaveBeenCalledTimes(1);
+
+    await act(async () => root.render(
+      <MessageList
+        onClarifyRespond={() => undefined}
+        onApprovalRespond={() => undefined}
+        onLoadEarlier={onLoadEarlier}
+        state={baseState}
+      />,
+    ));
     expect(onLoadEarlier).toHaveBeenCalledTimes(1);
 
     await act(async () => root.render(
@@ -453,7 +456,32 @@ describe("MessageList", () => {
         onClarifyRespond={() => undefined}
         onApprovalRespond={() => undefined}
         onLoadEarlier={onLoadEarlier}
-        state={{ ...baseState, historyError: "Network unavailable" }}
+        state={{
+          ...baseState,
+          historyCursor: "cursor-2",
+          messages: [
+            { artifactIds: [], id: "message-0", role: "assistant", text: "Earlier" },
+            ...baseState.messages,
+          ],
+        }}
+      />,
+    ));
+    expect(onLoadEarlier).toHaveBeenCalledTimes(2);
+
+    await act(async () => root.render(
+      <MessageList
+        onClarifyRespond={() => undefined}
+        onApprovalRespond={() => undefined}
+        onLoadEarlier={onLoadEarlier}
+        state={{ ...baseState, historyCursor: "cursor-2", historyLoading: true }}
+      />,
+    ));
+    await act(async () => root.render(
+      <MessageList
+        onClarifyRespond={() => undefined}
+        onApprovalRespond={() => undefined}
+        onLoadEarlier={onLoadEarlier}
+        state={{ ...baseState, historyCursor: "cursor-2", historyError: "Network unavailable" }}
       />,
     ));
     const retry = Array.from(container.querySelectorAll("button")).find((button) =>
@@ -463,7 +491,7 @@ describe("MessageList", () => {
     expect(retry).toBeDefined();
 
     await act(async () => retry?.click());
-    expect(onLoadEarlier).toHaveBeenCalledTimes(2);
+    expect(onLoadEarlier).toHaveBeenCalledTimes(3);
     await act(async () => root.unmount());
   });
 

@@ -13,6 +13,7 @@ vi.mock("@/lib/api", async (importOriginal) => ({
 }));
 
 let root: Root | null = null;
+let renderContainer: HTMLDivElement | null = null;
 
 beforeEach(() => {
   (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT: boolean })
@@ -24,6 +25,7 @@ beforeEach(() => {
 afterEach(async () => {
   if (root) await act(async () => root?.unmount());
   root = null;
+  renderContainer = null;
   document.body.innerHTML = "";
 });
 
@@ -157,6 +159,45 @@ describe("GroupConversation owner mentions", () => {
       .toBe("/hermes/api/employees/employee-a/avatar?v=123");
   });
 
+  it("loads a short initial history once per advancing sequence", () => {
+    const onLoadEarlier = vi.fn();
+    const baseState: CollaborationState = {
+      ...initialCollaborationState,
+      group: {
+        archived_at: null,
+        created_at: 1,
+        creator_employee_id: null,
+        creator_kind: "owner",
+        group_id: "group-a",
+        last_sequence: 1,
+        name: "Group A",
+        status: "active",
+        updated_at: 1,
+      },
+      historyBeforeSequence: 10,
+      historyHasMore: true,
+      loading: false,
+    };
+
+    const container = renderConversation(baseState, undefined, onLoadEarlier);
+    expect(onLoadEarlier).toHaveBeenCalledTimes(1);
+
+    renderConversation(baseState, undefined, onLoadEarlier);
+    expect(onLoadEarlier).toHaveBeenCalledTimes(1);
+
+    renderConversation({ ...baseState, historyLoading: true }, undefined, onLoadEarlier);
+    renderConversation({ ...baseState, historyBeforeSequence: 5 }, undefined, onLoadEarlier);
+    expect(onLoadEarlier).toHaveBeenCalledTimes(2);
+
+    renderConversation({
+      ...baseState,
+      historyBeforeSequence: undefined,
+      historyHasMore: false,
+    }, undefined, onLoadEarlier);
+    expect(onLoadEarlier).toHaveBeenCalledTimes(2);
+    expect(container.textContent).not.toContain("Scroll up for earlier messages");
+  });
+
   it("renders the history control when a page has no visible message events", () => {
     const container = renderConversation({
       ...initialCollaborationState,
@@ -244,14 +285,22 @@ describe("GroupConversation owner mentions", () => {
   });
 });
 
-function renderConversation(state: CollaborationState, avatarUrl?: string) {
-  const container = document.createElement("div");
-  document.body.appendChild(container);
-  root = createRoot(container);
+function renderConversation(
+  state: CollaborationState,
+  avatarUrl?: string,
+  onLoadEarlier?: () => void | Promise<void>,
+) {
+  if (!root || !renderContainer) {
+    renderContainer = document.createElement("div");
+    document.body.appendChild(renderContainer);
+    root = createRoot(renderContainer);
+  }
+  const container = renderContainer;
   act(() => {
     root?.render(
       <GroupConversation
         employees={[{ avatarUrl, available: true, employeeId: "employee-a", name: "Alice" }]}
+        onLoadEarlier={onLoadEarlier}
         state={state}
       />,
     );

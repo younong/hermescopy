@@ -71,7 +71,7 @@ export function MessageList({
   const pendingBottomAdjustmentRef = useRef(0);
   const bottomAdjustmentFrameRef = useRef<number | null>(null);
   const lastForceBottomKeyRef = useRef<string | undefined>(undefined);
-  const anchorRef = useRef<{ id: string; offset: number } | null>(null);
+  const anchorRef = useRef<{ followBottom: boolean; id: string; offset: number } | null>(null);
 
   const rows = useMemo<RenderRow[]>(() => {
     const result: RenderRow[] = [];
@@ -138,16 +138,21 @@ export function MessageList({
     });
     const row = firstVisible ? rows[firstVisible.index] : undefined;
     if (firstVisible && row) {
-      anchorRef.current = { id: row.id, offset: firstVisible.start - container.scrollTop };
+      anchorRef.current = {
+        followBottom: followBottomRef.current,
+        id: row.id,
+        offset: firstVisible.start - container.scrollTop,
+      };
       followBottomRef.current = false;
     }
   }, [rows, virtualizer]);
 
-  const { handleScroll: handleHistoryScroll, retry, syncScrollPosition } =
+  const { checkTop, handleScroll: handleHistoryScroll, retry, syncScrollPosition } =
     useLoadEarlierOnScroll({
       autoEnabled: !state.historyError && !state.safeguardReached,
       canLoad: state.historyHasMore && !!state.historyCursor,
       loading: state.historyLoading,
+      loadKey: state.historyCursor,
       onBeforeLoad: captureAnchor,
       onLoadEarlier,
       resetKey: state.sessionId,
@@ -163,8 +168,14 @@ export function MessageList({
 
   const handleScroll = useCallback((event: UIEvent<HTMLDivElement>) => {
     followBottomRef.current = isNearBottom(event.currentTarget);
+    if (anchorRef.current && followBottomRef.current) anchorRef.current = null;
     handleHistoryScroll(event);
-  }, [handleHistoryScroll]);
+    checkTop(event.currentTarget.scrollTop);
+  }, [checkTop, handleHistoryScroll]);
+
+  useLayoutEffect(() => {
+    anchorRef.current = null;
+  }, [state.sessionId]);
 
   useLayoutEffect(() => {
     if (forceBottomKey === lastForceBottomKeyRef.current) return;
@@ -192,6 +203,7 @@ export function MessageList({
   }, [syncScrollPosition, totalSize]);
 
   useLayoutEffect(() => {
+    let restoredAnchor = false;
     if (!state.historyLoading && anchorRef.current) {
       const anchor = anchorRef.current;
       const index = rows.findIndex((row) => row.id === anchor.id);
@@ -203,10 +215,14 @@ export function MessageList({
           syncScrollPosition(element.scrollTop);
         }
       }
+      followBottomRef.current = anchor.followBottom;
       anchorRef.current = null;
+      restoredAnchor = true;
     }
-    if (followBottomRef.current) scrollToBottom();
-  }, [rows, scrollToBottom, state.historyLoading, syncScrollPosition, totalSize, virtualizer]);
+    if (!restoredAnchor && followBottomRef.current) scrollToBottom();
+    const element = containerRef.current;
+    if (element) checkTop(element.scrollTop);
+  }, [checkTop, rows, scrollToBottom, state.historyLoading, syncScrollPosition, totalSize, virtualizer]);
 
   if (rows.length === 0) {
     return (

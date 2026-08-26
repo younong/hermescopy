@@ -211,31 +211,68 @@ describe("SessionsPage session management", () => {
 });
 
 describe("SessionMessageList", () => {
-  it("loads earlier messages on upward scrolling but not at initial top", async () => {
+  it("loads earlier messages at the initial top without a scroll event", async () => {
     const container = document.createElement("div");
     document.body.appendChild(container);
     const root = createRoot(container);
-    const onLoadEarlier = vi.fn();
+    const onLoadEarlier = vi.fn().mockResolvedValue(undefined);
 
     await act(async () => root.render(
       <SessionMessageList
         canLoadEarlier
         historyLoading={false}
+        historyCursor="cursor-1"
         messages={[{ text: "Current message", role: "user" }]}
         onLoadEarlier={onLoadEarlier}
         sessionId="session-1"
       />,
     ));
-    const scroller = container.querySelector<HTMLElement>("[aria-busy=false]")!;
     expect(container.textContent).toContain("Scroll up for earlier messages");
     expect(container.textContent).not.toContain("Load earlier messages");
-
-    await act(async () => scroll(scroller, 0));
-    await act(async () => scroll(scroller, 300));
-    await act(async () => scroll(scroller, 100));
-    await act(async () => scroll(scroller, 80));
-
     expect(onLoadEarlier).toHaveBeenCalledTimes(1);
+
+    await act(async () => root.render(
+      <SessionMessageList
+        canLoadEarlier
+        historyLoading={false}
+        historyCursor="cursor-1"
+        messages={[{ text: "Current message", role: "user" }]}
+        onLoadEarlier={onLoadEarlier}
+        sessionId="session-1"
+      />,
+    ));
+    expect(onLoadEarlier).toHaveBeenCalledTimes(1);
+
+    await act(async () => root.render(
+      <SessionMessageList
+        canLoadEarlier
+        historyLoading={false}
+        historyCursor="cursor-2"
+        messages={[
+          { text: "Earlier message", role: "assistant" },
+          { text: "Current message", role: "user" },
+        ]}
+        onLoadEarlier={onLoadEarlier}
+        sessionId="session-1"
+      />,
+    ));
+    expect(onLoadEarlier).toHaveBeenCalledTimes(2);
+
+    await act(async () => root.render(
+      <SessionMessageList
+        canLoadEarlier={false}
+        historyLoading={false}
+        historyCursor={null}
+        messages={[
+          { text: "Oldest message", role: "user" },
+          { text: "Earlier message", role: "assistant" },
+          { text: "Current message", role: "user" },
+        ]}
+        onLoadEarlier={onLoadEarlier}
+        sessionId="session-1"
+      />,
+    ));
+    expect(onLoadEarlier).toHaveBeenCalledTimes(2);
     await act(async () => root.unmount());
   });
 
@@ -263,6 +300,7 @@ describe("SessionMessageList", () => {
         canLoadEarlier
         historyError="Network unavailable"
         historyLoading={false}
+        historyCursor="cursor-1"
         messages={messages}
         onLoadEarlier={onLoadEarlier}
         sessionId="session-1"
@@ -287,8 +325,9 @@ describe("SessionMessageList", () => {
 
     await act(async () => root.render(
       <SessionMessageList
-        canLoadEarlier
+        canLoadEarlier={false}
         historyLoading={false}
+        historyCursor={null}
         messages={[{ text: "Current message", role: "user" }]}
         onLoadEarlier={onLoadEarlier}
         sessionId="session-1"
@@ -300,6 +339,16 @@ describe("SessionMessageList", () => {
       get: () => scrollHeight,
     });
     scroller.scrollTop = 300;
+    await act(async () => root.render(
+      <SessionMessageList
+        canLoadEarlier
+        historyLoading={false}
+        historyCursor="cursor-1"
+        messages={[{ text: "Current message", role: "user" }]}
+        onLoadEarlier={onLoadEarlier}
+        sessionId="session-1"
+      />,
+    ));
     await act(async () => scroll(scroller, 300));
     await act(async () => scroll(scroller, 100));
     expect(onLoadEarlier).toHaveBeenCalledTimes(1);
@@ -308,6 +357,7 @@ describe("SessionMessageList", () => {
       <SessionMessageList
         canLoadEarlier
         historyLoading
+        historyCursor="cursor-1"
         messages={[{ text: "Current message", role: "user" }]}
         onLoadEarlier={onLoadEarlier}
         sessionId="session-1"
@@ -318,6 +368,7 @@ describe("SessionMessageList", () => {
       <SessionMessageList
         canLoadEarlier
         historyLoading={false}
+        historyCursor="cursor-2"
         messages={[
           { text: "Earlier message", role: "assistant" },
           { text: "Current message", role: "user" },

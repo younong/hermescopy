@@ -299,6 +299,7 @@ export function SessionMessageList({
   canLoadEarlier,
   historyError,
   historyLoading,
+  historyCursor,
   highlight,
   messages,
   onLoadEarlier,
@@ -307,6 +308,7 @@ export function SessionMessageList({
   canLoadEarlier: boolean;
   historyError?: string | null;
   historyLoading: boolean;
+  historyCursor?: string | null;
   highlight?: string;
   messages: SessionMessage[];
   onLoadEarlier: () => void | Promise<void>;
@@ -324,10 +326,11 @@ export function SessionMessageList({
     };
   }, []);
 
-  const { handleScroll, retry, syncScrollPosition } = useLoadEarlierOnScroll({
+  const { checkTop, handleScroll, retry, syncScrollPosition } = useLoadEarlierOnScroll({
     autoEnabled: !historyError,
     canLoad: canLoadEarlier,
     loading: historyLoading,
+    loadKey: historyCursor ?? undefined,
     onBeforeLoad: captureAnchor,
     onLoadEarlier,
     resetKey: sessionId,
@@ -336,11 +339,14 @@ export function SessionMessageList({
   useLayoutEffect(() => {
     const container = containerRef.current;
     const anchor = anchorRef.current;
-    if (!container || !anchor || historyLoading) return;
-    container.scrollTop = anchor.scrollTop + (container.scrollHeight - anchor.scrollHeight);
-    syncScrollPosition(container.scrollTop);
-    anchorRef.current = null;
-  }, [historyLoading, messages, syncScrollPosition]);
+    if (!container || historyLoading) return;
+    if (anchor) {
+      container.scrollTop = anchor.scrollTop + (container.scrollHeight - anchor.scrollHeight);
+      syncScrollPosition(container.scrollTop);
+      anchorRef.current = null;
+    }
+    checkTop(container.scrollTop);
+  }, [checkTop, historyCursor, historyLoading, messages, syncScrollPosition]);
 
   useEffect(() => {
     if (!highlight || !containerRef.current) return;
@@ -704,6 +710,7 @@ function SessionRow({
               canLoadEarlier={historyHasMore && !!historyCursor}
               historyError={historyError}
               historyLoading={historyLoading}
+              historyCursor={historyCursor}
               highlight={searchQuery}
               messages={messages}
               onLoadEarlier={loadEarlierMessages}
