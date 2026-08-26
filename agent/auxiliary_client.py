@@ -4223,6 +4223,12 @@ def _to_async_client(sync_client, model: str, is_vision: bool = False):
         "api_key": sync_client.api_key,
         "base_url": str(sync_client.base_url),
     }
+    # Preserve only caller-supplied headers, not the SDK-generated defaults
+    # exposed by ``default_headers``. Deployment relay routing depends on the
+    # provider selector stored in OpenAI's ``_custom_headers``.
+    sync_headers = getattr(sync_client, "_custom_headers", None)
+    if sync_headers:
+        async_kwargs["default_headers"] = dict(sync_headers)
     sync_base_url = str(sync_client.base_url)
     if base_url_host_matches(sync_base_url, "openrouter.ai"):
         async_kwargs["default_headers"] = build_or_headers()

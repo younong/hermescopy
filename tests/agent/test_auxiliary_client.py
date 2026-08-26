@@ -4265,6 +4265,88 @@ class TestRuntimeBoundVisionRouting:
         assert calls[0][1]["is_vision"] is True
         assert calls[0][1]["task"] == "vision"
 
+    @pytest.mark.asyncio
+    async def test_async_runtime_sends_deployment_relay_provider_header(
+        self, monkeypatch
+    ):
+        import httpx
+
+        runtime = {
+            "provider": "custom:codex",
+            "model": "gpt-5.6-sol",
+            "base_url": "http://127.0.0.1:39123/v1",
+            "api_key": "deployment-inference-relay",
+            "api_mode": "chat_completions",
+        }
+        captured = {}
+
+        async def handle_request(request):
+            captured["path"] = request.url.path
+            captured["provider"] = request.headers.get(
+                "x-hermes-deployment-provider"
+            )
+            captured["body"] = json.loads(request.content)
+            return httpx.Response(
+                200,
+                request=request,
+                json={
+                    "id": "chatcmpl-test",
+                    "object": "chat.completion",
+                    "created": 0,
+                    "model": "gpt-5.6-sol",
+                    "choices": [{
+                        "index": 0,
+                        "message": {"role": "assistant", "content": "ok"},
+                        "finish_reason": "stop",
+                    }],
+                },
+            )
+
+        sync_http = httpx.Client(
+            transport=httpx.MockTransport(
+                lambda request: httpx.Response(500, request=request)
+            )
+        )
+        async_http = httpx.AsyncClient(transport=httpx.MockTransport(handle_request))
+
+        def http_client_kwargs(_base_url, *, async_mode=False):
+            return {"http_client": async_http if async_mode else sync_http}
+
+        monkeypatch.setattr(
+            "agent.auxiliary_client._openai_http_client_kwargs",
+            http_client_kwargs,
+        )
+        monkeypatch.setattr(
+            "agent.auxiliary_client._main_model_supports_vision", lambda *_: True
+        )
+        monkeypatch.setattr(
+            "agent.auxiliary_client._deployment_relay_route",
+            lambda *_args, **_kwargs: SimpleNamespace(provider="custom:codex"),
+        )
+
+        try:
+            provider, client, model = resolve_vision_provider_client(
+                main_runtime=runtime,
+                async_mode=True,
+            )
+            await client.chat.completions.create(
+                model=model,
+                messages=[{"role": "user", "content": "describe"}],
+            )
+        finally:
+            await async_http.aclose()
+            sync_http.close()
+
+        assert provider == "custom:codex"
+        assert captured == {
+            "path": "/v1/chat/completions",
+            "provider": "custom:codex",
+            "body": {
+                "messages": [{"role": "user", "content": "describe"}],
+                "model": "gpt-5.6-sol",
+            },
+        }
+
     def test_runtime_route_failure_does_not_resolve_auto(self, monkeypatch):
         runtime = {
             "provider": "custom:codex",
