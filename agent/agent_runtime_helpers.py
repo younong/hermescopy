@@ -2401,6 +2401,9 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
                     disabled_toolsets=getattr(agent, "disabled_toolsets", None),
                     employee_policy=getattr(agent, "employee_policy", None),
                     collaboration_context=getattr(agent, "collaboration_context", None),
+                    main_runtime=agent._current_main_runtime(
+                        allow_deployment_relay=True
+                    ) if hasattr(agent, "_current_main_runtime") else None,
                     tool_request_middleware_trace=list(_tool_middleware_trace),
                 )
     else:
@@ -2417,6 +2420,9 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
                 enabled_toolsets=getattr(agent, "enabled_toolsets", None),
                 disabled_toolsets=getattr(agent, "disabled_toolsets", None),
                 employee_policy=getattr(agent, "employee_policy", None),
+                main_runtime=agent._current_main_runtime(
+                    allow_deployment_relay=True
+                ) if hasattr(agent, "_current_main_runtime") else None,
                 tool_request_middleware_trace=list(_tool_middleware_trace),
             )
 
