@@ -3350,7 +3350,6 @@ def _retry_same_provider_sync(
     resolved_base_url: Optional[str],
     resolved_api_key: Optional[str],
     resolved_api_mode: Optional[str],
-    main_runtime: Optional[Dict[str, Any]],
     final_model: Optional[str],
     messages: list,
     temperature: Optional[float],
@@ -3359,6 +3358,7 @@ def _retry_same_provider_sync(
     effective_timeout: float,
     effective_extra_body: dict,
     deadline_monotonic: Optional[float] = None,
+    main_runtime: Optional[Dict[str, Any]] = None,
     planned_input_tokens: Optional[int] = None,
     route_metadata_callback: Optional[
         Callable[["AuxiliaryRouteCapacity"], None]
@@ -3370,6 +3370,7 @@ def _retry_same_provider_sync(
             model=final_model,
             base_url=resolved_base_url,
             api_key=resolved_api_key,
+            main_runtime=main_runtime,
             async_mode=False,
         )
     else:
@@ -3428,6 +3429,7 @@ async def _retry_same_provider_async(
     tools: Optional[list],
     effective_timeout: float,
     effective_extra_body: dict,
+    main_runtime: Optional[Dict[str, Any]] = None,
 ) -> Any:
     if task == "vision":
         _, retry_client, retry_model = resolve_vision_provider_client(
@@ -3435,6 +3437,7 @@ async def _retry_same_provider_async(
             model=final_model,
             base_url=resolved_base_url,
             api_key=resolved_api_key,
+            main_runtime=main_runtime,
             async_mode=True,
         )
     else:
@@ -5142,6 +5145,7 @@ def resolve_vision_provider_client(
     *,
     base_url: Optional[str] = None,
     api_key: Optional[str] = None,
+    main_runtime: Optional[Dict[str, Any]] = None,
     async_mode: bool = False,
 ) -> Tuple[Optional[str], Optional[Any], Optional[str]]:
     """Resolve the client actually used for vision tasks.
@@ -5151,6 +5155,48 @@ def resolve_vision_provider_client(
     backends, so users can intentionally force experimental providers. Auto mode
     stays conservative and only tries vision backends known to work today.
     """
+    runtime = _normalize_main_runtime(main_runtime)
+    if runtime:
+        runtime_provider = _normalize_vision_provider(
+            str(runtime.get("provider") or provider or "")
+        )
+        runtime_model = str(runtime.get("model") or model or "").strip() or None
+        runtime_base_url = str(runtime.get("base_url") or base_url or "").strip() or None
+        runtime_api_key = runtime.get("api_key") or api_key
+        runtime_api_mode = str(runtime.get("api_mode") or "").strip() or None
+        if not runtime_provider or runtime_provider == "auto" or not runtime_model:
+            return runtime_provider or "auto", None, None
+        if not _main_model_supports_vision(runtime_provider, runtime_model):
+            logger.warning(
+                "Vision model selected by the active chat runtime does not support vision"
+            )
+            return runtime_provider, None, None
+        # Named custom providers (``custom:<name>``) still need to honor the
+        # live session's endpoint and relay credentials.  Route the concrete
+        # URL through the anonymous custom client builder while preserving the
+        # named provider label for diagnostics and route metadata.
+        resolver_provider = (
+            "custom"
+            if runtime_base_url and runtime_provider.startswith("custom:")
+            else runtime_provider
+        )
+        client, final_model = resolve_provider_client(
+            resolver_provider,
+            model=runtime_model,
+            async_mode=async_mode,
+            explicit_base_url=runtime_base_url,
+            explicit_api_key=runtime_api_key,
+            api_mode=runtime_api_mode,
+            main_runtime=runtime,
+            is_vision=True,
+            task="vision",
+        )
+        if client is None:
+            return runtime_provider, None, None
+        if async_mode:
+            return runtime_provider, client, final_model or runtime_model
+        return runtime_provider, client, final_model or runtime_model
+
     requested, resolved_model, resolved_base_url, resolved_api_key, resolved_api_mode = _resolve_task_provider_model(
         "vision", provider, model, base_url, api_key
     )
@@ -6654,15 +6700,22 @@ def call_llm(
             requested_output_tokens=max(0, int(max_tokens or 0)),
         )
 
+    runtime_bound = bool(_normalize_main_runtime(main_runtime))
     if task == "vision":
         effective_provider, client, final_model = resolve_vision_provider_client(
             provider=resolved_provider if resolved_provider != "auto" else provider,
             model=resolved_model or model,
             base_url=resolved_base_url or base_url,
             api_key=resolved_api_key or api_key,
+            main_runtime=main_runtime,
             async_mode=False,
         )
-        if client is None and resolved_provider != "auto" and not resolved_base_url:
+        if (
+            client is None
+            and not runtime_bound
+            and resolved_provider != "auto"
+            and not resolved_base_url
+        ):
             logger.warning(
                 "Vision provider %s unavailable, falling back to auto vision backends",
                 resolved_provider,
@@ -7319,15 +7372,22 @@ async def async_call_llm(
     effective_extra_body = _get_task_extra_body(task)
     effective_extra_body.update(extra_body or {})
 
+    runtime_bound = bool(_normalize_main_runtime(main_runtime))
     if task == "vision":
         effective_provider, client, final_model = resolve_vision_provider_client(
             provider=resolved_provider if resolved_provider != "auto" else provider,
             model=resolved_model or model,
             base_url=resolved_base_url or base_url,
             api_key=resolved_api_key or api_key,
+            main_runtime=main_runtime,
             async_mode=True,
         )
-        if client is None and resolved_provider != "auto" and not resolved_base_url:
+        if (
+            client is None
+            and not runtime_bound
+            and resolved_provider != "auto"
+            and not resolved_base_url
+        ):
             logger.warning(
                 "Vision provider %s unavailable, falling back to auto vision backends",
                 resolved_provider,
@@ -7592,6 +7652,7 @@ async def async_call_llm(
                 )
                 return await _retry_same_provider_async(
                     task=task,
+                    main_runtime=main_runtime,
                     resolved_provider=resolved_provider,
                     resolved_model=resolved_model,
                     resolved_base_url=resolved_base_url,
@@ -7641,6 +7702,7 @@ async def async_call_llm(
                         tools=tools,
                         effective_timeout=effective_timeout,
                         effective_extra_body=effective_extra_body,
+                        main_runtime=main_runtime,
                     )
                 except Exception as retry2_err:
                     if (_is_payment_error(retry2_err) or _is_auth_error(retry2_err)

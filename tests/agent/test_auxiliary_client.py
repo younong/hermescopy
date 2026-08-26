@@ -4222,6 +4222,67 @@ class TestCodexAdapterPromptCacheKey:
         assert "prompt_cache_key" not in captured
 
 
+class TestRuntimeBoundVisionRouting:
+    @pytest.mark.parametrize(
+        ("runtime", "expected_provider", "expected_model"),
+        [
+            (
+                {"provider": "custom:codex", "model": "gpt-5.6-sol", "base_url": "https://codex.invalid/v1", "api_key": "runtime-key", "api_mode": "chat_completions"},
+                "custom:codex",
+                "gpt-5.6-sol",
+            ),
+            (
+                {"provider": "custom:volcengine-ark", "model": "kimi-k3", "base_url": "https://ark.invalid/v1", "api_key": "runtime-key", "api_mode": "chat_completions"},
+                "custom:volcengine-ark",
+                "kimi-k3",
+            ),
+        ],
+    )
+    def test_runtime_selects_provider_and_model_without_auto_fallback(
+        self, monkeypatch, runtime, expected_provider, expected_model
+    ):
+        client = MagicMock()
+        monkeypatch.setattr(
+            "agent.auxiliary_client._main_model_supports_vision",
+            lambda provider, model: True,
+        )
+        calls = []
+
+        def resolve(provider, **kwargs):
+            calls.append((provider, kwargs))
+            return client, kwargs["model"]
+
+        monkeypatch.setattr("agent.auxiliary_client.resolve_provider_client", resolve)
+        provider, resolved, model = resolve_vision_provider_client(main_runtime=runtime)
+        assert (provider, model) == (expected_provider, expected_model)
+        assert resolved is client
+        # Named custom providers use the concrete custom endpoint builder;
+        # the public result preserves the session's provider label.
+        assert calls[0][0] == "custom"
+        assert calls[0][1]["model"] == expected_model
+        assert calls[0][1]["explicit_base_url"] == runtime["base_url"]
+        assert calls[0][1]["explicit_api_key"] == runtime["api_key"]
+        assert calls[0][1]["is_vision"] is True
+        assert calls[0][1]["task"] == "vision"
+
+    def test_runtime_route_failure_does_not_resolve_auto(self, monkeypatch):
+        runtime = {
+            "provider": "custom:codex",
+            "model": "gpt-5.6-sol",
+            "base_url": "https://codex.invalid/v1",
+            "api_key": "runtime-key",
+        }
+        monkeypatch.setattr("agent.auxiliary_client._main_model_supports_vision", lambda *_: True)
+        resolve = MagicMock(return_value=(None, None))
+        auto = MagicMock(side_effect=AssertionError("runtime-bound vision entered auto fallback"))
+        monkeypatch.setattr("agent.auxiliary_client.resolve_provider_client", resolve)
+        monkeypatch.setattr("agent.auxiliary_client._resolve_strict_vision_backend", auto)
+        provider, client, model = resolve_vision_provider_client(main_runtime=runtime)
+        assert provider == "custom:codex"
+        assert client is None and model is None
+        auto.assert_not_called()
+
+
 class TestVisionAutoSkipsKimiCoding:
     """_resolve_auto vision branch skips providers that have no vision on
     their main endpoint (e.g. Kimi Coding Plan /coding) and falls through

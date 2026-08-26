@@ -6040,8 +6040,12 @@ def _model_visible_image_path(path: Path) -> str:
     return f"/workspace/{visible}" if visible is not None else str(path)
 
 
-def _enrich_with_attached_images(user_text: str, image_paths: list[str]) -> str:
-    """Pre-analyze attached images, failing closed if any image is unavailable."""
+def _enrich_with_attached_images(
+    user_text: str,
+    image_paths: list[str],
+    main_runtime: dict | None = None,
+) -> str:
+    """Pre-analyze attached images using the active chat runtime."""
     import asyncio, json as _json
     from tools.vision_tools import vision_analyze_tool
 
@@ -6063,7 +6067,13 @@ def _enrich_with_attached_images(user_text: str, image_paths: list[str]) -> str:
         hint = f"[You can examine it with vision_analyze using image_url: {hint_path}]"
         try:
             r = _json.loads(
-                asyncio.run(vision_analyze_tool(image_url=str(p), user_prompt=prompt))
+                asyncio.run(
+                    vision_analyze_tool(
+                        image_url=str(p),
+                        user_prompt=prompt,
+                        main_runtime=main_runtime,
+                    )
+                )
             )
         except Exception:
             logger.exception("attached image vision analysis failed: %s", path)
@@ -11982,7 +11992,17 @@ def _run_prompt_submit(
                             "Image attachment could not be delivered; please retry."
                         ) from None
                 else:
-                    run_message = _enrich_with_attached_images(prompt, images)
+                    try:
+                        main_runtime = agent._current_main_runtime(
+                            allow_deployment_relay=True
+                        )
+                    except AttributeError:
+                        main_runtime = None
+                    run_message = _enrich_with_attached_images(
+                        prompt,
+                        images,
+                        main_runtime=main_runtime,
+                    )
 
             def _stream(delta):
                 with session["history_lock"]:

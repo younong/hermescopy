@@ -282,7 +282,12 @@ def handle_computer_use(args: Dict[str, Any], **kwargs) -> Any:
         })
 
     try:
-        return _dispatch(backend, action, args)
+        return _dispatch(
+            backend,
+            action,
+            args,
+            main_runtime=kwargs.get("main_runtime"),
+        )
     except Exception as e:
         logger.exception("computer_use %s failed", action)
         return json.dumps({"error": f"{action} failed: {e}"})
@@ -340,7 +345,13 @@ def _summarize_action(action: str, args: Dict[str, Any]) -> str:
     return action
 
 
-def _dispatch(backend: ComputerUseBackend, action: str, args: Dict[str, Any]) -> Any:
+def _dispatch(
+    backend: ComputerUseBackend,
+    action: str,
+    args: Dict[str, Any],
+    *,
+    main_runtime: Optional[Dict[str, Any]] = None,
+) -> Any:
     capture_after = bool(args.get("capture_after"))
 
     if action == "capture":
@@ -348,7 +359,11 @@ def _dispatch(backend: ComputerUseBackend, action: str, args: Dict[str, Any]) ->
         if mode not in {"som", "vision", "ax"}:
             return json.dumps({"error": f"bad mode {mode!r}; use som|vision|ax"})
         cap = backend.capture(mode=mode, app=args.get("app"))
-        return _capture_response(cap, max_elements=_coerce_max_elements(args.get("max_elements")))
+        return _capture_response(
+            cap,
+            max_elements=_coerce_max_elements(args.get("max_elements")),
+            main_runtime=main_runtime,
+        )
 
     if action == "wait":
         seconds = float(args.get("seconds", 1.0))
@@ -535,7 +550,12 @@ def _coerce_max_elements(value: Any) -> int:
     return n
 
 
-def _capture_response(cap: CaptureResult, max_elements: int = _DEFAULT_MAX_ELEMENTS) -> Any:
+def _capture_response(
+    cap: CaptureResult,
+    max_elements: int = _DEFAULT_MAX_ELEMENTS,
+    *,
+    main_runtime: Optional[Dict[str, Any]] = None,
+) -> Any:
     total_elements = len(cap.elements)
     visible_elements = cap.elements[:max_elements]
     truncated_elements = max(0, total_elements - len(visible_elements))
@@ -584,7 +604,11 @@ def _capture_response(cap: CaptureResult, max_elements: int = _DEFAULT_MAX_ELEME
         # main models tripped HTTP 404 / 400 at the provider boundary even
         # when auxiliary.vision was explicitly configured to handle this.
         if _should_route_through_aux_vision():
-            routed = _route_capture_through_aux_vision(cap, summary)
+            routed = _route_capture_through_aux_vision(
+                cap,
+                summary,
+                main_runtime=main_runtime,
+            )
             if routed is not None:
                 return routed
             # Aux routing was requested but failed (vision node down, aux call
@@ -731,6 +755,8 @@ def _should_route_through_aux_vision() -> bool:
 def _route_capture_through_aux_vision(
     cap: CaptureResult,
     summary: str,
+    *,
+    main_runtime: Optional[Dict[str, Any]] = None,
 ) -> Optional[str]:
     """Pre-analyse the captured PNG via ``vision_analyze`` and return a text result.
 
@@ -792,7 +818,11 @@ def _route_capture_through_aux_vision(
         )
 
         result_json = _run_async(
-            vision_analyze_tool(str(temp_image_path), prompt)
+            vision_analyze_tool(
+                str(temp_image_path),
+                prompt,
+                main_runtime=main_runtime,
+            )
         )
     except Exception as exc:
         logger.warning(

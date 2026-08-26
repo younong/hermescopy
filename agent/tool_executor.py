@@ -1472,6 +1472,9 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                     disabled_toolsets=getattr(agent, "disabled_toolsets", None),
                     employee_policy=getattr(agent, "employee_policy", None),
                     collaboration_context=getattr(agent, "collaboration_context", None),
+                    main_runtime=agent._current_main_runtime(
+                        allow_deployment_relay=True
+                    ) if hasattr(agent, "_current_main_runtime") else None,
                     tool_request_middleware_trace=list(middleware_trace),
                 )
                 _spinner_result = function_result
@@ -1516,6 +1519,9 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                     disabled_toolsets=getattr(agent, "disabled_toolsets", None),
                     employee_policy=getattr(agent, "employee_policy", None),
                     collaboration_context=getattr(agent, "collaboration_context", None),
+                    main_runtime=agent._current_main_runtime(
+                        allow_deployment_relay=True
+                    ) if hasattr(agent, "_current_main_runtime") else None,
                     tool_request_middleware_trace=list(middleware_trace),
                 )
             except KeyboardInterrupt:
