@@ -141,7 +141,7 @@
             "command": "bash",
             "args": [
               "-lc",
-              "exec \"$CLAUDE_PROJECT_DIR/.claude/hooks/run-python-hook.sh\" .claude/hooks/development-workflow.py"
+              "exec \"$CLAUDE_PROJECT_DIR/.claude/hooks/run-python-hook.sh\" .claude/hooks/approve-exit-plan.py"
             ],
             "timeout": 5,
             "statusMessage": "Approving development plan"
