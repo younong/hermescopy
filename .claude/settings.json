@@ -85,7 +85,7 @@
         ]
       },
       {
-        "matcher": "EnterWorktree|Write|Edit|NotebookEdit|Bash|PowerShell|Monitor|Agent|Workflow",
+        "matcher": "EnterWorktree|Write|Edit|NotebookEdit",
         "hooks": [
           {
             "type": "command",
