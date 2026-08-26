@@ -47,6 +47,16 @@ for (const plugin of plugins) {
       outDir: plugin.dist,
       target: "es2022",
       write: mode === "build",
+      // The plugin manifest and dashboard loader both hard-code "style.css";
+      // without an explicit assetFileNames rule, rollup names the CSS chunk
+      // after web/package.json ("web") and emits "web.css", which silently
+      // breaks every plugin's styles in production.
+      rollupOptions: {
+        output: {
+          assetFileNames: (info) =>
+            info.name?.endsWith(".css") ? "style.css" : "[name][extname]",
+        },
+      },
     },
   });
   if (mode === "build") {
