@@ -80,6 +80,15 @@ def test_result_does_not_rewake_model():
     json.dumps(result, ensure_ascii=False)
 
 
+def test_final_result_rewakes_model_with_exact_pr_outcome():
+    result = module._final_result("自动提交 PR 完成：https://example.invalid/pr/1。")
+
+    assert result["decision"] == "block"
+    assert "https://example.invalid/pr/1" in result["reason"]
+    assert "准确报告" in result["reason"]
+    assert "不要声称 PR 尚未创建或更新" in result["reason"]
+
+
 def test_main_accepts_utf8_bom_payload(tmp_path, monkeypatch, capsys):
     monkeypatch.setattr(sys, "stdin", __import__("io").StringIO("﻿{}"))
 
@@ -89,12 +98,15 @@ def test_main_accepts_utf8_bom_payload(tmp_path, monkeypatch, capsys):
     assert "缺少 session_id" in output["systemMessage"]
 
 
-def test_unapproved_session_is_passive(tmp_path):
-    result = module.process(
-        {"session_id": "one", "cwd": str(tmp_path)}, _env(tmp_path)
-    )
-    assert "没有已批准" in result["systemMessage"]
-    assert "decision" not in result
+def test_missing_plan_does_not_block_worktree_checks(tmp_path):
+    session_id = "task-session"
+    _origin, repo, _worktree = _repositories(tmp_path, session_id)
+    env = _env(tmp_path)
+
+    result = module.process({"session_id": session_id, "cwd": str(repo)}, env)
+
+    assert result["decision"] == "block"
+    assert "primary checkout" in result["reason"]
 
 
 def test_approved_session_in_primary_checkout_is_blocked_with_bound(tmp_path):
@@ -164,7 +176,6 @@ def test_verified_stop_commits_pushes_creates_pr_and_is_idempotent(tmp_path, mon
     session_id = "task-session"
     origin, _repo, worktree = _repositories(tmp_path, session_id)
     env = _env(tmp_path)
-    _approve(session_id, worktree, env)
     (worktree / "tracked.txt").write_text("implemented\n")
     module.workflow.write_verification(worktree, session_id, ["pytest"], env)
     gh_calls: list[tuple[str, ...]] = []
@@ -185,7 +196,8 @@ def test_verified_stop_commits_pushes_creates_pr_and_is_idempotent(tmp_path, mon
     result = module.process({"session_id": session_id, "cwd": str(worktree)}, env)
     again = module.process({"session_id": session_id, "cwd": str(worktree)}, env)
 
-    assert "https://example.invalid/pr/1" in result["systemMessage"]
+    assert result["decision"] == "block"
+    assert "https://example.invalid/pr/1" in result["reason"]
     branch_head = _git(origin, "rev-parse", "refs/heads/worktree-task")
     assert branch_head == _git(worktree, "rev-parse", "HEAD")
     assert _git(worktree, "show", "HEAD:tracked.txt") == "implemented"
@@ -219,7 +231,8 @@ def test_open_pr_is_updated_but_terminal_pr_is_not_pushed(tmp_path, monkeypatch)
         result = module.process({"session_id": session_id, "cwd": str(worktree)}, env)
 
         if state == "OPEN":
-            assert "已更新现有 PR" in result["systemMessage"]
+            assert result["decision"] == "block"
+            assert "已更新现有 PR" in result["reason"]
             assert _git(origin, "rev-parse", "refs/heads/worktree-task") != before
         else:
             assert state in result["systemMessage"]

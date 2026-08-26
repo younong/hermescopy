@@ -136,7 +136,6 @@ def test_verify_cli_records_only_success(tmp_path):
     env = os.environ.copy()
     env["CLAUDE_CODE_SESSION_ID"] = session_id
     env["CLAUDE_DEVELOPMENT_WORKFLOW_STATE_DIR"] = str(state)
-    module.record_plan_approved({"session_id": session_id, "cwd": str(worktree)}, env)
 
     failed = subprocess.run(
         [sys.executable, str(HOOK), "verify", "--", sys.executable, "-c", "raise SystemExit(7)"],
