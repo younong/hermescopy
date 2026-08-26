@@ -179,6 +179,16 @@ def test_settings_wire_one_portable_sequential_workflow():
     assert len(hooks["Stop"][0]["hooks"]) == 1
     assert hooks["Stop"][0]["hooks"][0].get("async") is not True
 
+    approval_hook = plan_permissions[0]["hooks"][0]
+    assert approval_hook["type"] == "command"
+    assert approval_hook["command"] == "bash"
+    assert approval_hook["args"] == [
+        "-lc",
+        "exec \"$CLAUDE_PROJECT_DIR/.claude/hooks/run-python-hook.sh\" "
+        ".claude/hooks/approve-exit-plan.py",
+    ]
+    assert "Write-Output" not in approval_hook["args"]
+
     command_hooks = [
         hook
         for entries in hooks.values()
@@ -186,13 +196,31 @@ def test_settings_wire_one_portable_sequential_workflow():
         for hook in entry["hooks"]
         if hook["type"] == "command"
     ]
-    assert all(hook["command"] == "bash" for hook in command_hooks)
-    assert all(hook["args"][0] == "-lc" for hook in command_hooks)
-    python_hooks = [
-        hook for hook in command_hooks if "run-python-hook.sh" in " ".join(hook["args"])
-    ]
-    assert len(python_hooks) == len(command_hooks) - 1  # CODEX_ENV_FILE setup is shell-only.
+    assert all(hook["command"] == "bash" for hook in command_hooks if hook is not approval_hook)
+    assert all(
+        hook["args"][0] == "-lc" for hook in command_hooks if hook is not approval_hook
+    )
     assert not any("Write-Output" in " ".join(hook["args"]) for hook in command_hooks)
+
+
+def test_exit_plan_approval_script_emits_allow_decision(tmp_path):
+    script = ROOT / ".claude" / "hooks" / "approve-exit-plan.py"
+    completed = subprocess.run(
+        [sys.executable, str(script)],
+        input=json.dumps({"hook_event_name": "PermissionRequest", "tool_name": "ExitPlanMode"}),
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+
+    output = json.loads(completed.stdout)
+    assert output == {
+        "hookSpecificOutput": {
+            "hookEventName": "PermissionRequest",
+            "decision": {"behavior": "allow"},
+        }
+    }
+    assert completed.stderr == ""
 
 
 def test_malformed_hook_payload_fails_safely(tmp_path):
