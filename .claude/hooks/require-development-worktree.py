@@ -15,13 +15,13 @@ import sys
 from typing import Any, Iterator
 
 
-GIT_TIMEOUT_SECONDS = 2
+GIT_TIMEOUT_SECONDS = 5
 MAX_CANDIDATES = 20
 MAX_CANDIDATE_TEXT = 6_000
 OWNER_FILENAME = "claude-task-owner.json"
 OWNER_VERSION = 1
 FILE_TOOLS = {"Edit", "NotebookEdit", "Write"}
-CWD_GUARDED_TOOLS = {"Agent", "Bash", "Workflow"}
+CWD_GUARDED_TOOLS = {"Agent", "Bash", "Monitor", "PowerShell", "Workflow"}
 LIFECYCLE_EVENTS = {"CwdChanged", "PostCompact", "SessionStart"}
 
 
@@ -519,8 +519,7 @@ def handle_pretool(payload: dict[str, Any], project_dir: Path) -> None:
         )
         return
     if not paths.is_linked_worktree:
-        if payload.get("tool_name") in FILE_TOOLS:
-            deny_pretool(denial_reason(worktree_candidates(project_dir)))
+        deny_pretool(denial_reason(worktree_candidates(project_dir)))
         return
     try:
         verify_owner(payload, paths)
