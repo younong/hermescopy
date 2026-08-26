@@ -503,6 +503,43 @@ def test_post_enter_registers_clean_new_worktree(tmp_path):
     assert "authorized worktree" in result.stdout
 
 
+def test_post_enter_registers_clean_worktree_with_untracked_directory(tmp_path):
+    repo = _new_repo(tmp_path)
+    worktree = _add_worktree(repo, "untracked-directory-task")
+    (worktree / ".gitignore").write_text("build-cache/\n")
+    _git(worktree, "add", ".gitignore")
+    _git(
+        worktree,
+        "-c",
+        "user.name=Hook Test",
+        "-c",
+        "user.email=hook@example.invalid",
+        "commit",
+        "-m",
+        "ignore build cache",
+    )
+    (worktree / "build-cache").mkdir()
+    (worktree / "build-cache" / "artifact.bin").write_bytes(b"artifact")
+
+    result = _run_hook(
+        repo,
+        worktree,
+        raw_payload=_payload(
+            "PostToolUse",
+            repo,
+            session_id="untracked-directory-session",
+            tool_name="EnterWorktree",
+            tool_input={"name": "untracked-directory-task"},
+            tool_response=f"Created worktree at {worktree}.",
+            cwd=worktree,
+        ),
+    )
+
+    owner = json.loads(_owner_path(worktree).read_text())
+    assert owner == {"version": 1, "task_id": "untracked-directory-session"}
+    assert "authorized worktree" in result.stdout
+
+
 def test_post_enter_does_not_claim_dirty_unowned_worktree(tmp_path):
     repo = _new_repo(tmp_path)
     worktree = _add_worktree(repo, "dirty-task")
@@ -778,8 +815,10 @@ def test_settings_enable_ownership_guard_across_lifecycle_events():
     ]
     assert len(require_hooks) == 5
     assert all(hook["type"] == "command" for hook in require_hooks)
+    assert all(hook["command"] == "bash" for hook in require_hooks)
+    assert all(hook["args"][0] == "-lc" for hook in require_hooks)
     assert all(
-        "require-development-worktree.py"
+        "run-python-hook.sh"
         in " ".join([hook.get("command", ""), *hook.get("args", [])])
         for hook in require_hooks
     )

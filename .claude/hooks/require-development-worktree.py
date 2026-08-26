@@ -362,7 +362,12 @@ def create_owner(payload: dict[str, Any], paths: RepositoryPaths) -> dict[str, A
 
 
 def worktree_is_clean(paths: RepositoryPaths) -> bool | None:
-    output = git_output(paths.worktree, "status", "--porcelain", "--untracked-files=all")
+    # ``all`` recursively expands every ignored-excluded untracked file. On a
+    # freshly-created worktree this can exceed the hook timeout on Windows (and
+    # on large repositories), causing a clean worktree to be rejected. Normal
+    # mode still reports an untracked directory as ``?? dir/`` while avoiding
+    # that recursive scan.
+    output = git_output(paths.worktree, "status", "--porcelain", "--untracked-files=normal")
     return None if output is None else not output.strip()
 
 

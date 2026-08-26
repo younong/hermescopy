@@ -232,6 +232,7 @@ def test_settings_apply_hook_to_agents_and_workflows():
 
     assert len(review_hooks) == 1
     hook = review_hooks[0]["hooks"][0]
-    assert hook["command"] == "python"
-    assert hook["args"][0] == "-c"
+    assert hook["command"] == "bash"
+    assert hook["args"][0] == "-lc"
+    assert "run-python-hook.sh" in hook["args"][1]
     assert "block-review-agents.py" in " ".join(hook["args"])

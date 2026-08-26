@@ -187,10 +187,13 @@ def test_settings_wire_one_portable_sequential_workflow():
         for hook in entry["hooks"]
         if hook["type"] == "command"
     ]
-    assert all(hook["command"] == "python" for hook in command_hooks)
-    assert all(hook["args"][0] == "-c" for hook in command_hooks)
+    assert all(hook["command"] == "bash" for hook in command_hooks)
+    assert all(hook["args"][0] == "-lc" for hook in command_hooks)
+    python_hooks = [
+        hook for hook in command_hooks if "run-python-hook.sh" in " ".join(hook["args"])
+    ]
+    assert len(python_hooks) == len(command_hooks) - 1  # CODEX_ENV_FILE setup is shell-only.
     assert not any("Write-Output" in " ".join(hook["args"]) for hook in command_hooks)
-    assert not any("python3" in " ".join(hook["args"]) for hook in command_hooks)
 
 
 def test_malformed_hook_payload_fails_safely(tmp_path):
