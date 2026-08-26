@@ -15,20 +15,20 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python",
+            "command": "bash",
             "args": [
-              "-c",
-              "import os,pathlib,shlex; env=os.environ.get('CLAUDE_ENV_FILE'); project=os.environ.get('CLAUDE_PROJECT_DIR'); env and project and pathlib.Path(env).open('a', encoding='utf-8').write('export CODEX_HOME=' + shlex.quote(str(pathlib.Path(project) / '.codex')) + '\\n')"
+              "-lc",
+              "printf 'export CODEX_HOME=%q\\n' \"$CLAUDE_PROJECT_DIR/.codex\" >> \"$CLAUDE_ENV_FILE\""
             ],
             "timeout": 5,
             "statusMessage": "Configuring project-local Codex"
           },
           {
             "type": "command",
-            "command": "python",
+            "command": "bash",
             "args": [
-              "-c",
-              "import os,runpy; runpy.run_path(os.path.join(os.environ['CLAUDE_PROJECT_DIR'],'.claude','hooks','require-development-worktree.py'),run_name='__main__')"
+              "-lc",
+              "exec \"$CLAUDE_PROJECT_DIR/.claude/hooks/run-python-hook.sh\" .claude/hooks/require-development-worktree.py"
             ],
             "timeout": 5,
             "statusMessage": "Restoring worktree task ownership"
@@ -41,10 +41,10 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python",
+            "command": "bash",
             "args": [
-              "-c",
-              "import os,runpy; runpy.run_path(os.path.join(os.environ['CLAUDE_PROJECT_DIR'],'.claude','hooks','require-development-worktree.py'),run_name='__main__')"
+              "-lc",
+              "exec \"$CLAUDE_PROJECT_DIR/.claude/hooks/run-python-hook.sh\" .claude/hooks/require-development-worktree.py"
             ],
             "timeout": 5,
             "statusMessage": "Restoring worktree task ownership"
@@ -57,10 +57,10 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python",
+            "command": "bash",
             "args": [
-              "-c",
-              "import os,runpy; runpy.run_path(os.path.join(os.environ['CLAUDE_PROJECT_DIR'],'.claude','hooks','require-development-worktree.py'),run_name='__main__')"
+              "-lc",
+              "exec \"$CLAUDE_PROJECT_DIR/.claude/hooks/run-python-hook.sh\" .claude/hooks/require-development-worktree.py"
             ],
             "timeout": 5,
             "statusMessage": "Checking worktree task ownership"
@@ -74,10 +74,10 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python",
+            "command": "bash",
             "args": [
-              "-c",
-              "import os,runpy; runpy.run_path(os.path.join(os.environ['CLAUDE_PROJECT_DIR'],'.claude','hooks','block-review-agents.py'),run_name='__main__')"
+              "-lc",
+              "exec \"$CLAUDE_PROJECT_DIR/.claude/hooks/run-python-hook.sh\" .claude/hooks/block-review-agents.py"
             ],
             "timeout": 5,
             "statusMessage": "Enforcing bounded review policy"
@@ -89,10 +89,10 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python",
+            "command": "bash",
             "args": [
-              "-c",
-              "import os,runpy; runpy.run_path(os.path.join(os.environ['CLAUDE_PROJECT_DIR'],'.claude','hooks','require-development-worktree.py'),run_name='__main__')"
+              "-lc",
+              "exec \"$CLAUDE_PROJECT_DIR/.claude/hooks/run-python-hook.sh\" .claude/hooks/require-development-worktree.py"
             ],
             "timeout": 5,
             "statusMessage": "Enforcing worktree task ownership"
@@ -106,10 +106,10 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python",
+            "command": "bash",
             "args": [
-              "-c",
-              "import os,runpy; runpy.run_path(os.path.join(os.environ['CLAUDE_PROJECT_DIR'],'.claude','hooks','require-development-worktree.py'),run_name='__main__')"
+              "-lc",
+              "exec \"$CLAUDE_PROJECT_DIR/.claude/hooks/run-python-hook.sh\" .claude/hooks/require-development-worktree.py"
             ],
             "timeout": 5,
             "statusMessage": "Registering worktree task ownership"
@@ -121,10 +121,10 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python",
+            "command": "bash",
             "args": [
-              "-c",
-              "import os,runpy; runpy.run_path(os.path.join(os.environ['CLAUDE_PROJECT_DIR'],'.claude','hooks','development-workflow.py'),run_name='__main__')"
+              "-lc",
+              "exec \"$CLAUDE_PROJECT_DIR/.claude/hooks/run-python-hook.sh\" .claude/hooks/development-workflow.py"
             ],
             "timeout": 5,
             "statusMessage": "Continuing approved development plan"
@@ -138,10 +138,10 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python",
+            "command": "bash",
             "args": [
-              "-c",
-              "import os,runpy; runpy.run_path(os.path.join(os.environ['CLAUDE_PROJECT_DIR'],'.claude','hooks','development-workflow.py'),run_name='__main__')"
+              "-lc",
+              "exec \"$CLAUDE_PROJECT_DIR/.claude/hooks/run-python-hook.sh\" .claude/hooks/development-workflow.py"
             ],
             "timeout": 5,
             "statusMessage": "Approving development plan"
@@ -154,10 +154,10 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python",
+            "command": "bash",
             "args": [
-              "-c",
-              "import os,runpy; runpy.run_path(os.path.join(os.environ['CLAUDE_PROJECT_DIR'],'.claude','hooks','auto-submit-pr.py'),run_name='__main__')"
+              "-lc",
+              "exec \"$CLAUDE_PROJECT_DIR/.claude/hooks/run-python-hook.sh\" .claude/hooks/auto-submit-pr.py"
             ],
             "timeout": 120,
             "statusMessage": "Submitting verified work as a GitHub PR"

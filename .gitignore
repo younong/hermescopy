@@ -45,6 +45,7 @@ deploy/*.local.env
 !.claude/hooks/block-review-agents.py
 !.claude/hooks/development-workflow.py
 !.claude/hooks/require-development-worktree.py
+!.claude/hooks/run-python-hook.sh
 .playwright-cli/
 compose.hermes.local.yml
 export*

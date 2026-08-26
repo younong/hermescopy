@@ -815,8 +815,10 @@ def test_settings_enable_ownership_guard_across_lifecycle_events():
     ]
     assert len(require_hooks) == 5
     assert all(hook["type"] == "command" for hook in require_hooks)
+    assert all(hook["command"] == "bash" for hook in require_hooks)
+    assert all(hook["args"][0] == "-lc" for hook in require_hooks)
     assert all(
-        "require-development-worktree.py"
+        "run-python-hook.sh"
         in " ".join([hook.get("command", ""), *hook.get("args", [])])
         for hook in require_hooks
     )
