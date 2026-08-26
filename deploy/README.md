@@ -16,15 +16,19 @@
 
 ## 核心发布规则
 
-常规发布先确定 Git tag，然后只发布该 tag 中的代码。
+生产 artifact 始终来自不可变 Git tag。
 
-- 新发布：`--create-tag <tag>`
-- 重试/回滚：`--tag <existing-tag>`
-- 无 tag 的受限例外：`--ref <40-hex-commit-sha>`，仅发布已推送到 `origin` 的不可变完整 commit SHA；不会打 tag，也绝不会上传当前工作区或接受分支名、`HEAD`、短 SHA。
+- 新发布：开发分支先通过 PR 合入 `main`，同步本地 `main` 后使用 `--create-tag <tag>`。
+- 重试/回滚：仅使用 origin 上已经发布、且本地与远端同名 tag 指向同一 commit 的 `--tag <existing-tag>`。
+- 不支持按工作区、分支名或 commit SHA 直接发布；原 `--ref` 入口已删除。
 
-新发布前必须人工提交代码。`--create-tag` 要求具名分支和干净工作区，fetch 最新 `origin/main`，以 `--no-autostash` rebase 当前分支，再用绑定 rebase 前远端分支精确 SHA 的 `--force-with-lease=<完整分支 ref>:<observed SHA>` 更新远端同名 PR/源分支，然后只创建并 atomic push 指定的 annotated tag。默认只允许 `main`；`--allow-non-main` 保留，但同样必须 rebase 最新 `origin/main`，且不允许 detached HEAD。远端分支在快照后发生任何变化时 lease 会失效，发布会在 tag 创建/发布前 fail closed。工具不会自动 commit/stash，也禁止无守卫的 `--force`、裸/隐式 lease、`+` refspec、覆盖 tag、tag-only 降级或用 `--tags` 推送无关 tag。
+常规 `--create-tag` 要求具名 `main` 和干净工作区。工具 fetch 最新 `origin/main` 后，要求 `HEAD`、本地 `main` 与 `origin/main` 完全一致；落后、领先或分叉都会停止。常规路径不会 rebase 或 push `main`，只创建并 push 唯一目标 annotated tag，不会用 `--tags` 推送其他本地 tag。
 
-工具使用 `git archive <tag>` 生成干净源码，在本机临时源码目录中安装 Node 依赖、构建 `web`，并用独立 lockfile 生成只含 PptxGenJS 的 PowerPoint payload，然后把生产运行源码 + 本机预构建产物打包上传到服务器。构建完成后，归档会省略 `tests/`、`website/`、`.github/` 和 `docs/` 等非运行目录。服务器只解包到 `/opt/hermes/releases/<tag>`、按 locked Python/PowerPoint 输入和架构创建或复用 root-owned immutable runtime、验证 host sandbox policy，并把 runner、Dashboard unit、policy 和 seccomp 先写入事务 staging。切换时停止旧 Dashboard，由其排空并吊销 Owner Workers；若旧版本仍有 standalone Gateway unit，则仅在迁移中停止、禁用并移除它。确认旧服务退出后才原子替换 `/opt/hermes/current` 和 staged artifacts，随后只启动 `hermes-dashboard.service`。切换前会通过真实 authenticated Bubblewrap executor 生成两页 PPTX、用 MarkItDown 校验顺序，并用 LibreOffice 转换一次 PDF。发布工具还会在远端事务前建立 authenticated 连续性会话，在候选成功或 pre-commit 回滚后用新单次 ticket 恢复同一 canonical session，再执行提交后公开真实模型冒烟。发布成功后会清理本次上传的远端 tarball 和临时冒烟数据，并按保留策略回收旧 release。
+`--allow-non-main` 只保留给用户明确认定的紧急事故，不是 PR 未合入或 main 未同步时的快捷方式。应急路径仍要求具名分支和干净工作区，会 rebase 最新 `origin/main`，用绑定 observed SHA 的完整分支 ref exact lease 更新远端同名分支，再以 prepared commit lease atomic push 分支守卫与唯一 tag；rebase 冲突、detached HEAD、tag 冲突或远端并发移动都会 fail closed。通过 AI 执行时，每一条包含 `--allow-non-main` 的完整命令都必须按当前分支、tag、dry-run/真实模式单独获得用户明确批准；一般性的“发布”“继续”或此前批准不能沿用，dry-run 和真实部署也必须分别请示。
+
+`scripts/release.py --publish` 负责 GitHub Release 和分发 artifact，不是阿里云部署入口，不能用于绕过以上 main/tag 规则。
+
+工具使用 `git archive <tag>` 生成干净源码，在本机临时源码目录中安装 Node 依赖、构建 `web`，并用独立 lockfile 生成只含 PptxGenJS 的 PowerPoint payload，然后把生产运行源码 + 本机预构建产物打包上传到服务器。构建完成后，归档会省略 `tests/`、`website/`、`.github/` 和 `docs/` 等非运行目录。服务器只解包到 `/opt/hermes/releases/<tag>`、按 locked Python/PowerPoint 输入和架构创建或复用 root-owned immutable runtime、验证 host sandbox policy，并把 runner、Dashboard unit、policy 和 seccomp 先写入事务 staging。切换时停止旧 Dashboard，由其排空并吊销 Owner Workers；若旧版本仍有 standalone Gateway unit，则仅在迁移中停止、禁用并移除它。确认旧服务退出后才原子替换 `/opt/hermes/current` 和 staged artifacts，随后只启动 `hermes-dashboard.service`。切换前会通过真实 authenticated Bubblewrap executor 生成两页 PPTX、用 MarkItDown 校验顺序，并用 LibreOffice 转换一次 PDF。发布工具还会在远端事务前建立 authenticated 连续性会话，在候选成功或 pre-commit 回滚后用新单次 ticket 恢复同一 canonical session，再执行提交后公开真实模型冒烟。发布成功后会清理本次上传的远端 tarball 和临时冒烟数据，并按保留策略回收旧 release。历史 `/opt/hermes/releases/commit-<sha>` 目录不会在升级时被主动删除；当前或刚替换的 release 仍受保护，其他目录之后由既有保留策略自然清理，但它们不再是新发布或回滚来源。
 
 ## 服务器运行方式
 
@@ -98,32 +102,35 @@ Dry-run 会披露 provisioning 与 PowerPoint runtime smoke 均为 planned，但
 npm run deploy -- --help
 ```
 
-预览新 tag 发布（仍要求代码已提交且工作区干净，只做远端只读检查，不 rebase/push/tag）：
+常规新 tag 发布必须先把开发分支通过 PR 合入 `main`，再同步本地 `main`：
 
 ```bash
+git status --short
+git switch main
+git pull --ff-only origin main
 npm run deploy -- --create-tag v2026.7.4 --dry-run
-```
-
-创建 tag 并发布：
-
-```bash
 npm run deploy -- --create-tag v2026.7.4
 ```
 
-部署已有 tag：
+`--dry-run` 仍执行本地和 origin Git 只读校验，但不创建 tag、不上传、不连接服务器。工具确认本地与远端 `main` 完全一致后，真实执行只发布目标 tag。
+
+明确的紧急事故才可从 non-main 分支创建 tag：
 
 ```bash
+npm run deploy -- --create-tag <emergency-tag> --allow-non-main --dry-run
+npm run deploy -- --create-tag <emergency-tag> --allow-non-main
+```
+
+这两条命令通过 AI 执行时必须分别单独获得用户对完整命令的明确批准。
+
+部署 origin 上已有的同名同 commit tag：
+
+```bash
+npm run deploy -- --tag v2026.7.4 --dry-run
 npm run deploy -- --tag v2026.7.4
 ```
 
-不创建 tag 时，部署已推送的完整 commit SHA：
-
-```bash
-npm run deploy -- --ref <40-hex-commit-sha> --dry-run
-npm run deploy -- --ref <40-hex-commit-sha>
-```
-
-`--ref` 仍要求干净工作树，并将 release 目录固定命名为 `commit-<sha>`；artifact 中的 `.hermes-release.json` 必须与该 SHA 一致，已有不同来源的 release 不会被覆盖。
+`--tag` 从不可变 tag 构建，不上传当前工作区；工作区不干净时默认拒绝，可显式使用 `--allow-dirty`，但本地修改仍不会进入 artifact。只存在于本地或与 origin 指向不同 commit 的 tag 会被拒绝。
 
 回滚到旧 tag：
 

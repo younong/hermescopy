@@ -22,11 +22,12 @@ allowed-tools:
 
 ## 核心规则
 
-1. **必须先有 tag，再发布**
-   - 新版本发布：先人工提交代码，再使用 `--create-tag <tag>`。
-   - `--create-tag` 要求具名分支和干净工作区，自动 rebase 最新 `origin/main`，再以绑定 rebase 前远端分支精确 SHA 的 `--force-with-lease=<完整 ref>:<observed SHA>` 更新原 PR/源分支，并以 prepared commit 精确 lease atomic push 唯一目标 tag；不会自动 commit/stash，也不会推送其他本地 tag。
-   - 重试或回滚：使用 `--tag <existing-tag>`。
-   - 不允许发布未打 tag 的当前工作区。
+1. **常规发布必须先合入 main，再按 tag 发布**
+   - 新版本发布：开发分支先通过 PR 合入 `main`，同步本地 `main` 后使用 `--create-tag <tag>`。
+   - `--create-tag` 要求具名 `main`、干净工作区，以及 `HEAD`、本地 `main` 与最新 `origin/main` 完全一致；工具不会 rebase 或 push `main`，只创建并 push 唯一目标 tag。
+   - 重试或回滚：仅使用 origin 上已经发布、且本地/远端指向同一 commit 的 `--tag <existing-tag>`。
+   - 不允许发布未打 tag 的工作区、分支名或 commit SHA；`--ref` 已删除。
+   - `scripts/release.py --publish` 不是阿里云部署入口，不得用它绕过这些规则。
 
 2. **不要把密码或 secret 写入仓库**
    - 不要编辑代码、文档、配置去保存真实服务器密码。
@@ -49,6 +50,13 @@ allowed-tools:
 6. **不等待 GitHub 远程测试**
    - 发布前不得查询、等待或要求 GitHub 分片测试、GitHub Actions、PR checks 或其他远程 CI 通过。
    - 发布只由当前改动规定的本地验证、下方发布前检查和发布工具自身检查决定；这些本地与内置检查不得省略。
+
+7. **`--allow-non-main` 只允许逐命令审批的应急场景**
+   - 该参数仅用于用户明确认定的紧急事故，不属于常规发布授权。AI 不得因为当前分支不是 `main`、PR 尚未合入、时间紧迫，或用户此前批准过发布而自行使用。
+   - 每次准备执行任何包含 `--allow-non-main` 的命令前，必须单独列明当前分支、目标 tag、dry-run/真实执行模式和完整命令，向用户请示并收到该次明确批准。
+   - 一般性的“发布”“直接部署”“继续”和此前命令的批准均不能沿用；分支、tag、host、dry-run/真实模式或其他参数变化后必须重新请示。沉默或含糊回复视为未批准。
+   - dry-run 和真实部署分别请示。未获明确批准时停止，并要求先通过 PR 合入 `main`。
+   - 固定请示格式：`当前分支 <branch> 尚未通过常规流程合入 main。--allow-non-main 是应急旁路，会 rebase 最新 origin/main、用 exact lease 更新远端同名分支并创建 tag <tag>。是否明确批准我仅执行下面这一次命令？ <完整命令>`
 
 ## 常用命令
 
@@ -131,12 +139,15 @@ ssh root@106.15.186.104 'set -a; [ ! -f /opt/hermes/shared/.env ] || . /opt/herm
 ```bash
 git status --short
 git branch --show-current
+git fetch --no-tags origin main
+git rev-parse HEAD
+git rev-parse origin/main
 git tag --list | tail -n 20
 node --check deploy/deploy.mjs
 npm run deploy -- --help
 ```
 
-注意：创建新 tag 时，发布工具默认要求当前分支为 `main` 且工作区（含未跟踪文件）干净。工具会 fetch 并 rebase 最新 `origin/main`，用完整分支 ref 和 rebase 前 observed SHA 的精确 lease 更新原远端分支，然后精确发布目标 tag。确实要从非 main 分支发布时，必须显式使用 `--allow-non-main`；该路径同样 rebase `origin/main`，且 detached HEAD 始终拒绝。远端分支并发变化会使 lease 失效并停止发布。
+注意：常规创建新 tag 时，当前分支必须是 `main`、工作区（含未跟踪文件）必须干净，且 `HEAD` 必须与最新 `origin/main` 完全一致。落后、领先或分叉都停止；不得让发布脚本替用户 rebase/push main，也不得把 `--allow-non-main` 当作快捷修复。只有用户明确提出应急并按上面的逐命令规则批准后，才能使用该参数；应急路径仍会 rebase `origin/main`，且 detached HEAD 或远端并发变化会使发布停止。
 
 ## 自动两层冒烟
 

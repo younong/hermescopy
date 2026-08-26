@@ -6,6 +6,8 @@ from pathlib import Path
 import shutil
 import subprocess
 
+import pytest
+
 
 DEPLOY_SCRIPT = Path(__file__).parents[2] / "deploy" / "deploy.mjs"
 
@@ -61,6 +63,7 @@ def _repositories(tmp_path: Path) -> tuple[Path, Path, Path]:
     _commit_file(seed, "base.txt", "base\n", "base")
     _git(seed, "remote", "add", "origin", str(origin))
     _git(seed, "push", "-u", "origin", "main")
+    _git(origin, "symbolic-ref", "HEAD", "refs/heads/main")
     _git(tmp_path, "clone", str(origin), str(work))
     _configure_identity(work)
     return origin, seed, work
@@ -152,22 +155,73 @@ def _move_remote_branch_before_push(
     return {**os.environ, "PATH": f"{wrapper_dir}{os.pathsep}{os.environ['PATH']}"}
 
 
-def test_stale_clean_main_is_updated_before_the_release_tag(tmp_path):
-    origin, seed, work = _repositories(tmp_path)
-    latest = _commit_file(seed, "remote.txt", "remote\n", "advance main")
-    _git(seed, "push", "origin", "main")
+def test_synchronized_main_publishes_only_the_release_tag(tmp_path):
+    origin, _seed, work = _repositories(tmp_path)
+    main = _ref(work, "main")
     _git(work, "tag", "unrelated-local-tag")
 
     result = _prepare(work, "v-test-main")
 
     assert result.returncode == 0, result.stderr
-    assert _ref(work, "main") == latest
-    assert _ref(work, "v-test-main^{commit}") == latest
-    assert _ref(origin, "refs/heads/main") == latest
-    assert _ref(origin, "refs/tags/v-test-main^{commit}") == latest
+    assert _ref(work, "main") == main
+    assert _ref(origin, "refs/heads/main") == main
+    assert _ref(work, "v-test-main^{commit}") == main
+    assert _ref(origin, "refs/tags/v-test-main^{commit}") == main
+    assert "git rebase" not in result.stdout
+    push_lines = "\n".join(
+        line for line in result.stdout.splitlines() if "$ git push" in line
+    )
+    assert "refs/heads/main" not in push_lines
+    assert "--force-with-lease" not in push_lines
+    assert "--tags" not in result.stdout
     assert _git(
         origin, "rev-parse", "--verify", "refs/tags/unrelated-local-tag", check=False
     ).returncode != 0
+
+
+def test_stale_main_is_rejected_without_moving_refs(tmp_path):
+    origin, seed, work = _repositories(tmp_path)
+    local_main = _ref(work, "main")
+    latest = _commit_file(seed, "remote.txt", "remote\n", "advance main")
+    _git(seed, "push", "origin", "main")
+
+    result = _prepare(work, "v-test-stale")
+
+    assert result.returncode != 0
+    assert "behind origin/main" in result.stderr
+    assert _ref(work, "main") == local_main
+    assert _ref(origin, "refs/heads/main") == latest
+    assert _git(work, "rev-parse", "--verify", "refs/tags/v-test-stale", check=False).returncode != 0
+    assert _git(origin, "rev-parse", "--verify", "refs/tags/v-test-stale", check=False).returncode != 0
+
+
+def test_main_with_unmerged_commits_is_rejected(tmp_path):
+    origin, _seed, work = _repositories(tmp_path)
+    remote_main = _ref(origin, "refs/heads/main")
+    local_main = _commit_file(work, "local.txt", "local\n", "unmerged local change")
+
+    result = _prepare(work, "v-test-ahead")
+
+    assert result.returncode != 0
+    assert "not merged into origin/main" in result.stderr
+    assert _ref(work, "main") == local_main
+    assert _ref(origin, "refs/heads/main") == remote_main
+
+
+def test_non_main_release_without_emergency_flag_is_rejected(tmp_path):
+    origin, _seed, work = _repositories(tmp_path)
+    _git(work, "checkout", "-b", "release/candidate")
+    local_head = _commit_file(work, "feature.txt", "feature\n", "feature")
+    before_remote = _git(origin, "show-ref").stdout
+
+    result = _prepare(work, "v-test-no-emergency")
+
+    assert result.returncode != 0
+    assert "Merge the change through a PR" in result.stderr
+    assert "--allow-non-main" not in result.stderr
+    assert _ref(work, "HEAD") == local_head
+    assert _git(origin, "show-ref").stdout == before_remote
+    assert _git(work, "rev-parse", "--verify", "refs/tags/v-test-no-emergency", check=False).returncode != 0
 
 
 def test_non_main_release_rebases_onto_origin_main_and_pushes_same_branch(tmp_path):
@@ -201,14 +255,15 @@ def test_create_tag_rejects_dirty_worktree_even_in_dry_run(tmp_path):
     assert _git(origin, "show-ref").stdout == before_remote
 
 
-def test_rebase_conflict_aborts_without_pushing_or_tagging(tmp_path):
+def test_emergency_rebase_conflict_aborts_without_pushing_or_tagging(tmp_path):
     origin, seed, work = _repositories(tmp_path)
+    _git(work, "checkout", "-b", "release/candidate")
     local_head = _commit_file(work, "base.txt", "local\n", "local conflict")
     _commit_file(seed, "base.txt", "remote\n", "remote conflict")
     _git(seed, "push", "origin", "main")
     remote_head = _ref(origin, "refs/heads/main")
 
-    result = _prepare(work, "v-test-conflict")
+    result = _prepare(work, "v-test-conflict", allow_non_main=True)
 
     assert result.returncode != 0
     assert "Rebase onto origin/main failed" in result.stderr
@@ -220,10 +275,8 @@ def test_rebase_conflict_aborts_without_pushing_or_tagging(tmp_path):
     assert _git(origin, "rev-parse", "--verify", "refs/tags/v-test-conflict", check=False).returncode != 0
 
 
-def test_dry_run_reports_sync_without_changing_refs(tmp_path):
-    origin, seed, work = _repositories(tmp_path)
-    _commit_file(seed, "remote.txt", "remote\n", "advance main")
-    _git(seed, "push", "origin", "main")
+def test_main_dry_run_reports_tag_only_publication_without_changing_refs(tmp_path):
+    origin, _seed, work = _repositories(tmp_path)
     before_local = _git(work, "show-ref").stdout
     before_remote = _git(origin, "show-ref").stdout
 
@@ -233,20 +286,15 @@ def test_dry_run_reports_sync_without_changing_refs(tmp_path):
     assert _git(work, "show-ref").stdout == before_local
     assert _git(origin, "show-ref").stdout == before_remote
     assert "git fetch --no-tags origin" in result.stdout
-    assert "git rebase --no-autostash refs/remotes/origin/main" in result.stdout
-    remote_main = _ref(origin, "refs/heads/main")
-    assert (
-        f"git push --force-with-lease=refs/heads/main:{remote_main} origin "
-        "<post-rebase-commit>:refs/heads/main"
-    ) in result.stdout
     assert "git tag -a v-test-dry-run" in result.stdout
-    assert (
-        "git push --atomic "
-        "--force-with-lease=refs/heads/main:<post-rebase-commit> origin"
-    ) in result.stdout
-    push_lines = [line for line in result.stdout.splitlines() if "git push" in line]
-    assert all(" --force " not in line and " +" not in line for line in push_lines)
-    assert all("--force-with-lease=refs/heads/main:" in line for line in push_lines)
+    push_lines = "\n".join(
+        line for line in result.stdout.splitlines() if "git push" in line
+    )
+    assert "git push origin refs/tags/v-test-dry-run:refs/tags/v-test-dry-run" in push_lines
+    assert "refs/heads/main" not in push_lines
+    assert "--force-with-lease" not in push_lines
+    assert "git rebase" not in result.stdout
+    assert "<post-rebase-commit>" not in result.stdout
     assert "--tags" not in result.stdout
 
 
@@ -292,27 +340,85 @@ def test_create_tag_cli_dry_run_reports_powerpoint_provisioning(tmp_path):
     assert "v-test-powerpoint" in result.stdout
 
 
-def test_create_tag_cli_rejects_commit_ref_override(tmp_path):
+def test_cli_rejects_allow_non_main_with_existing_tag(tmp_path):
     _origin, _seed, work = _repositories(tmp_path)
     script = _install_deploy_script(work)
-    commit = _ref(work, "HEAD")
 
     result = _run(
-        [
-            "node",
-            str(script),
-            "--create-tag",
-            "v-test-cli",
-            "--ref",
-            commit,
-            "--dry-run",
-        ],
+        ["node", str(script), "--tag", "v-test-existing", "--allow-non-main", "--dry-run"],
         work,
         check=False,
     )
 
     assert result.returncode != 0
-    assert "Pass exactly one of --tag, --create-tag, or --ref." in result.stderr
+    assert "--allow-non-main is only valid with --create-tag" in result.stderr
+
+
+def test_cli_rejects_removed_commit_ref_source(tmp_path):
+    _origin, _seed, work = _repositories(tmp_path)
+    script = _install_deploy_script(work)
+    commit = _ref(work, "HEAD")
+
+    result = _run(
+        ["node", str(script), "--ref", commit, "--dry-run"],
+        work,
+        check=False,
+    )
+
+    assert result.returncode != 0
+    assert "Unknown argument: --ref" in result.stderr
+
+
+def test_existing_tag_cli_rejects_local_only_tag(tmp_path):
+    _origin, _seed, work = _repositories(tmp_path)
+    script = _install_deploy_script(work)
+    _git(work, "tag", "-a", "v-test-local-only", "-m", "local only")
+
+    result = _run(
+        ["node", str(script), "--tag", "v-test-local-only", "--dry-run"],
+        work,
+        check=False,
+    )
+
+    assert result.returncode != 0
+    assert "Tag does not exist on origin" in result.stderr
+
+
+def test_existing_tag_cli_rejects_local_remote_commit_mismatch(tmp_path):
+    _origin, seed, work = _repositories(tmp_path)
+    script = _install_deploy_script(work)
+    local_commit = _ref(work, "HEAD")
+    remote_commit = _commit_file(seed, "tagged.txt", "remote tag\n", "remote tag commit")
+    _git(seed, "tag", "-a", "v-test-mismatch", "-m", "remote", remote_commit)
+    _git(seed, "push", "origin", "refs/tags/v-test-mismatch")
+    _git(work, "tag", "-a", "v-test-mismatch", "-m", "local", local_commit)
+
+    result = _run(
+        ["node", str(script), "--tag", "v-test-mismatch", "--dry-run"],
+        work,
+        check=False,
+    )
+
+    assert result.returncode != 0
+    assert "do not resolve to the same commit" in result.stderr
+
+
+def test_existing_published_tag_cli_dry_run_succeeds(tmp_path):
+    _origin, _seed, work = _repositories(tmp_path)
+    script = _install_deploy_script(work)
+    commit = _ref(work, "HEAD")
+    _git(work, "tag", "-a", "v-test-published", "-m", "published", commit)
+    _git(work, "push", "origin", "refs/tags/v-test-published")
+
+    result = _run(
+        ["node", str(script), "--tag", "v-test-published", "--dry-run"],
+        work,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "Tag: v-test-published" in result.stdout
+    assert "/releases/v-test-published" in result.stdout
 
 
 def test_existing_remote_tag_is_not_overwritten(tmp_path):
@@ -358,6 +464,7 @@ def test_exact_lease_rewrites_existing_remote_branch_after_rebase(tmp_path):
     assert _ref(origin, "refs/tags/v-test-non-ff^{commit}") == prepared
 
 
+@pytest.mark.skipif(os.name == "nt", reason="the Git push race wrapper requires POSIX executable lookup")
 def test_exact_lease_preserves_branch_that_moves_before_initial_push(tmp_path):
     origin, seed, work = _repositories(tmp_path)
     _git(seed, "checkout", "-b", "release/candidate")
@@ -380,6 +487,7 @@ def test_exact_lease_preserves_branch_that_moves_before_initial_push(tmp_path):
     assert _git(origin, "rev-parse", "--verify", "refs/tags/v-test-initial-race", check=False).returncode != 0
 
 
+@pytest.mark.skipif(os.name == "nt", reason="the Git push race wrapper requires POSIX executable lookup")
 def test_exact_lease_rejects_branch_move_before_atomic_tag_push(tmp_path):
     origin, seed, work = _repositories(tmp_path)
     _git(seed, "checkout", "-b", "release/candidate")
