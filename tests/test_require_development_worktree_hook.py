@@ -758,20 +758,29 @@ def test_settings_enable_ownership_guard_across_lifecycle_events():
     pretool_hooks = [
         entry
         for entry in settings["hooks"]["PreToolUse"]
-        if entry.get("matcher")
-        == "EnterWorktree|Write|Edit|NotebookEdit|Bash|PowerShell|Monitor|Agent|Workflow"
+        if entry.get("matcher") == "EnterWorktree|Write|Edit|NotebookEdit"
     ]
     assert len(pretool_hooks) == 1
+    assert all(
+        tool not in pretool_hooks[0]["matcher"]
+        for tool in ("Bash", "PowerShell", "Monitor", "Agent", "Workflow")
+    )
     require_hooks = [
         hook
         for entries in settings["hooks"].values()
         for entry in entries
         for hook in entry["hooks"]
-        if "require-development-worktree.py" in " ".join(
-            [hook.get("command", ""), *hook.get("args", [])]
+        if "require-development-worktree.py" in hook.get("command", "")
+        or any(
+            "require-development-worktree.py" in argument
+            for argument in hook.get("args", [])
         )
     ]
     assert len(require_hooks) == 5
-    assert all(hook["command"] == "python" for hook in require_hooks)
-    assert all(hook["args"][0] == "-c" for hook in require_hooks)
+    assert all(hook["type"] == "command" for hook in require_hooks)
+    assert all(
+        "require-development-worktree.py"
+        in " ".join([hook.get("command", ""), *hook.get("args", [])])
+        for hook in require_hooks
+    )
     assert settings["hooks"]["PostToolUse"][0]["matcher"] == "EnterWorktree"
