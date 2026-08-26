@@ -956,6 +956,42 @@ def _local_dashboard_account_role(request: Request) -> Optional[str]:
     return _session_local_account_role(getattr(request.state, "session", None))
 
 
+def _plugin_name_from_api_path(path: Optional[str]) -> Optional[str]:
+    """Return the plugin name from ``/api/plugins/<name>/...`` or ``None``.
+
+    Mirrors the extraction pattern used by :func:`_plugin_api_runtime_gate`.
+    Defensive against non-string input so the gate can pass through untrusted
+    ``request.url.path`` values without crashing.
+    """
+    if not isinstance(path, str) or not path:
+        return None
+    parts = path.split("/")
+    # parts: ['', 'api', 'plugins', '<name>', ...]
+    if len(parts) < 4 or parts[0] != "" or parts[1] != "api" or parts[2] != "plugins":
+        return None
+    name = parts[3]
+    return name or None
+
+
+def _plugin_api_requires_admin_for_member(plugin_name: Optional[str]) -> bool:
+    """Return ``True`` when a member session needs the admin role to call this plugin API.
+
+    The manifest is the source of truth: a plugin that declares any chat
+    workspace with ``admin_only: true`` keeps its API admin-only. Everything
+    else is open to member sessions. Fail-closed: unknown or malformed plugin
+    names default to admin-only, matching the pre-existing blanket behaviour.
+    """
+    if not plugin_name:
+        return True
+    plugins = _get_dashboard_plugins()
+    plugin = next((p for p in plugins if p.get("name") == plugin_name), None)
+    if plugin is None:
+        return True
+    chat = plugin.get("chat") or {}
+    workspaces = chat.get("workspaces") or []
+    return any(isinstance(w, dict) and w.get("admin_only") is True for w in workspaces)
+
+
 def _authenticated_owner_control_plane_gate_response(request: Request) -> Optional[JSONResponse]:
     """Return a fail-closed response for authenticated APIs not behind workers."""
     path = request.url.path
@@ -964,6 +1000,7 @@ def _authenticated_owner_control_plane_gate_response(request: Request) -> Option
         path.startswith("/api/plugins/")
         and not path.startswith("/api/plugins/scheduled-tasks/")
         and _local_dashboard_account_role(request) == "member"
+        and _plugin_api_requires_admin_for_member(_plugin_name_from_api_path(path))
     ):
         return JSONResponse(
             status_code=403,
