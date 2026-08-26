@@ -190,6 +190,60 @@ def test_owner_discovery_rejects_entire_malformed_manifest_deterministically(tmp
     assert "tab" not in plugins[0]
 
 
+def test_owner_worker_discovery_preserves_chat_workspaces(tmp_path, monkeypatch):
+    """Regression: ``hermes_cli.dashboard_plugins.discover_dashboard_plugins`` is the
+    function the owner-worker runtime imports; it must propagate ``chat.workspaces``
+    into the returned plugin dict so the Kanban sidebar entry surfaces for member
+    users (PR #327 follow-up).
+    """
+    from hermes_cli.dashboard_plugins import discover_dashboard_plugins as owner_discover
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.delenv("HERMES_ENABLE_PROJECT_PLUGINS", raising=False)
+    kanban_dir = _write_manifest(
+        tmp_path / "plugins",
+        "kanban",
+        {
+            "name": "kanban",
+            "label": "Kanban",
+            "entry": "dist/index.js",
+            "chat": {
+                "workspaces": [
+                    {
+                        "id": "kanban",
+                        "path": "/chat/kanban",
+                        "label": "Kanban",
+                        "description": "Multi-agent collaboration board",
+                        "icon": "SquareKanban",
+                        "position": "after:files",
+                    }
+                ]
+            },
+        },
+    )
+
+    with patch("hermes_cli.plugins.get_bundled_plugins_dir", return_value=tmp_path / "bundled"):
+        plugins = owner_discover()
+
+    assert len(plugins) == 1
+    plugin = plugins[0]
+    assert plugin["name"] == "kanban"
+    assert plugin["_dir"] == str(kanban_dir)
+    assert plugin["chat"] == {
+        "workspaces": [
+            {
+                "id": "kanban",
+                "path": "/chat/kanban",
+                "label": "Kanban",
+                "description": "Multi-agent collaboration board",
+                "icon": "SquareKanban",
+                "position": "after:files",
+                "admin_only": False,
+            }
+        ]
+    }
+
+
 def test_manifest_without_tab_or_chat_workspace_is_rejected(tmp_path):
     with pytest.raises(ValueError, match="must declare tab or chat.workspaces"):
         normalize_dashboard_plugin_manifest(

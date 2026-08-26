@@ -6,7 +6,7 @@ import json
 import logging
 import re
 import sys
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Callable, Iterable
 
 from hermes_constants import get_hermes_home
@@ -16,6 +16,7 @@ from utils import env_var_enabled
 _log = logging.getLogger(__name__)
 _API_TARGETS = frozenset({"control-plane", "owner-worker"})
 _PLUGIN_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+_WORKSPACE_ID_PATTERN = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
 
 
 def safe_plugin_relpath(value: Any, *, dashboard_dir: Path) -> str | None:
@@ -33,8 +34,204 @@ def safe_plugin_relpath(value: Any, *, dashboard_dir: Path) -> str | None:
     return value
 
 
+def _nonempty_string(value: Any, *, field: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{field} must be a non-empty string")
+    return value.strip()
+
+
+def _optional_string(value: Any, *, field: str, default: str) -> str:
+    if value is None:
+        return default
+    if not isinstance(value, str):
+        raise ValueError(f"{field} must be a string")
+    return value.strip()
+
+
+def _normalized_route(value: Any, *, field: str, prefix: str = "/") -> str:
+    path = _nonempty_string(value, field=field)
+    normalized_path = PurePosixPath(path)
+    parts = normalized_path.parts
+    if (
+        not path.startswith(prefix)
+        or (path == prefix and prefix != "/")
+        or (path.endswith("/") and path != "/")
+        or normalized_path.as_posix() != path
+        or "?" in path
+        or "#" in path
+        or "." in parts
+        or ".." in parts
+    ):
+        scope = f"under {prefix.rstrip('/')}" if prefix != "/" else "an absolute normalized route"
+        raise ValueError(f"{field} must be {scope}")
+    return path
+
+
+def _normalize_tab(raw: Any, *, name: str) -> dict[str, Any]:
+    if not isinstance(raw, dict):
+        raise ValueError("tab must be an object")
+
+    position = _nonempty_string(raw.get("position", "end"), field="tab.position")
+    if position != "end":
+        relation, separator, target = position.partition(":")
+        if (
+            separator != ":"
+            or relation not in {"before", "after"}
+            or not _WORKSPACE_ID_PATTERN.fullmatch(target)
+        ):
+            raise ValueError("tab.position must be end, before:<id>, or after:<id>")
+
+    tab = {
+        "path": _normalized_route(raw.get("path", f"/{name}"), field="tab.path"),
+        "position": position,
+    }
+    override = raw.get("override")
+    if override is not None:
+        tab["override"] = _normalized_route(override, field="tab.override")
+    hidden = raw.get("hidden")
+    if hidden is not None:
+        if not isinstance(hidden, bool):
+            raise ValueError("tab.hidden must be a boolean")
+        if hidden:
+            tab["hidden"] = True
+    return tab
+
+
+def _normalize_chat_workspace(raw: Any, *, index: int) -> dict[str, Any]:
+    field = f"chat.workspaces[{index}]"
+    if not isinstance(raw, dict):
+        raise ValueError(f"{field} must be an object")
+
+    workspace_id = _nonempty_string(raw.get("id"), field=f"{field}.id")
+    if not _WORKSPACE_ID_PATTERN.fullmatch(workspace_id):
+        raise ValueError(f"{field}.id must contain lowercase letters, digits, or hyphens")
+
+    path = _normalized_route(raw.get("path"), field=f"{field}.path", prefix="/chat/")
+
+    position = raw.get("position", "end")
+    if isinstance(position, bool) or not isinstance(position, (str, int)):
+        raise ValueError(f"{field}.position must be end, before:<id>, after:<id>, or a non-negative integer")
+    if isinstance(position, int):
+        if position < 0:
+            raise ValueError(f"{field}.position integer must be non-negative")
+    else:
+        position = _nonempty_string(position, field=f"{field}.position")
+        if position != "end":
+            relation, separator, target = position.partition(":")
+            if (
+                separator != ":"
+                or relation not in {"before", "after"}
+                or not _WORKSPACE_ID_PATTERN.fullmatch(target)
+                or target == workspace_id
+            ):
+                raise ValueError(
+                    f"{field}.position must be end, before:<id>, after:<id>, or a non-negative integer"
+                )
+
+    admin_only = raw.get("admin_only", False)
+    if not isinstance(admin_only, bool):
+        raise ValueError(f"{field}.admin_only must be a boolean")
+
+    return {
+        "id": workspace_id,
+        "path": path,
+        "label": _optional_string(raw.get("label"), field=f"{field}.label", default=workspace_id),
+        "description": _optional_string(raw.get("description"), field=f"{field}.description", default=""),
+        "icon": _optional_string(raw.get("icon"), field=f"{field}.icon", default="Puzzle"),
+        "position": position,
+        "admin_only": admin_only,
+    }
+
+
+def normalize_dashboard_plugin_manifest(
+    data: Any,
+    *,
+    default_name: str,
+    dashboard_dir: Path,
+    source: str,
+) -> dict[str, Any]:
+    """Validate and normalize one dashboard plugin manifest."""
+    if not isinstance(data, dict):
+        raise ValueError("manifest must be an object")
+
+    name = _nonempty_string(data.get("name", default_name), field="name")
+    if not _PLUGIN_NAME_RE.fullmatch(name):
+        raise ValueError(
+            "name must start with a letter or digit and contain only letters, digits, dots, underscores, or hyphens"
+        )
+
+    raw_tab = data.get("tab")
+    tab_info = _normalize_tab(raw_tab, name=name) if raw_tab is not None else None
+
+    raw_chat = data.get("chat")
+    chat_info: dict[str, Any] | None = None
+    if raw_chat is not None:
+        if not isinstance(raw_chat, dict):
+            raise ValueError("chat must be an object")
+        raw_workspaces = raw_chat.get("workspaces")
+        if not isinstance(raw_workspaces, list) or not raw_workspaces:
+            raise ValueError("chat.workspaces must be a non-empty list")
+        workspaces = [
+            _normalize_chat_workspace(workspace, index=index)
+            for index, workspace in enumerate(raw_workspaces)
+        ]
+        ids = [workspace["id"] for workspace in workspaces]
+        paths = [workspace["path"] for workspace in workspaces]
+        if len(ids) != len(set(ids)):
+            raise ValueError("chat.workspaces contains duplicate ids")
+        if len(paths) != len(set(paths)):
+            raise ValueError("chat.workspaces contains duplicate paths")
+        chat_info = {"workspaces": workspaces}
+
+    raw_api = data.get("api")
+    has_api = bool(raw_api) and isinstance(raw_api, str)
+    # Reject bare manifests (no tab, no chat.workspaces, no api). Legacy
+    # api-only plugins (e.g. #259's owner-worker / control-plane API plugins)
+    # declare just ``api`` + ``api_target`` and must still be discovered.
+    if tab_info is None and chat_info is None and not has_api:
+        raise ValueError("manifest must declare tab or chat.workspaces")
+
+    slots_src = data.get("slots")
+    slots = [slot for slot in slots_src if isinstance(slot, str) and slot] if isinstance(slots_src, list) else []
+    raw_api = data.get("api")
+    safe_api = safe_plugin_relpath(raw_api, dashboard_dir=dashboard_dir)
+    if raw_api and safe_api is None:
+        _log.warning(
+            "Plugin %s: refusing unsafe api path %r (must be a relative file "
+            "inside the plugin's dashboard directory)",
+            name,
+            raw_api,
+        )
+    plugin = {
+        "name": name,
+        "label": data.get("label", name),
+        "description": data.get("description", ""),
+        "icon": data.get("icon", "Puzzle"),
+        "version": data.get("version", "0.0.0"),
+        "slots": slots,
+        "entry": data.get("entry", "dist/index.js"),
+        "css": data.get("css"),
+        "has_api": bool(safe_api),
+        "source": source,
+        "_dir": str(dashboard_dir),
+        "_api_file": safe_api,
+    }
+    if tab_info is not None:
+        plugin["tab"] = tab_info
+    if chat_info is not None:
+        plugin["chat"] = chat_info
+    return plugin
+
+
 def discover_dashboard_plugins() -> list[dict[str, Any]]:
-    """Discover and validate dashboard manifests in precedence order."""
+    """Discover and validate dashboard manifests in precedence order.
+
+    Each manifest is normalized via :func:`normalize_dashboard_plugin_manifest`,
+    which preserves both the legacy ``tab`` field (dashboard plugin tabs) and
+    the ``chat.workspaces`` array introduced for chat-workspace plugins
+    (PR #261). ``api_target`` and the authenticated-control-plane policy flag
+    are layered on after normalization so both fields reach the dashboard.
+    """
     from hermes_cli.plugins import get_bundled_plugins_dir
 
     bundled_root = get_bundled_plugins_dir()
@@ -59,73 +256,41 @@ def discover_dashboard_plugins() -> list[dict[str, Any]]:
                 continue
             try:
                 data = json.loads(manifest_file.read_text(encoding="utf-8"))
-                name = data.get("name", child.name)
-                if (
-                    not isinstance(name, str)
-                    or not _PLUGIN_NAME_RE.fullmatch(name)
-                    or name in seen_names
-                ):
+                plugin = normalize_dashboard_plugin_manifest(
+                    data,
+                    default_name=child.name,
+                    dashboard_dir=child / "dashboard",
+                    source=source,
+                )
+                name = plugin["name"]
+                if name in seen_names:
+                    _log.warning(
+                        "Ignoring duplicate dashboard plugin name %r from %s",
+                        name,
+                        manifest_file,
+                    )
                     continue
                 seen_names.add(name)
-                dashboard_dir = child / "dashboard"
-                raw_api = data.get("api")
-                safe_api = safe_plugin_relpath(raw_api, dashboard_dir=dashboard_dir)
-                if raw_api and safe_api is None:
-                    _log.warning(
-                        "Plugin %s: refusing unsafe api path %r; backend routes will not be mounted",
-                        name,
-                        raw_api,
-                    )
+
                 raw_target = data.get("api_target", "control-plane")
                 api_target = raw_target if raw_target in _API_TARGETS else None
-                authenticated_api = data.get("authenticated_api")
-                authenticated_control_plane_api = (
-                    source == "bundled"
-                    and authenticated_api == "dashboard-session"
-                )
-                if safe_api and api_target is None:
+                if api_target is None and plugin.get("has_api"):
                     _log.warning(
                         "Plugin %s: refusing invalid api_target %r (expected control-plane or owner-worker)",
-                        name,
+                        plugin["name"],
                         raw_target,
                     )
-                    safe_api = None
-
-                raw_tab = data.get("tab", {}) if isinstance(data.get("tab"), dict) else {}
-                tab_info = {
-                    "path": raw_tab.get("path", f"/{name}"),
-                    "position": raw_tab.get("position", "end"),
-                }
-                override_path = raw_tab.get("override")
-                if isinstance(override_path, str) and override_path.startswith("/"):
-                    tab_info["override"] = override_path
-                if bool(raw_tab.get("hidden")):
-                    tab_info["hidden"] = True
-                raw_slots = data.get("slots")
-                slots = (
-                    [slot for slot in raw_slots if isinstance(slot, str) and slot]
-                    if isinstance(raw_slots, list)
-                    else []
+                    plugin["_api_file"] = None
+                    plugin["has_api"] = False
+                authenticated_api = data.get("authenticated_api")
+                plugin["api_target"] = api_target or "control-plane"
+                plugin["_authenticated_control_plane_api"] = (
+                    source == "bundled" and authenticated_api == "dashboard-session"
                 )
-                plugins.append({
-                    "name": name,
-                    "label": data.get("label", name),
-                    "description": data.get("description", ""),
-                    "icon": data.get("icon", "Puzzle"),
-                    "version": data.get("version", "0.0.0"),
-                    "tab": tab_info,
-                    "slots": slots,
-                    "entry": data.get("entry", "dist/index.js"),
-                    "css": data.get("css"),
-                    "has_api": bool(safe_api),
-                    "api_target": api_target or "control-plane",
-                    "source": source,
-                    "_authenticated_control_plane_api": authenticated_control_plane_api,
-                    "_dir": str(dashboard_dir),
-                    "_api_file": safe_api,
-                })
+                plugins.append(plugin)
             except Exception as exc:
                 _log.warning("Bad dashboard plugin manifest %s: %s", manifest_file, exc)
+                continue
     return plugins
 
 
