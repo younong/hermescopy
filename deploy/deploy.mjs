@@ -579,8 +579,8 @@ export function createReleaseArchive(
   console.log(`Release archive: ${archiveBytes} bytes (${(archiveBytes / 1024 / 1024).toFixed(2)} MiB)`);
 }
 
-function gitTreeModes(sourceCommit) {
-  const output = runText("git", ["ls-tree", "-rz", "--full-tree", sourceCommit]);
+function gitTreeModes(sourceCommit, { cwd = repoRoot } = {}) {
+  const output = runText("git", ["ls-tree", "-rz", "--full-tree", sourceCommit], { cwd });
   const modes = new Map();
   for (const record of output.split("\0")) {
     if (!record) continue;
@@ -604,7 +604,7 @@ export function releaseManifest({ releaseId, sourceCommit, sourceTag }) {
   };
 }
 
-export function createArchive(args, { dryRun }) {
+export function createArchive(args, { dryRun, cwd = repoRoot }) {
   const { releaseId, sourceCommit, sourceTag } = args;
   const tmp = dryRun ? null : mkdtempSync(path.join(tmpdir(), "hermes-deploy-"));
   const buildDir = dryRun ? path.join(tmpdir(), `hermes-${releaseId}-artifact`) : path.join(tmp, "artifact");
@@ -615,8 +615,12 @@ export function createArchive(args, { dryRun }) {
     mkdirSync(buildDir, { recursive: true });
   }
   const archiveEnv = { COPYFILE_DISABLE: "1" };
-  run("git", ["archive", "--format=tar", "--output", sourceArchive, sourceCommit], { dryRun, env: archiveEnv });
-  const gitModes = dryRun ? new Map() : gitTreeModes(sourceCommit);
+  run("git", ["archive", "--format=tar", "--output", sourceArchive, sourceCommit], {
+    dryRun,
+    env: archiveEnv,
+    cwd,
+  });
+  const gitModes = dryRun ? new Map() : gitTreeModes(sourceCommit, { cwd });
   if (!dryRun) {
     extractSourceArchive(sourceArchive, buildDir);
     writeFileSync(
@@ -2072,12 +2076,12 @@ export async function main({ argv = process.argv.slice(2), cwd = repoRoot } = {}
     args.sourceCommit = prepared.sourceCommit;
   } else {
     validateTag(args.tag);
-    assertCleanWorktree({ allowDirty: args.allowDirty, dryRun: args.dryRun });
-    if (!tagExists(args.tag)) {
+    assertCleanWorktree({ allowDirty: args.allowDirty, dryRun: args.dryRun, cwd });
+    if (!tagExists(args.tag, { cwd })) {
       throw new Error(`Tag does not exist locally: ${args.tag}. Run 'git fetch --tags' first if needed.`);
     }
-    const localTagCommit = runText("git", ["rev-parse", "--verify", `${args.tag}^{commit}`]);
-    const originTagCommit = remoteTagCommit(args.tag);
+    const localTagCommit = runText("git", ["rev-parse", "--verify", `${args.tag}^{commit}`], { cwd });
+    const originTagCommit = remoteTagCommit(args.tag, { cwd });
     if (!originTagCommit) {
       throw new Error(`Tag does not exist on origin: ${args.tag}. --tag is only for retrying or rolling back published tags.`);
     }
@@ -2089,7 +2093,7 @@ export async function main({ argv = process.argv.slice(2), cwd = repoRoot } = {}
   }
 
   args.releaseId = args.sourceTag;
-  const { tmp, archivePath } = createArchive(args, { dryRun: args.dryRun });
+  const { tmp, archivePath } = createArchive(args, { dryRun: args.dryRun, cwd });
   let deploymentCommitted = false;
   let authorityConcurrencyResult = null;
   let readerPerformanceResult = null;
