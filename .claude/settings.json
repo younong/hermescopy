@@ -3,6 +3,9 @@
     "claude-api": "off",
     "code-review": "off"
   },
+  "env": {
+    "CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS": "2"
+  },
   "worktree": {
     "baseRef": "fresh"
   },
