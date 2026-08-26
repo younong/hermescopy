@@ -30,7 +30,7 @@ export function GroupConversation({ employees, onLoadEarlier, state }: GroupConv
   const historyCopy = translations.messages;
   const containerRef = useRef<HTMLDivElement | null>(null);
   const followBottomRef = useRef(true);
-  const anchorRef = useRef<{ id: string; offset: number } | null>(null);
+  const anchorRef = useRef<{ followBottom: boolean; id: string; offset: number } | null>(null);
   const initializedGroupRef = useRef<string | undefined>(undefined);
   const employeeIdentity = useMemo(() => {
     const identities = new Map(employees.map((employee) => [employee.employeeId, employee]));
@@ -91,15 +91,20 @@ export function GroupConversation({ employees, onLoadEarlier, state }: GroupConv
     });
     const row = firstVisible ? rows[firstVisible.index] : undefined;
     if (firstVisible && row) {
-      anchorRef.current = { id: row.id, offset: firstVisible.start - container.scrollTop };
+      anchorRef.current = {
+        followBottom: followBottomRef.current,
+        id: row.id,
+        offset: firstVisible.start - container.scrollTop,
+      };
       followBottomRef.current = false;
     }
   }, [rows, virtualizer]);
 
-  const { handleScroll: handleHistoryScroll, retry, syncScrollPosition } = useLoadEarlierOnScroll({
+  const { checkTop, handleScroll: handleHistoryScroll, retry, syncScrollPosition } = useLoadEarlierOnScroll({
     autoEnabled: !state.historyError,
     canLoad: state.historyHasMore && state.historyBeforeSequence !== undefined,
     loading: state.historyLoading,
+    loadKey: state.historyBeforeSequence,
     onBeforeLoad: captureAnchor,
     onLoadEarlier,
     resetKey: state.group?.group_id,
@@ -116,8 +121,14 @@ export function GroupConversation({ employees, onLoadEarlier, state }: GroupConv
   const handleScroll = useCallback((event: UIEvent<HTMLDivElement>) => {
     const element = event.currentTarget;
     followBottomRef.current = element.scrollHeight - element.scrollTop - element.clientHeight <= BOTTOM_THRESHOLD_PX;
+    if (anchorRef.current && followBottomRef.current) anchorRef.current = null;
     handleHistoryScroll(event);
-  }, [handleHistoryScroll]);
+    checkTop(element.scrollTop);
+  }, [checkTop, handleHistoryScroll]);
+
+  useLayoutEffect(() => {
+    anchorRef.current = null;
+  }, [state.group?.group_id]);
 
   useLayoutEffect(() => {
     const groupId = state.group?.group_id;
@@ -127,6 +138,7 @@ export function GroupConversation({ employees, onLoadEarlier, state }: GroupConv
   }, [scrollToBottom, state.group?.group_id, state.loading]);
 
   useLayoutEffect(() => {
+    let restoredAnchor = false;
     if (!state.historyLoading && anchorRef.current) {
       const anchor = anchorRef.current;
       const index = rows.findIndex((row) => row.id === anchor.id);
@@ -138,11 +150,14 @@ export function GroupConversation({ employees, onLoadEarlier, state }: GroupConv
           syncScrollPosition(element.scrollTop);
         }
       }
+      followBottomRef.current = anchor.followBottom;
       anchorRef.current = null;
-      return;
+      restoredAnchor = true;
     }
-    if (followBottomRef.current) scrollToBottom();
-  }, [rows, scrollToBottom, state.historyLoading, syncScrollPosition, totalSize, virtualizer]);
+    if (!restoredAnchor && followBottomRef.current) scrollToBottom();
+    const element = containerRef.current;
+    if (element && !state.loading) checkTop(element.scrollTop);
+  }, [checkTop, rows, scrollToBottom, state.historyLoading, state.loading, syncScrollPosition, totalSize, virtualizer]);
 
   if (state.loading) {
     return <div className="flex flex-1 items-center justify-center gap-2 text-xs text-[#777c84]"><Spinner /> {copy.loadingGroup}</div>;
