@@ -250,6 +250,12 @@ def process(payload: dict[str, Any], environ: dict[str, str] | None = None) -> d
         )
     paths = _repository_paths(cwd)
     if paths is None or paths[1] == paths[2]:
+        try:
+            plan = workflow.read_plan(session_id, env)
+        except workflow.WorkflowError as exc:
+            return _result(f"自动提交 PR 已跳过：无法读取开发流程状态（{exc}）。")
+        if plan is None or plan.get("approved") is not True:
+            return _result("自动提交 PR 已跳过：本次会话没有已批准的开发计划。")
         return _retry_or_result(
             payload, cwd, session_id, env,
             "计划已批准，但当前仍是 primary checkout；请调用 EnterWorktree 后继续实现。",
@@ -337,7 +343,7 @@ def main() -> int:
         output = process(payload if isinstance(payload, dict) else {})
     except Exception as exc:
         output = _result(f"自动提交 PR 未执行：hook 内部错误（{exc}）。")
-    print(json.dumps(output, ensure_ascii=False))
+    print(json.dumps(output))
     return 0
 
 

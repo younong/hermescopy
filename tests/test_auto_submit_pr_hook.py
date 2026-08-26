@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -98,15 +99,50 @@ def test_main_accepts_utf8_bom_payload(tmp_path, monkeypatch, capsys):
     assert "缺少 session_id" in output["systemMessage"]
 
 
-def test_missing_plan_does_not_block_worktree_checks(tmp_path):
+def test_main_protocol_output_is_utf8_safe_under_cp936():
+    env = os.environ.copy()
+    env["PYTHONIOENCODING"] = "cp936"
+    env["PYTHONUTF8"] = "0"
+
+    completed = subprocess.run(
+        [sys.executable, str(HOOK)],
+        input=b"{}",
+        env=env,
+        capture_output=True,
+        check=True,
+    )
+
+    raw_output = completed.stdout.decode("utf-8")
+    output = json.loads(raw_output)
+    assert "缺少 session_id" in output["systemMessage"]
+    assert completed.stderr == b""
+    assert completed.stdout.isascii()
+
+
+def test_missing_plan_in_primary_checkout_is_passive(tmp_path):
     session_id = "task-session"
     _origin, repo, _worktree = _repositories(tmp_path, session_id)
     env = _env(tmp_path)
 
     result = module.process({"session_id": session_id, "cwd": str(repo)}, env)
 
-    assert result["decision"] == "block"
-    assert "primary checkout" in result["reason"]
+    assert "decision" not in result
+    assert "没有已批准的开发计划" in result["systemMessage"]
+    assert module.workflow.stop_retry_path(repo, session_id, env).exists() is False
+
+
+def test_unreadable_plan_in_primary_checkout_is_passive(tmp_path):
+    session_id = "task-session"
+    _origin, repo, _worktree = _repositories(tmp_path, session_id)
+    env = _env(tmp_path)
+    plan_path = module.workflow.plan_path(session_id, env)
+    plan_path.parent.mkdir(parents=True)
+    plan_path.write_text("not json", encoding="utf-8")
+
+    result = module.process({"session_id": session_id, "cwd": str(repo)}, env)
+
+    assert "decision" not in result
+    assert "无法读取开发流程状态" in result["systemMessage"]
 
 
 def test_approved_session_in_primary_checkout_is_blocked_with_bound(tmp_path):
@@ -176,6 +212,7 @@ def test_verified_stop_commits_pushes_creates_pr_and_is_idempotent(tmp_path, mon
     session_id = "task-session"
     origin, _repo, worktree = _repositories(tmp_path, session_id)
     env = _env(tmp_path)
+    assert module.workflow.read_plan(session_id, env) is None
     (worktree / "tracked.txt").write_text("implemented\n")
     module.workflow.write_verification(worktree, session_id, ["pytest"], env)
     gh_calls: list[tuple[str, ...]] = []

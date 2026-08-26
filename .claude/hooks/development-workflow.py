@@ -367,7 +367,7 @@ def main() -> int:
         output = process_hook(payload if isinstance(payload, dict) else {})
     except (json.JSONDecodeError, WorkflowError, OSError) as exc:
         output = {"systemMessage": f"Claude development workflow hook skipped: {exc}"}
-    print(json.dumps(output, ensure_ascii=False))
+    print(json.dumps(output))
     return 0
 
 
