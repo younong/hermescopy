@@ -9,6 +9,90 @@ import tarfile
 DEPLOY_SCRIPT = Path(__file__).parents[2] / "deploy" / "deploy.mjs"
 
 
+def _release_manifest(
+    *, release_id: str, source_commit: str, source_tag: str | None
+) -> subprocess.CompletedProcess[str]:
+    source = f"""
+import {{ releaseManifest }} from {json.dumps(DEPLOY_SCRIPT.as_uri())};
+try {{
+  console.log(JSON.stringify(releaseManifest({{
+    releaseId: process.argv[1],
+    sourceCommit: process.argv[2],
+    sourceTag: process.argv[3] === "null" ? null : process.argv[3],
+  }})));
+}} catch (error) {{
+  console.error(error.message);
+  process.exit(1);
+}}
+"""
+    return subprocess.run(
+        [
+            "node",
+            "--input-type=module",
+            "--eval",
+            source,
+            release_id,
+            source_commit,
+            "null" if source_tag is None else source_tag,
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+
+def test_release_manifest_is_fixed_to_tag_source():
+    result = _release_manifest(
+        release_id="v-test-manifest",
+        source_commit="a" * 40,
+        source_tag="v-test-manifest",
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout) == {
+        "schemaVersion": 1,
+        "releaseId": "v-test-manifest",
+        "source": {
+            "kind": "tag",
+            "commit": "a" * 40,
+            "tag": "v-test-manifest",
+        },
+    }
+
+
+def test_release_manifest_rejects_legacy_commit_release_shape():
+    result = _release_manifest(
+        release_id=f"commit-{'a' * 40}",
+        source_commit="a" * 40,
+        source_tag=None,
+    )
+
+    assert result.returncode != 0
+    assert "Tag release ID must match the source tag" in result.stderr
+
+
+def test_remote_release_reuse_requires_exact_tag_manifest():
+    script = DEPLOY_SCRIPT.read_text(encoding="utf-8")
+
+    assert (
+        'expected_manifest="{\\"schemaVersion\\":1,\\"releaseId\\":\\"$release_id\\",'
+        '\\"source\\":{\\"kind\\":\\"tag\\",\\"commit\\":\\"$source_commit\\",'
+        '\\"tag\\":\\"$source_tag\\"}}"'
+    ) in script
+    existing_check = script.index('if [ -e "$release" ]; then')
+    exact_match = script.index('if [ "$actual_manifest" != "$expected_manifest" ]; then', existing_check)
+    reject = script.index("Existing release does not match immutable source", exact_match)
+    reuse = script.index(
+        'echo "Remote release already exists with matching source, reusing: $release"',
+        reject,
+    )
+    extract_check = script.index(
+        'if [ "$actual_manifest" != "$expected_manifest" ]; then', reuse
+    )
+    extract_reject = script.index("Release manifest does not match immutable source", extract_check)
+    assert existing_check < exact_match < reject < reuse < extract_check < extract_reject
+
+
 def test_remote_cutover_stops_before_atomic_current_switch():
     script = DEPLOY_SCRIPT.read_text(encoding="utf-8")
 
