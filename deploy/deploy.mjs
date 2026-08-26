@@ -16,7 +16,7 @@ import {
   runLocalText,
 } from "./local-platform.mjs";
 import { createReleaseArchiveFile, extractSourceArchive } from "./archive.mjs";
-import { runPasswordSsh, uploadPasswordFile } from "./ssh-transport.mjs";
+import { remoteCommand, runPasswordSsh, uploadPasswordFile } from "./ssh-transport.mjs";
 
 const DEFAULT_HOST = "106.15.186.104";
 const DEFAULT_USER = "root";
@@ -724,7 +724,13 @@ async function runSsh(args, remoteArgs, options = {}) {
     }
     return runPasswordSsh(args, remoteArgs, { input: options.input });
   }
-  const sshArgs = [...sshBaseArgs(args), remoteTarget(args), ...remoteArgs];
+  const sshArgs = [
+    ...sshBaseArgs(args),
+    remoteTarget(args),
+    // sshd re-joins command argv with spaces before the remote shell parses it,
+    // so send one pre-quoted command string instead of raw argv (see #339).
+    remoteCommand(remoteArgs[0], remoteArgs.slice(1)),
+  ];
   return run("ssh", sshArgs, { dryRun: args.dryRun, input: options.input });
 }
 

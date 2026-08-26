@@ -102,7 +102,9 @@ export function quoteRemoteArg(value) {
   return `'${text.replaceAll("'", `'"'"'`)}'`;
 }
 
-function remoteCommand(command, commandArgs) {
+// sshd joins command argv with spaces before handing it to the remote shell,
+// so every transport must send a single pre-quoted command string.
+export function remoteCommand(command, commandArgs) {
   return [command, ...commandArgs].map(quoteRemoteArg).join(" ");
 }
 

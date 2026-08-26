@@ -6,6 +6,8 @@ from pathlib import Path
 import subprocess
 import tarfile
 
+import pytest
+
 
 ROOT = Path(__file__).parents[2]
 LOCAL_PLATFORM = ROOT / "deploy" / "local-platform.mjs"
@@ -123,3 +125,40 @@ def test_connection_check_dry_run_does_not_require_release_source():
     assert "Connection check passed" in result.stdout
     assert "git archive" not in result.stdout
     assert "mkdir -p" not in result.stdout
+
+
+@pytest.mark.skipif(os.name == "nt", reason="stub ssh relies on a POSIX shell")
+def test_connection_check_survives_sshd_argv_rejoin(tmp_path):
+    # Regression for #339: sshd re-joins command argv with spaces before the
+    # remote shell parses it, so deploy must send a single pre-quoted command
+    # string. The stub ssh simulates the server-side join faithfully: skip the
+    # option pairs, drop the target, re-join, and hand the result to a shell.
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    stub = bin_dir / "ssh"
+    stub.write_text(
+        "#!/bin/sh\n"
+        "while [ $# -gt 0 ]; do\n"
+        '  case "$1" in\n'
+        "    -*) shift 2 ;;\n"
+        "    *) shift; break ;;\n"
+        "  esac\n"
+        "done\n"
+        'exec sh -c "$*"\n',
+        encoding="utf-8",
+    )
+    stub.chmod(0o755)
+    env = {k: v for k, v in os.environ.items() if k != "HERMES_DEPLOY_PASSWORD"}
+    env["PATH"] = f"{bin_dir}{os.pathsep}{env.get('PATH', '')}"
+
+    result = subprocess.run(
+        ["node", str(DEPLOY), "--check-connection"],
+        cwd=ROOT,
+        check=False,
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "Connection check passed" in result.stdout
