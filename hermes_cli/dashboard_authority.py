@@ -16,6 +16,7 @@ from hermes_cli.dashboard_auth.audit import (
     AuthorityAuditReason,
 )
 from hermes_cli.dashboard_auth.authority import (
+    _SCHEMA_VERSION as AUTHORITY_SCHEMA_VERSION,
     AuthorityCorrupt,
     AuthorityStore,
     AuthorityUnavailable,
@@ -64,6 +65,9 @@ _CORRUPTION_CLASSIFICATIONS = frozenset({
     "zero_length_database",
     "sqlite_integrity_failure",
 })
+_RECOVERY_GUIDANCE = (
+    "Restart cannot recover authority; offline recovery fencing is required."
+)
 
 
 class AuthorityRecoveryError(RuntimeError):
@@ -80,6 +84,7 @@ class AuthorityStatus:
     sha256: str | None
     size: int | None
     preserved: bool | None
+    recovery_guidance: str | None = None
 
 
 def _validated_marker(store: AuthorityStore) -> dict[str, object] | None:
@@ -126,9 +131,12 @@ def authority_status(control_home: Path | None = None) -> AuthorityStatus:
             sha256=str(marker["sha256"]),
             size=int(marker["size"]),
             preserved=bool(marker["preserved"]),
+            recovery_guidance=_RECOVERY_GUIDANCE,
         )
     if not store.path.exists():
-        return AuthorityStatus("uninitialized", None, None, None, None, None, None, None)
+        return AuthorityStatus(
+            "uninitialized", None, None, None, None, None, None, None, None
+        )
     store._validate_path()  # noqa: SLF001 - read-only operator inspection
     if store.path.stat().st_size == 0:
         raise AuthorityRecoveryError("authority status is unavailable")
@@ -138,14 +146,47 @@ def authority_status(control_home: Path | None = None) -> AuthorityStatus:
             integrity = conn.execute("PRAGMA integrity_check").fetchone()
             if not integrity or str(integrity[0]).lower() != "ok":
                 raise AuthorityRecoveryError("authority integrity check failed")
-            values = dict(conn.execute(
-                "SELECT key, value FROM authority_meta WHERE key IN ('schema_version', 'recovery_generation')"
-            ).fetchall())
-            schema = int(values["schema_version"])
-            generation = int(values["recovery_generation"])
+            values = {
+                str(key): (value, str(storage_type))
+                for key, value, storage_type in conn.execute(
+                    "SELECT key, value, typeof(value) FROM authority_meta WHERE key IN "
+                    "('schema_version', 'recovery_generation', 'recovery_required')"
+                ).fetchall()
+            }
+            schema_value, schema_type = values["schema_version"]
+            generation_value, generation_type = values["recovery_generation"]
+            recovery_value, recovery_type = values["recovery_required"]
+            if (
+                schema_type != "integer"
+                or generation_type != "integer"
+                or recovery_type != "integer"
+                or isinstance(schema_value, bool)
+                or isinstance(generation_value, bool)
+                or isinstance(recovery_value, bool)
+                or not isinstance(schema_value, int)
+                or not isinstance(generation_value, int)
+                or not isinstance(recovery_value, int)
+                or schema_value < 1
+                or generation_value < 0
+                or recovery_value not in (0, 1)
+            ):
+                raise ValueError("invalid authority metadata")
+            schema = schema_value
+            generation = generation_value
+            recovery_required = recovery_value
     except (sqlite3.Error, KeyError, TypeError, ValueError) as exc:
         raise AuthorityRecoveryError("authority status is unavailable") from exc
-    return AuthorityStatus("healthy", schema, generation, None, None, sha256_file(store.path), store.path.stat().st_size, None)
+    return AuthorityStatus(
+        "recovery_required" if recovery_required == 1 else "healthy",
+        schema,
+        generation,
+        None,
+        None,
+        sha256_file(store.path),
+        store.path.stat().st_size,
+        None,
+        _RECOVERY_GUIDANCE if recovery_required == 1 else None,
+    )
 
 
 def preserve_authority(control_home: Path | None = None) -> AuthorityStatus:
@@ -249,7 +290,7 @@ def _validate_candidate(path: Path) -> ReplayContinuity:
                 "SELECT key, value FROM authority_meta WHERE key IN "
                 "('schema_version', 'authority_id', 'recovery_generation', 'recovery_required', 'keyring_bound')"
             ).fetchall())
-            if int(values["schema_version"]) != 8:
+            if int(values["schema_version"]) != AUTHORITY_SCHEMA_VERSION:
                 raise AuthorityRecoveryError("recovery candidate schema is unsupported")
             authority_id = str(values["authority_id"])
             generation = int(values["recovery_generation"])

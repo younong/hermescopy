@@ -3,11 +3,14 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
 
 from hermes_cli.dashboard_auth.authority import (
+    _SCHEMA_VERSION as AUTHORITY_SCHEMA_VERSION,
     AuthorizationScope,
     AuthorityCorrupt,
     AuthorityStore,
@@ -26,6 +29,11 @@ from hermes_cli.dashboard_authority import (
     recover_authority,
 )
 from hermes_cli.sqlite_util import sha256_file
+
+
+_RECOVERY_GUIDANCE = (
+    "Restart cannot recover authority; offline recovery fencing is required."
+)
 
 
 def _scope() -> AuthorizationScope:
@@ -87,6 +95,7 @@ def test_status_is_read_only_for_uninitialized_home(tmp_path):
     home = tmp_path / "control-plane"
     status = authority_status(home)
     assert status.state == "uninitialized"
+    assert status.recovery_guidance is None
     assert not home.exists()
 
 
@@ -97,6 +106,109 @@ def test_status_refuses_preexisting_zero_byte_database(tmp_path):
 
     with pytest.raises(AuthorityRecoveryError, match="status is unavailable"):
         authority_status(home)
+
+
+def test_status_reports_metadata_only_recovery_required(tmp_path):
+    control_home = tmp_path / "control-plane"
+    store = AuthorityStore(control_home)
+    store.activate(_scope())
+    with sqlite3.connect(store.path) as conn:
+        conn.execute(
+            "UPDATE authority_meta SET value=1 WHERE key='recovery_required'"
+        )
+
+    status = authority_status(control_home)
+
+    assert status.state == "recovery_required"
+    assert status.schema_version == AUTHORITY_SCHEMA_VERSION
+    assert status.recovery_generation == 0
+    assert status.sha256 == sha256_file(store.path)
+    assert status.size == store.path.stat().st_size
+    assert status.incident_id is None
+    assert status.classification is None
+    assert status.preserved is None
+    assert status.recovery_guidance == _RECOVERY_GUIDANCE
+
+
+@pytest.mark.parametrize(
+    "value",
+    ["2", "-1", "true", "", 0.5, 1.5, sqlite3.Binary(b"0"), sqlite3.Binary(b"1")],
+)
+def test_status_rejects_malformed_recovery_required_metadata(tmp_path, value):
+    control_home = tmp_path / "control-plane"
+    store = AuthorityStore(control_home)
+    store.activate(_scope())
+    with sqlite3.connect(store.path) as conn:
+        conn.execute(
+            "UPDATE authority_meta SET value=? WHERE key='recovery_required'", (value,)
+        )
+
+    with pytest.raises(AuthorityRecoveryError, match="status is unavailable"):
+        authority_status(control_home)
+
+
+def test_status_marker_includes_recovery_guidance(tmp_path):
+    control_home = tmp_path / "control-plane"
+    control_home.mkdir(mode=0o700)
+    store = AuthorityStore(control_home)
+    store.activate(_scope())
+    _corrupt_tls_header(store.path)
+    with pytest.raises(AuthorityCorrupt):
+        raise store._quarantine_corruption(  # noqa: SLF001 - incident fixture
+            "integrity_check returned 'file is not a database'"
+        )
+
+    status = authority_status(control_home)
+
+    assert status.state == "recovery_required"
+    assert status.recovery_guidance == _RECOVERY_GUIDANCE
+
+
+def test_status_cli_serializes_json_and_text_from_isolated_home(tmp_path):
+    hermes_home = tmp_path / "hermes-home"
+    control_home = hermes_home / "control-plane"
+    store = AuthorityStore(control_home)
+    store.activate(_scope())
+    with sqlite3.connect(store.path) as conn:
+        conn.execute(
+            "UPDATE authority_meta SET value=1 WHERE key='recovery_required'"
+        )
+    env = {**os.environ, "HERMES_HOME": str(hermes_home)}
+
+    json_result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "hermes_cli.main",
+            "dashboard",
+            "authority",
+            "status",
+            "--json",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+    text_result = subprocess.run(
+        [sys.executable, "-m", "hermes_cli.main", "dashboard", "authority", "status"],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+
+    assert json_result.returncode == 0, json_result.stderr
+    payload = json.loads(json_result.stdout)
+    assert payload["state"] == "recovery_required"
+    assert payload["schema_version"] == AUTHORITY_SCHEMA_VERSION
+    assert payload["recovery_generation"] == 0
+    assert payload["sha256"] == sha256_file(store.path)
+    assert payload["size"] == store.path.stat().st_size
+    assert payload["recovery_guidance"] == _RECOVERY_GUIDANCE
+    assert text_result.returncode == 0, text_result.stderr
+    assert "state: recovery_required" in text_result.stdout
+    assert f"recovery_guidance: {_RECOVERY_GUIDANCE}" in text_result.stdout
 
 
 def test_recovery_requires_matching_incident_digest_and_offline_lock(tmp_path, monkeypatch):
@@ -166,6 +278,7 @@ def test_recovery_accepts_separately_digest_pinned_healthy_source(tmp_path, monk
     )
 
     assert result.state == "healthy"
+    assert result.recovery_guidance is None
     assert result.recovery_generation == 1
     assert not store.recovery_marker_path.exists()
 
@@ -282,6 +395,7 @@ def test_preserve_retries_failed_evidence_without_changing_incident(tmp_path, mo
 
     updated = json.loads(store.recovery_marker_path.read_text())
     assert result.state == "recovery_required"
+    assert result.recovery_guidance == _RECOVERY_GUIDANCE
     assert result.preserved is True
     assert updated["incident_id"] == original["incident_id"]
     assert updated["detected_at"] == original["detected_at"]

@@ -226,6 +226,7 @@ class DeploymentResourceBroker:
         self._manager = manager
         self._authority_store = authority_store
         self._peers: dict[tuple[str, int, str, int, int], _BrokerPeer] = {}
+        self._cleanup_peers: dict[tuple[str, int, str, int], _BrokerPeer] = {}
         self._lock = threading.RLock()
         self._closed = False
 
@@ -284,20 +285,39 @@ class DeploymentResourceBroker:
                 None,
             )
             peer = self._peers.pop(key, None) if key is not None else None
-        if peer is not None:
-            self._close_peer(peer)
+            peer = peer or self._cleanup_peers.get(generation_key)
+            if peer is not None:
+                self._cleanup_peers[generation_key] = peer
+        if peer is None:
+            return
+        self._close_peer(peer)
+        with self._lock:
+            if not peer.reservations:
+                self._cleanup_peers.pop(generation_key, None)
 
     def close(self) -> None:
         with self._lock:
             self._closed = True
-            peers = tuple(self._peers.values())
+            for peer in self._peers.values():
+                self._cleanup_peers[self._generation_key(peer.lease)] = peer
             self._peers.clear()
+            peers = tuple({
+                id(peer): peer for peer in self._cleanup_peers.values()
+            }.values())
         first_error: Exception | None = None
         for peer in peers:
             try:
                 self._close_peer(peer)
             except Exception as exc:
                 first_error = first_error or exc
+            else:
+                generation_key = self._generation_key(peer.lease)
+                with self._lock:
+                    if (
+                        not peer.reservations
+                        and self._cleanup_peers.get(generation_key) is peer
+                    ):
+                        self._cleanup_peers.pop(generation_key, None)
         if first_error is not None:
             raise ResourceBrokerError("resource broker cleanup failed") from first_error
 
@@ -324,15 +344,21 @@ class DeploymentResourceBroker:
         except (OSError, ResourceBrokerError):
             pass
         finally:
+            generation_key = self._generation_key(peer.lease)
             with self._lock:
                 for candidate, item in tuple(self._peers.items()):
                     if item is peer:
                         self._peers.pop(candidate, None)
                         break
+                self._cleanup_peers[generation_key] = peer
             try:
                 self._close_peer(peer)
             except Exception:
                 pass
+            else:
+                with self._lock:
+                    if not peer.reservations:
+                        self._cleanup_peers.pop(generation_key, None)
 
     def _require_active(self, peer: _BrokerPeer) -> None:
         try:
@@ -433,14 +459,13 @@ class DeploymentResourceBroker:
 
     def _close_peer(self, peer: _BrokerPeer) -> None:
         with peer.operation_lock:
-            if peer.closed:
-                return
-            peer.closed = True
-            try:
-                peer.connection.shutdown(socket.SHUT_RDWR)
-            except OSError:
-                pass
-            peer.connection.close()
+            if not peer.closed:
+                peer.closed = True
+                try:
+                    peer.connection.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
+                peer.connection.close()
             self._cleanup_reservations(peer)
 
 

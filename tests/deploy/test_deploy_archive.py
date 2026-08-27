@@ -129,7 +129,10 @@ def test_remote_cutover_stops_before_atomic_current_switch():
     assert 'mode=ro&immutable=1' in script
     assert "PRAGMA integrity_check" in script
     assert 'dashboard authority status --json' in script
-    assert "documented offline recovery workflow" in script
+    assert (
+        "Restart cannot recover authority; offline recovery fencing is required."
+        in script
+    )
     assert "write_drain_request" not in script
     assert "read_runtime_status" not in script
     assert "is_gateway_runtime_lock_active" not in script

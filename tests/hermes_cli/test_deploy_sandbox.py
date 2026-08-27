@@ -218,6 +218,29 @@ def test_deploy_uses_nonroot_service_immutable_runtime_and_host_policy():
     assert "HERMES_EXECUTOR_START_GATE_FD" not in source
 
 
+def test_deploy_sets_and_preflights_dashboard_nofile_limits_without_changing_executor_limit():
+    source = DEPLOY.read_text(encoding="utf-8")
+
+    assert "dashboard_soft_nofile=65536" in source
+    assert "dashboard_hard_nofile=1048576" in source
+    assert "LimitNOFILE=$dashboard_soft_nofile:$dashboard_hard_nofile" in source
+    assert '--expected-soft-nofile "$dashboard_soft_nofile"' in source
+    assert '--expected-hard-nofile "$dashboard_hard_nofile"' in source
+    assert "--require-mandatory" in source
+    mandatory_gate = source.index('payload.get("mandatoryReady") is True')
+    limit_failure = source.index(
+        "Dashboard LimitNOFILE verification failed; refusing deployment",
+        mandatory_gate,
+    )
+    optional_cgroup = source.index(
+        "HERMES_DEPLOY_STAGE executor_resource_preflight=unavailable",
+        limit_failure,
+    )
+    deployment_commit = source.index('deployment_committed="1"', optional_cgroup)
+    assert mandatory_gate < limit_failure < optional_cgroup < deployment_commit
+    assert '"file_descriptors":64' in source
+
+
 def test_deploy_filters_and_deduplicates_runtime_dependencies():
     source = DEPLOY.read_text(encoding="utf-8")
     build_start = source.index('if [ ! -x "$venv/bin/python3" ]; then')
