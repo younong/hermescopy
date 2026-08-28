@@ -22,6 +22,7 @@ _PROTOCOL_VERSION = 1
 _MAX_PACKET_BYTES = 128 * 1024
 _MAX_FDS = 8
 _RESPONSE_TIMEOUT = 10.0
+_LAUNCHER_SHUTDOWN_TIMEOUT = 3.0
 _FD_NAMES = ("cwd", "stdout", "stderr", "start", "inference", "media", "resource")
 _PIDFD_SYSCALLS = {
     "aarch64": (434, 424),
@@ -412,32 +413,35 @@ class LauncherProcessHandle:
         self.pid = pid
         self._launcher = launcher
         self._pidfd = _pidfd_open(pid)
+        self._lock = threading.Lock()
         self.returncode: int | None = None
 
     def poll(self) -> int | None:
-        if self.returncode is not None:
+        with self._lock:
+            if self.returncode is not None:
+                return self.returncode
+            selector = selectors.DefaultSelector()
+            try:
+                selector.register(self._pidfd, selectors.EVENT_READ)
+                if selector.select(0):
+                    self.returncode = self._returncode_after_confirmed_exit()
+            finally:
+                selector.close()
             return self.returncode
-        selector = selectors.DefaultSelector()
-        try:
-            selector.register(self._pidfd, selectors.EVENT_READ)
-            if selector.select(0):
-                self.returncode = self._launcher._child_returncode(self.pid)
-        finally:
-            selector.close()
-        return self.returncode
 
     def wait(self, timeout: float | None = None) -> int:
-        if self.returncode is not None:
-            return self.returncode
-        selector = selectors.DefaultSelector()
-        try:
-            selector.register(self._pidfd, selectors.EVENT_READ)
-            if not selector.select(timeout):
-                raise subprocess.TimeoutExpired("owner-worker", timeout)
-            self.returncode = self._launcher._child_returncode(self.pid)
-            return self.returncode
-        finally:
-            selector.close()
+        with self._lock:
+            if self.returncode is not None:
+                return self.returncode
+            selector = selectors.DefaultSelector()
+            try:
+                selector.register(self._pidfd, selectors.EVENT_READ)
+                if not selector.select(timeout):
+                    raise subprocess.TimeoutExpired("owner-worker", timeout)
+                self.returncode = self._returncode_after_confirmed_exit()
+                return self.returncode
+            finally:
+                selector.close()
 
     def terminate(self) -> None:
         self._signal(signal.SIGTERM)
@@ -445,16 +449,44 @@ class LauncherProcessHandle:
     def kill(self) -> None:
         self._signal(signal.SIGKILL)
 
+    def confirm_exit_after_launcher_close(self, timeout: float = 2.0) -> bool:
+        """Confirm exit without consulting the now-closed launcher channel."""
+        with self._lock:
+            selector = selectors.DefaultSelector()
+            try:
+                selector.register(self._pidfd, selectors.EVENT_READ)
+                if selector.select(0):
+                    return True
+                _pidfd_send_signal(self._pidfd, signal.SIGKILL)
+                return bool(selector.select(timeout))
+            except ProcessLookupError:
+                return True
+            finally:
+                selector.close()
+
+    def _returncode_after_confirmed_exit(self) -> int:
+        try:
+            return self._launcher._child_returncode(self.pid)
+        except (OwnerWorkerLauncherError, OSError, EOFError):
+            # A readable pidfd is authoritative exit evidence even if an earlier
+            # ambiguous RPC poisoned the launcher channel and lost exit status.
+            return 1
+
     def _signal(self, sig: signal.Signals) -> None:
-        if self.poll() is not None:
-            return
-        _pidfd_send_signal(self._pidfd, sig)
+        with self._lock:
+            if self.returncode is not None:
+                return
+            try:
+                _pidfd_send_signal(self._pidfd, sig)
+            except ProcessLookupError:
+                pass
 
     def close(self) -> None:
-        fd = getattr(self, "_pidfd", -1)
-        if fd >= 0:
-            os.close(fd)
+        with self._lock:
+            fd = getattr(self, "_pidfd", -1)
             self._pidfd = -1
+            if fd >= 0:
+                os.close(fd)
 
 
 class OwnerWorkerLauncher:
@@ -464,27 +496,32 @@ class OwnerWorkerLauncher:
         _require_pidfd_support()
         parent, child = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
         child.set_inheritable(True)
-        try:
-            self._process = process_factory(
-                [sys.executable, "-m", "hermes_cli.owner_worker.preloaded_launcher", "--fd", str(child.fileno())],
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                close_fds=True,
-                pass_fds=(child.fileno(),),
-            )
-        finally:
-            child.close()
+        self._process = None
         self._channel = parent
-        self._channel.settimeout(_RESPONSE_TIMEOUT)
         self._lock = threading.Lock()
+        self._closed = False
         try:
+            try:
+                self._process = process_factory(
+                    [sys.executable, "-m", "hermes_cli.owner_worker.preloaded_launcher", "--fd", str(child.fileno())],
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    close_fds=True,
+                    pass_fds=(child.fileno(),),
+                )
+            finally:
+                child.close()
+            self._channel.settimeout(_RESPONSE_TIMEOUT)
             ready, fds = _recv_packet(self._channel)
             _close_fds(fds)
             if ready != {"version": _PROTOCOL_VERSION, "op": "ready"}:
                 raise OwnerWorkerLauncherError("owner worker launcher preload failed")
-        except Exception:
-            self.close()
+        except BaseException:
+            try:
+                self.close()
+            except BaseException:
+                pass
             raise
 
     def spawn(
@@ -509,52 +546,128 @@ class OwnerWorkerLauncher:
             "env": env,
             "fdNames": names,
         }
-        with self._lock:
-            if self._process.poll() is not None:
-                raise OwnerWorkerLauncherError("owner worker launcher is unavailable")
-            _send_packet(self._channel, request, descriptors)
-            response, received = _recv_packet(self._channel)
-        _close_fds(received)
-        if (
-            response.get("version") != _PROTOCOL_VERSION
-            or response.get("nonce") != nonce
-            or response.get("op") != "launched"
-            or not isinstance(response.get("pid"), int)
-            or response["pid"] <= 0
-        ):
-            raise OwnerWorkerLauncherError("owner worker launcher rejected the launch")
-        return LauncherProcessHandle(response["pid"], self)
+        received: list[int] = []
+        try:
+            with self._lock:
+                if self._closed or self._process is None or self._process.poll() is not None:
+                    raise OwnerWorkerLauncherError("owner worker launcher is unavailable")
+                try:
+                    _send_packet(self._channel, request, descriptors)
+                    response, received = _recv_packet(self._channel)
+                    if (
+                        response.get("version") != _PROTOCOL_VERSION
+                        or response.get("nonce") != nonce
+                        or response.get("op") != "launched"
+                        or not isinstance(response.get("pid"), int)
+                        or response["pid"] <= 0
+                    ):
+                        raise OwnerWorkerLauncherError(
+                            "owner worker launcher rejected the launch"
+                        )
+                except BaseException:
+                    self._poison_locked()
+                    raise
+        finally:
+            _close_fds(received)
+        try:
+            return LauncherProcessHandle(response["pid"], self)
+        except BaseException:
+            # The launcher has already forked this child. Closing the launcher
+            # synchronously reaps every tracked child rather than returning with
+            # one generation that has no pidfd-backed ownership handle.
+            try:
+                self.close()
+            except BaseException:
+                pass
+            raise
 
     def _child_returncode(self, pid: int) -> int:
         nonce = uuid.uuid4().hex
-        with self._lock:
-            if self._process.poll() is not None:
-                raise OwnerWorkerLauncherError("owner worker launcher is unavailable")
-            _send_packet(
-                self._channel,
-                {
-                    "version": _PROTOCOL_VERSION,
-                    "op": "status",
-                    "nonce": nonce,
-                    "pid": pid,
-                },
-            )
-            response, received = _recv_packet(self._channel)
-        _close_fds(received)
-        if (
-            response.get("version") != _PROTOCOL_VERSION
-            or response.get("op") != "status"
-            or response.get("nonce") != nonce
-            or response.get("pid") != pid
-            or response.get("known") is not True
-            or not isinstance(response.get("returncode"), int)
-        ):
-            raise OwnerWorkerLauncherError("owner worker launcher child status is invalid")
+        received: list[int] = []
+        try:
+            with self._lock:
+                if self._closed or self._process is None or self._process.poll() is not None:
+                    raise OwnerWorkerLauncherError("owner worker launcher is unavailable")
+                try:
+                    _send_packet(
+                        self._channel,
+                        {
+                            "version": _PROTOCOL_VERSION,
+                            "op": "status",
+                            "nonce": nonce,
+                            "pid": pid,
+                        },
+                    )
+                    response, received = _recv_packet(self._channel)
+                    if (
+                        response.get("version") != _PROTOCOL_VERSION
+                        or response.get("op") != "status"
+                        or response.get("nonce") != nonce
+                        or response.get("pid") != pid
+                        or response.get("known") is not True
+                        or not isinstance(response.get("returncode"), int)
+                    ):
+                        raise OwnerWorkerLauncherError(
+                            "owner worker launcher child status is invalid"
+                        )
+                except BaseException:
+                    self._poison_locked()
+                    raise
+        finally:
+            _close_fds(received)
         return response["returncode"]
 
     def close(self) -> None:
+        lock = getattr(self, "_lock", None)
+        if lock is None:
+            self._close_locked()
+            return
+        with lock:
+            self._close_locked()
+
+    def _poison_locked(self) -> None:
+        """Permanently reject RPCs after an ambiguous ordered-channel failure."""
+        self._closed = True
+        channel = getattr(self, "_channel", None)
+        if channel is not None:
+            try:
+                channel.close()
+            except OSError:
+                pass
+            self._channel = None
+        try:
+            self._reap_launcher_locked(allow_eof_cleanup=True)
+        except BaseException:
+            # The ordered-RPC failure remains primary. Keep process ownership so
+            # close() can retry any interrupted or failed launcher reap.
+            pass
+
+    def _reap_launcher_locked(self, *, allow_eof_cleanup: bool) -> None:
+        process = getattr(self, "_process", None)
+        if process is None:
+            return
+        if process.poll() is None and allow_eof_cleanup:
+            try:
+                process.wait(timeout=_LAUNCHER_SHUTDOWN_TIMEOUT)
+            except subprocess.TimeoutExpired:
+                pass
+        if process.poll() is None:
+            process.terminate()
+            try:
+                process.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=2)
+        if process.poll() is not None:
+            self._process = None
+
+    def _close_locked(self) -> None:
         channel = getattr(self, "_channel", None)
         process = getattr(self, "_process", None)
+        if getattr(self, "_closed", False) and process is None:
+            return
+        self._closed = True
+        graceful_shutdown = False
         if channel is not None:
             try:
                 nonce = uuid.uuid4().hex
@@ -564,19 +677,20 @@ class OwnerWorkerLauncher:
                 )
                 response, fds = _recv_packet(channel)
                 _close_fds(fds)
-                if response.get("nonce") != nonce:
-                    raise OwnerWorkerLauncherError("owner worker launcher shutdown failed")
+                graceful_shutdown = response == {
+                    "version": _PROTOCOL_VERSION,
+                    "op": "shutdown",
+                    "nonce": nonce,
+                }
+                if not graceful_shutdown:
+                    raise OwnerWorkerLauncherError(
+                        "owner worker launcher shutdown failed"
+                    )
             except (OSError, EOFError, OwnerWorkerLauncherError, socket.timeout):
                 pass
             channel.close()
             self._channel = None
-        if process is not None and process.poll() is None:
-            process.terminate()
-            try:
-                process.wait(timeout=2)
-            except subprocess.TimeoutExpired:
-                process.kill()
-                process.wait(timeout=2)
+        self._reap_launcher_locked(allow_eof_cleanup=graceful_shutdown)
 
 
 def main() -> None:

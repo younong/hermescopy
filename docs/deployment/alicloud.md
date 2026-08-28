@@ -59,7 +59,7 @@ Systemd 服务与 delegated cgroup：
 
 旧 `hermes-gateway.service` 仅在升级事务中被识别并退休；候选版本不会安装、启用或启动它。
 
-Dashboard unit 使用 `Delegate=cpu memory pids`、CPU/Memory/Tasks accounting 和 `KillMode=control-group`。可信 bootstrap 先把 Dashboard 进程移入 `control-plane/`，再启用 unit root controller 并建立空的 `authenticated-owners/`；应用只管理该空 subtree。生产专用首版预算为：全局 1500m CPU/2304 MiB/512 PID/最多 5 worker 和 2 executor；单 owner 1000m/896 MiB/128 PID/1 executor；单 invocation 750m/512 MiB/swap 0/64 PID/64 FD/120 秒/200,000 字节。它们只针对当前 2 vCPU、约 3.48 GiB 主机，不是跨部署默认值。
+Dashboard unit 使用 `Delegate=cpu memory pids`、CPU/Memory/Tasks accounting、`LimitNOFILE=65536:1048576` 和 `KillMode=mixed`。可信 bootstrap 先把 Dashboard 进程移入 `control-plane/`，再启用 unit root controller 并建立空的 `authenticated-owners/`；应用只管理该空 subtree。生产专用首版预算为：全局 1500m CPU/2304 MiB/512 PID/最多 5 worker 和 2 executor；单 owner 1000m/896 MiB/128 PID/1 executor；单 invocation 750m/512 MiB/swap 0/64 PID/64 FD/120 秒/200,000 字节。它们只针对当前 2 vCPU、约 3.48 GiB 主机，不是跨部署默认值。
 
 Dashboard 只监听服务器本机 `127.0.0.1:9119`，公开入口为：
 
@@ -85,26 +85,22 @@ ssh -L 9119:localhost:9119 root@106.15.186.104
 hermes dashboard authority status --json
 ```
 
-如果 authority 无法读取或存在 `authority.sqlite3.recovery-required.json`，部署会停止，且不会删除 marker、修复数据库或回滚 authority。按以下离线流程恢复：
+如果 authority 无法读取、存在 `authority.sqlite3.recovery-required.json` marker，或数据库 metadata 中 `recovery_required=1`，部署会停止，且不会删除 marker、修复数据库或回滚 authority。重启无法恢复 authority；必须执行离线 recovery fencing。
 
-1. 停止 Dashboard（以及可能持有 authority 生命周期锁的 owner 进程），不要删除或改名 marker。
-2. 查看状态并确保 forensic copy 已保存：
-   ```bash
-   hermes dashboard authority status --json
-   hermes dashboard authority preserve --json
-   ```
-3. 从 marker 记录的 incident ID 与 SHA-256 固定来源执行恢复。仅当来源精确匹配 `SQLit` 后 byte 5 的 TLS record 损坏时才使用专用模式：
-   ```bash
-   hermes dashboard authority recover \
-     --incident <incident-id> \
-     --source <untouched-source.sqlite3> \
-     --sha256 <sha256> \
-     --repair-tls-offset-5 \
-     --json
-   ```
-4. 启动 Dashboard，并验证新登录、WS ticket、Owner Worker 对话和冷 Session Reader resume。
+先停止 Dashboard（以及可能持有 authority 生命周期锁的 owner 进程），然后运行 `hermes dashboard authority status --json` 区分恢复证据：
 
-恢复命令不修改来源文件。它在同目录 staging DB 上验证完整性和 schema，通过 SQLite backup 重建，推进 recovery generation，撤销旧 scope/ticket/bootstrap/Worker/Reader authority，并在 DB 与 browser-ticket keyring witness 均持久化一致后才清除 marker。禁止直接恢复陈旧 DB、手工删除 marker 或跳过 recovery fencing。
+- **有 marker/incident ID 的损坏事件**：不要删除或改名 marker。运行 `hermes dashboard authority preserve --json` 确认 forensic copy，再从 marker 记录的 incident ID 与 SHA-256 固定来源执行恢复。仅当来源精确匹配 `SQLit` 后 byte 5 的 TLS record 损坏时才使用专用模式：
+  ```bash
+  hermes dashboard authority recover \
+    --incident <incident-id> \
+    --source <untouched-source.sqlite3> \
+    --sha256 <sha256> \
+    --repair-tls-offset-5 \
+    --json
+  ```
+- **只有 metadata `recovery_required=1`、没有 incident ID 的 replay-continuity 事件**：现有 `preserve`/`recover` 命令只接受 marker-backed corruption，不能修复该状态。保持 Dashboard 离线和 authority/keyring 原件不变，保存两者的 forensic copy，并升级给 authority recovery 维护者执行专用 signer/DB fencing；不得手工把 metadata 改回 `0`、生成新 keyring 或把 marker-only 命令当作成功恢复。
+
+恢复完成后启动 Dashboard，并验证新登录、WS ticket、Owner Worker 对话和冷 Session Reader resume。marker-backed 恢复命令不修改来源文件；它在同目录 staging DB 上验证完整性和 schema，通过 SQLite backup 重建，推进 recovery generation，撤销旧 scope/ticket/bootstrap/Worker/Reader authority，并在 DB 与 browser-ticket keyring witness 均持久化一致后才清除 marker。禁止直接恢复陈旧 DB、手工删除 marker 或跳过 recovery fencing。
 
 ## 本机发布端与 SSH host key
 
@@ -212,7 +208,7 @@ npm run deploy -- --create-tag <emergency-tag> --allow-non-main
 5. 在服务器上按 locked Python/PowerPoint 输入与架构创建或复用不可变 runtime。
 6. 校验 Bubblewrap 能力，安装 root-owned seccomp artifact 和 `/etc/hermes/executor-sandbox.json`，执行 policy preflight。
 7. 将 candidate runner、Dashboard unit、policy 和 seccomp 留在事务 staging；停止旧 Dashboard，由其关闭浏览器桥并排空、吊销 Owner Workers。若旧 standalone Gateway unit 存在，则仅在迁移中停止、禁用并移除。确认旧服务退出后，才原子安装 staged artifacts 和切换 `/opt/hermes/current`，再以稳定的非 root `hermes` user/group 只启动 Dashboard。
-8. 对 delegated subtree 执行 `check-executor-cgroup-host.py --require-ready`。已迁移主机必须通过 controller、accounting、swap/freeze 和 topology 检查；未迁移主机明确保持 Tool fail closed，部署脚本不会修改 grub 或重启。
+8. 对 delegated subtree 执行 `check-executor-cgroup-host.py --expected-soft-nofile 65536 --expected-hard-nofile 1048576 --require-mandatory`，并分别读取 `mandatoryReady` 与 `resourceReady`。Dashboard 的运行时 soft/hard `LimitNOFILE` 不匹配时部署必定停止；已迁移主机还必须通过 controller、accounting、swap/freeze 和 topology 检查，未迁移主机则明确保持 Tool fail closed，部署脚本不会修改 grub 或重启。
 9. 资源层 ready 时执行 `smoke-executor-resources.py` 的真实 kernel limit/event/cleanup 检查，再通过同一 cgroup manager 启动真实 authenticated executor：在高编号 FD 压力下验证 Bubblewrap 可启动、executor 内 `RLIMIT_NOFILE` 与 policy 一致，并完成 PptxGenJS、MarkItDown、单次 LibreOffice PowerPoint runtime 以及确定性的 loopback owner-relay 网络 smoke。
 10. 从 loopback 带生产代理头验证 Hermes 自己的登录 gate 已生效。
 11. 在部署事务内以 `hermes` 用户、`env -i` 和独立临时 `HOME`/`TMPDIR`/`HERMES_HOME` 运行 Authority concurrency smoke，覆盖并发首次初始化、browser/Worker exact-once、Worker lease/change feed、checkpoint、integrity、schema 与 recovery 状态；它只访问合成 Authority，绝不读取生产 Authority 或 `.env`。
@@ -287,7 +283,9 @@ nginx -t && systemctl reload nginx
    ```bash
    python3 /opt/hermes/current/deploy/check-executor-cgroup-host.py \
      --managed-root /sys/fs/cgroup/system.slice/hermes-dashboard.service/authenticated-owners \
-     --service hermes-dashboard.service --require-ready
+     --service hermes-dashboard.service \
+     --expected-soft-nofile 65536 --expected-hard-nofile 1048576 \
+     --require-ready
    python3 /opt/hermes/current/deploy/smoke-executor-resources.py \
      --managed-root /sys/fs/cgroup/system.slice/hermes-dashboard.service/authenticated-owners
    ```
@@ -348,7 +346,8 @@ sudo -u hermes env \
   'from hermes_cli.owner_worker.host_sandbox import host_sandbox_deployment_policy; host_sandbox_deployment_policy()'
 python3 /opt/hermes/current/deploy/check-executor-cgroup-host.py \
   --managed-root /sys/fs/cgroup/system.slice/hermes-dashboard.service/authenticated-owners \
-  --service hermes-dashboard.service
+  --service hermes-dashboard.service \
+  --expected-soft-nofile 65536 --expected-hard-nofile 1048576
 ```
 
 cgroup 不限制普通 workspace 文件字节数或 inode。本阶段不会把现有 `disk_bytes`/`disk_inodes` quota 声明为硬保障；当前根盘 ext4 尚未启用 per-owner project quota，且生产探测时已使用约 79%。上线必须保留磁盘容量/inode 告警。第二阶段应把 owner workspace 移入支持 project quota 的独立 ext4/XFS 文件系统，并为每个 owner 同时配置字节和 inode 硬配额。

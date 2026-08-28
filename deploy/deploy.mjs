@@ -785,6 +785,8 @@ service_user="hermes"
 service_group="hermes"
 owner_worker_drain_timeout=120
 owner_worker_runtime_limit=4
+dashboard_soft_nofile=65536
+dashboard_hard_nofile=1048576
 dashboard_stop_timeout="$((owner_worker_drain_timeout + 30))"
 old_current_target=""
 new_current_target=""
@@ -1500,6 +1502,7 @@ Delegate=cpu memory pids
 CPUAccounting=yes
 MemoryAccounting=yes
 TasksAccounting=yes
+LimitNOFILE=$dashboard_soft_nofile:$dashboard_hard_nofile
 # Signal only the Dashboard first so its shutdown hook can drain owner workers;
 # systemd still SIGKILLs any processes left in the cgroup after the stop timeout.
 KillMode=mixed
@@ -1521,14 +1524,16 @@ if ! authority_status="$(
     "$venv/bin/python" -m hermes_cli.main dashboard authority status --json
 )"; then
   echo "HERMES_DEPLOY_STAGE authority_preflight=failed" >&2
-  echo "Authority preflight failed; run 'hermes dashboard authority status' and the documented offline recovery workflow" >&2
+  echo "Authority preflight failed. Restart cannot recover authority; offline recovery fencing is required. Run 'hermes dashboard authority status'." >&2
   exit 1
 fi
 printf '%s' "$authority_status" | "$venv/bin/python" -c '
 import json, sys
 payload = json.load(sys.stdin)
 if payload.get("state") not in {"healthy", "uninitialized"}:
-    raise SystemExit("authority recovery is required before deployment")
+    raise SystemExit(
+        "Restart cannot recover authority; offline recovery fencing is required."
+    )
 '
 echo "HERMES_DEPLOY_STAGE authority_preflight=passed"
 
@@ -1591,10 +1596,31 @@ if [ "$login_status" != "302" ] || [ "$api_status" != "401" ]; then
   exit 1
 fi
 
-if "$venv/bin/python" "$release/deploy/check-executor-cgroup-host.py" \
-  --managed-root "$cgroup_root" \
-  --service hermes-dashboard.service \
-  --require-ready; then
+if ! executor_host_status="$(
+  "$venv/bin/python" "$release/deploy/check-executor-cgroup-host.py" \
+    --managed-root "$cgroup_root" \
+    --service hermes-dashboard.service \
+    --expected-soft-nofile "$dashboard_soft_nofile" \
+    --expected-hard-nofile "$dashboard_hard_nofile" \
+    --require-mandatory
+)"; then
+  echo "Executor host preflight could not inspect the candidate service" >&2
+  exit 1
+fi
+printf '%s\n' "$executor_host_status"
+if ! printf '%s' "$executor_host_status" | "$venv/bin/python" -c '
+import json, sys
+payload = json.load(sys.stdin)
+raise SystemExit(0 if payload.get("mandatoryReady") is True else 1)
+'; then
+  echo "Dashboard LimitNOFILE verification failed; refusing deployment" >&2
+  exit 1
+fi
+if printf '%s' "$executor_host_status" | "$venv/bin/python" -c '
+import json, sys
+payload = json.load(sys.stdin)
+raise SystemExit(0 if payload.get("resourceReady") is True else 1)
+'; then
   echo "HERMES_DEPLOY_STAGE executor_resource_preflight=passed"
   PYTHONPATH="$release" "$venv/bin/python" -c 'from hermes_cli.owner_worker.host_sandbox import host_sandbox_deployment_policy; host_sandbox_deployment_policy()'
   "$venv/bin/python" "$release/deploy/smoke-executor-resources.py" \

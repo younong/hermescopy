@@ -68,14 +68,17 @@ class OwnerWorkerHandle:
     lease_version: int
     recovery_generation: int
     socket_path: Path
-    process: subprocess.Popen[Any]
-    pid: int
+    process: subprocess.Popen[Any] | None
+    pid: int | None
     started_at: float = field(default_factory=time.time)
     last_used_at: float = field(default_factory=time.time)
     last_health: dict[str, Any] = field(default_factory=dict)
     active_uses: int = 0
     accepting: bool = True
     resource_scope: CgroupScopeLease | None = field(default=None, repr=False)
+    process_handle_closed: bool = field(default=False, repr=False)
+    broker_cleanup_pending: bool = field(default=False, repr=False)
+    runtime_cleanup_pending: bool = field(default=False, repr=False)
 
 
 class OwnerWorkerUnavailableError(RuntimeError):
@@ -313,12 +316,7 @@ class OwnerWorkerSupervisor:
         self._use_preloaded_launcher = process_factory is subprocess.Popen
         self.launcher = None
         self._bundled_skill_snapshot = None
-        if self._use_preloaded_launcher:
-            from tools.skills_sync import prepare_bundled_skill_snapshot
-
-            self.launcher = launcher or OwnerWorkerLauncher()
-            self._bundled_skill_snapshot = prepare_bundled_skill_snapshot()
-        elif launcher is not None:
+        if not self._use_preloaded_launcher and launcher is not None:
             raise ValueError("owner worker launcher requires the production process factory")
         self.startup_timeout = startup_timeout
         self.poll_interval = poll_interval
@@ -397,11 +395,33 @@ class OwnerWorkerSupervisor:
         # and process teardown complete. This prevents duplicate retirement, new
         # use leases, and replacement admission while the old process is live.
         self._terminating_handles: dict[str, OwnerWorkerHandle] = {}
+        self._terminating_in_progress: set[int] = set()
+        self._shutting_down = False
+        self._shutdown_in_progress = False
+        self._shutdown_complete = False
         self._last_start_attempt: dict[str, float] = {}
         self._starting_owner_keys: set[str] = set()
         self._in_flight_starts = 0
         self._lock = threading.RLock()
         self._start_finished = threading.Condition(self._lock)
+        if self._use_preloaded_launcher:
+            from tools.skills_sync import prepare_bundled_skill_snapshot
+
+            owns_launcher = launcher is None
+            self.launcher = launcher or OwnerWorkerLauncher()
+            try:
+                self._bundled_skill_snapshot = prepare_bundled_skill_snapshot()
+            except BaseException:
+                if owns_launcher:
+                    try:
+                        self.launcher.close()
+                    except BaseException:
+                        _log.warning(
+                            "Owner worker launcher cleanup failed during initialization",
+                            exc_info=True,
+                        )
+                    self.launcher = None
+                raise
 
     @staticmethod
     def _audit_generation(reason: AuthorityAuditReason, lease: OwnerWorkerAuthorityLease) -> None:
@@ -470,6 +490,10 @@ class OwnerWorkerSupervisor:
                     )
 
             with self._start_finished:
+                if self._shutting_down:
+                    raise OwnerWorkerUnavailableError(
+                        "owner worker supervisor is shutting down"
+                    )
                 existing = self._handles.get(owner_key)
                 if existing is not None:
                     if existing.owner_home.resolve() != owner_home.resolve():
@@ -611,12 +635,31 @@ class OwnerWorkerSupervisor:
                     raise OwnerWorkerUnavailableError(f"owner worker is already owned: {exc}") from exc
                 claim = self.authority_store.claim_worker_start(owner_key, worker_id=uuid.uuid4().hex)
         generation = claim.generation
-        socket_path = self.socket_path_for(owner, generation.worker_generation)
-        env = self._env_for(owner, generation, claim.lease, process_token=claim.process_token)
-        heartbeat_stop = threading.Event()
+        socket_path = owner_worker_socket_path(
+            owner_home,
+            generation.worker_generation,
+        )
+        heartbeat_stop = None
+        heartbeat_thread = None
         heartbeat_failure: list[BaseException] = []
 
+        def _try_startup_cleanup(operation: str, callback: Callable[[], None]) -> bool:
+            try:
+                callback()
+            except BaseException:
+                _log.warning(
+                    "Owner worker startup cleanup failed",
+                    extra={
+                        "operation": operation,
+                        "worker_generation": generation.worker_generation,
+                    },
+                    exc_info=True,
+                )
+                return False
+            return True
+
         def _startup_heartbeat() -> None:
+            assert heartbeat_stop is not None
             interval = max(0.25, min(1.0, self.poll_interval or 0.5))
             while not heartbeat_stop.wait(interval):
                 try:
@@ -628,26 +671,122 @@ class OwnerWorkerSupervisor:
                     heartbeat_stop.set()
                     return
 
-        heartbeat_thread = threading.Thread(
-            target=_startup_heartbeat,
-            name=f"owner-worker-heartbeat-{generation.worker_generation}",
-            daemon=True,
-        )
-        heartbeat_thread.start()
-
         def _stop_startup_heartbeat() -> None:
-            heartbeat_stop.set()
-            heartbeat_thread.join(timeout=max(1.0, self.poll_interval + 1.0))
+            if heartbeat_stop is not None:
+                heartbeat_stop.set()
+            if heartbeat_thread is not None and heartbeat_thread.is_alive():
+                heartbeat_thread.join(timeout=max(1.0, self.poll_interval + 1.0))
 
         def _ensure_startup_heartbeat() -> None:
             if heartbeat_failure:
                 raise OwnerWorkerStartupError("owner worker startup lease heartbeat failed") from heartbeat_failure[0]
+
+        try:
+            socket_path = self.socket_path_for(owner, generation.worker_generation)
+            env = self._env_for(
+                owner,
+                generation,
+                claim.lease,
+                process_token=claim.process_token,
+            )
+            heartbeat_stop = threading.Event()
+            heartbeat_thread = threading.Thread(
+                target=_startup_heartbeat,
+                name=f"owner-worker-heartbeat-{generation.worker_generation}",
+                daemon=True,
+            )
+            heartbeat_thread.start()
+        except BaseException as exc:
+            _try_startup_cleanup("startup_heartbeat", _stop_startup_heartbeat)
+            authority_cleanup_complete = _try_startup_cleanup(
+                "authority_fence",
+                lambda: self.authority_store.transition_worker_lease(
+                    claim.lease,
+                    state=WorkerLeaseState.REVOKED,
+                    generation_state=WorkerGenerationState.FAILED,
+                ),
+            )
+            if not authority_cleanup_complete:
+                self._retain_startup_cleanup(
+                    owner_key=owner_key,
+                    owner_home=owner_home,
+                    socket_path=socket_path,
+                    lease=claim.lease,
+                    process=None,
+                    process_exited=True,
+                    resource_scope=None,
+                    broker_cleanup_pending=False,
+                    runtime_cleanup_pending=False,
+                )
+            if isinstance(exc, Exception):
+                raise OwnerWorkerStartupError(
+                    "owner worker startup setup failed"
+                ) from exc
+            raise
 
         relay_fd = None
         media_relay_fd = None
         resource_broker_fd = None
         worker_resource_scope = None
         resource_started_at = time.monotonic()
+
+        def _revoke_startup_brokers(lease: OwnerWorkerAuthorityLease) -> bool:
+            cleanup_complete = True
+            for operation, broker in (
+                ("inference_broker_revoke", self.deployment_inference_broker),
+                ("media_broker_revoke", self.deployment_media_broker),
+                ("resource_broker_revoke", self.deployment_resource_broker),
+            ):
+                if broker is not None:
+                    cleanup_complete = (
+                        _try_startup_cleanup(operation, lambda broker=broker: broker.revoke(lease))
+                        and cleanup_complete
+                    )
+            return cleanup_complete
+
+        def _fence_failed_start(lease: OwnerWorkerAuthorityLease) -> bool:
+            return _try_startup_cleanup(
+                "authority_fence",
+                lambda: self.authority_store.transition_worker_lease(
+                    lease,
+                    state=WorkerLeaseState.REVOKED,
+                    generation_state=WorkerGenerationState.FAILED,
+                ),
+            )
+
+        def _retain_incomplete_startup_cleanup(
+            *,
+            lease: OwnerWorkerAuthorityLease,
+            process: Any | None,
+            process_exited: bool,
+            broker_cleanup_complete: bool,
+            authority_cleanup_complete: bool,
+            runtime_cleanup_complete: bool,
+        ) -> None:
+            scope_pending = worker_resource_scope is not None and not getattr(
+                worker_resource_scope,
+                "released",
+                False,
+            )
+            if (
+                not process_exited
+                or not broker_cleanup_complete
+                or not authority_cleanup_complete
+                or not runtime_cleanup_complete
+                or scope_pending
+            ):
+                self._retain_startup_cleanup(
+                    owner_key=owner_key,
+                    owner_home=owner_home,
+                    socket_path=socket_path,
+                    lease=lease,
+                    process=process,
+                    process_exited=process_exited,
+                    resource_scope=worker_resource_scope,
+                    broker_cleanup_pending=not broker_cleanup_complete,
+                    runtime_cleanup_pending=not runtime_cleanup_complete,
+                )
+
         try:
             _ensure_startup_heartbeat()
             if self.resource_manager is not None:
@@ -666,7 +805,7 @@ class OwnerWorkerSupervisor:
                 worker_generation=generation.worker_generation,
             )
             controlled_roots = self._controlled_roots_for(runtime_paths)
-        except Exception as exc:
+        except BaseException as exc:
             observe_latency_stage(
                 stage="owner_worker.ready.resource_admission",
                 started_at=resource_started_at,
@@ -675,27 +814,25 @@ class OwnerWorkerSupervisor:
             )
             for fd in (relay_fd, media_relay_fd, resource_broker_fd):
                 if fd is not None:
-                    try:
-                        os.close(fd)
-                    except OSError:
-                        pass
-            if self.deployment_inference_broker is not None:
-                self.deployment_inference_broker.revoke(claim.lease)
-            if self.deployment_media_broker is not None:
-                self.deployment_media_broker.revoke(claim.lease)
-            if self.deployment_resource_broker is not None:
-                self.deployment_resource_broker.revoke(claim.lease)
+                    _try_startup_cleanup("relay_descriptor", lambda fd=fd: os.close(fd))
+            broker_cleanup_complete = _revoke_startup_brokers(claim.lease)
             if worker_resource_scope is not None:
-                worker_resource_scope.cleanup()
-            _stop_startup_heartbeat()
-            try:
-                self.authority_store.transition_worker_lease(
-                    claim.lease, state=WorkerLeaseState.REVOKED,
-                    generation_state=WorkerGenerationState.FAILED,
-                )
-            except AuthorizationRejected:
-                pass
-            raise OwnerWorkerStartupError("owner worker resource admission failed") from exc
+                _try_startup_cleanup("resource_scope", worker_resource_scope.cleanup)
+            _try_startup_cleanup("startup_heartbeat", _stop_startup_heartbeat)
+            authority_cleanup_complete = _fence_failed_start(claim.lease)
+            _retain_incomplete_startup_cleanup(
+                lease=claim.lease,
+                process=None,
+                process_exited=True,
+                broker_cleanup_complete=broker_cleanup_complete,
+                authority_cleanup_complete=authority_cleanup_complete,
+                runtime_cleanup_complete=True,
+            )
+            if isinstance(exc, Exception):
+                raise OwnerWorkerStartupError(
+                    "owner worker resource admission failed"
+                ) from exc
+            raise
         observe_latency_stage(
             stage="owner_worker.ready.resource_admission",
             started_at=resource_started_at,
@@ -714,32 +851,32 @@ class OwnerWorkerSupervisor:
                 outcome="error",
                 path=readiness_path,
             )
-            controlled_roots.close()
+            _try_startup_cleanup("controlled_roots", controlled_roots.close)
+            runtime_cleanup_complete = self._try_cleanup_generation_runtime(
+                owner_home,
+                generation.worker_generation,
+                socket_path=socket_path,
+            )
             for fd in (relay_fd, media_relay_fd, resource_broker_fd):
                 if fd is not None:
-                    try:
-                        os.close(fd)
-                    except OSError:
-                        pass
-            if self.deployment_inference_broker is not None:
-                self.deployment_inference_broker.revoke(claim.lease)
-            if self.deployment_media_broker is not None:
-                self.deployment_media_broker.revoke(claim.lease)
-            if self.deployment_resource_broker is not None:
-                self.deployment_resource_broker.revoke(claim.lease)
+                    _try_startup_cleanup("relay_descriptor", lambda fd=fd: os.close(fd))
+            broker_cleanup_complete = _revoke_startup_brokers(claim.lease)
             if worker_resource_scope is not None:
-                worker_resource_scope.cleanup()
-            _stop_startup_heartbeat()
-            try:
-                self.authority_store.transition_worker_lease(
-                    claim.lease, state=WorkerLeaseState.REVOKED,
-                    generation_state=WorkerGenerationState.FAILED,
-                )
-            except AuthorizationRejected:
-                pass
+                _try_startup_cleanup("resource_scope", worker_resource_scope.cleanup)
+            _try_startup_cleanup("startup_heartbeat", _stop_startup_heartbeat)
+            authority_cleanup_complete = _fence_failed_start(claim.lease)
+            _retain_incomplete_startup_cleanup(
+                lease=claim.lease,
+                process=None,
+                process_exited=True,
+                broker_cleanup_complete=broker_cleanup_complete,
+                authority_cleanup_complete=authority_cleanup_complete,
+                runtime_cleanup_complete=runtime_cleanup_complete,
+            )
             raise
         process = None
         cwd_fd = None
+        inherited_cwd_fd = None
         start_read = None
         start_write = None
         stdout_handle = None
@@ -851,17 +988,23 @@ class OwnerWorkerSupervisor:
                         ),
                     )
             finally:
-                os.close(inherited_cwd_fd)
-                if relay_fd is not None:
-                    os.close(relay_fd)
-                    relay_fd = None
-                if media_relay_fd is not None:
-                    os.close(media_relay_fd)
-                    media_relay_fd = None
-                if resource_broker_fd is not None:
-                    os.close(resource_broker_fd)
-                    resource_broker_fd = None
-        except Exception as exc:
+                if inherited_cwd_fd is not None:
+                    _try_startup_cleanup(
+                        "inherited_cwd_descriptor",
+                        lambda: os.close(inherited_cwd_fd),
+                    )
+                    inherited_cwd_fd = None
+                for operation, fd in (
+                    ("inference_relay_descriptor", relay_fd),
+                    ("media_relay_descriptor", media_relay_fd),
+                    ("resource_broker_descriptor", resource_broker_fd),
+                ):
+                    if fd is not None:
+                        _try_startup_cleanup(operation, lambda fd=fd: os.close(fd))
+                relay_fd = None
+                media_relay_fd = None
+                resource_broker_fd = None
+        except BaseException as exc:
             observe_latency_stage(
                 stage="owner_worker.ready.process_spawn",
                 started_at=process_started_at,
@@ -874,45 +1017,49 @@ class OwnerWorkerSupervisor:
                         os.close(fd)
                     except OSError:
                         pass
-            if process is not None and process.poll() is None:
-                process.terminate()
-                try:
-                    process.wait(timeout=2)
-                except subprocess.TimeoutExpired:
-                    process.kill()
-                    try:
-                        process.wait(timeout=2)
-                    except subprocess.TimeoutExpired:
-                        pass
-            if self.deployment_inference_broker is not None:
-                self.deployment_inference_broker.revoke(claim.lease)
-            if self.deployment_media_broker is not None:
-                self.deployment_media_broker.revoke(claim.lease)
-            if self.deployment_resource_broker is not None:
-                self.deployment_resource_broker.revoke(claim.lease)
-            if worker_resource_scope is not None:
-                worker_resource_scope.cleanup()
-                worker_resource_scope = None
-            _stop_startup_heartbeat()
-            self._try_cleanup_generation_runtime(owner_home, generation.worker_generation)
-            self._audit_generation(AuthorityAuditReason.GENERATION_START_FAILED, claim.lease)
-            try:
-                self.authority_store.transition_worker_lease(
-                    claim.lease,
-                    state=WorkerLeaseState.REVOKED,
-                    generation_state=WorkerGenerationState.FAILED,
+            process_exited = process is None
+            if process is not None:
+                process_exited = self._try_stop_and_close_process(
+                    process,
+                    worker_generation=generation.worker_generation,
                 )
-            except AuthorizationRejected:
-                pass
-            raise OwnerWorkerStartupError(f"owner worker process launch failed: {exc}") from exc
+            broker_cleanup_complete = _revoke_startup_brokers(claim.lease)
+            if worker_resource_scope is not None:
+                _try_startup_cleanup("resource_scope", worker_resource_scope.cleanup)
+                if getattr(worker_resource_scope, "released", False):
+                    worker_resource_scope = None
+            _try_startup_cleanup("startup_heartbeat", _stop_startup_heartbeat)
+            runtime_cleanup_complete = (
+                self._try_cleanup_generation_runtime(
+                    owner_home,
+                    generation.worker_generation,
+                )
+                if process_exited
+                else False
+            )
+            self._audit_generation(AuthorityAuditReason.GENERATION_START_FAILED, claim.lease)
+            authority_cleanup_complete = _fence_failed_start(claim.lease)
+            _retain_incomplete_startup_cleanup(
+                lease=claim.lease,
+                process=process,
+                process_exited=process_exited,
+                broker_cleanup_complete=broker_cleanup_complete,
+                authority_cleanup_complete=authority_cleanup_complete,
+                runtime_cleanup_complete=runtime_cleanup_complete,
+            )
+            if isinstance(exc, Exception):
+                raise OwnerWorkerStartupError(
+                    f"owner worker process launch failed: {exc}"
+                ) from exc
+            raise
         finally:
-            if cwd_fd is not None:
-                os.close(cwd_fd)
-            if stdout_handle is not None:
-                os.close(stdout_handle)
-            if stderr_handle is not None:
-                os.close(stderr_handle)
-            controlled_roots.close()
+            for descriptor in (cwd_fd, stdout_handle, stderr_handle):
+                if descriptor is not None:
+                    try:
+                        os.close(descriptor)
+                    except OSError:
+                        pass
+            _try_startup_cleanup("controlled_roots", controlled_roots.close)
         observe_latency_stage(
             stage="owner_worker.ready.process_spawn",
             started_at=process_started_at,
@@ -947,7 +1094,7 @@ class OwnerWorkerSupervisor:
                 generation_state=WorkerGenerationState.ACTIVE,
             )
             _stop_startup_heartbeat()
-        except Exception as exc:
+        except BaseException as exc:
             observe_latency_stage(
                 stage=(
                     "owner_worker.ready.lease_activate"
@@ -958,46 +1105,40 @@ class OwnerWorkerSupervisor:
                 outcome="error",
                 path=readiness_path,
             )
-            if self.deployment_inference_broker is not None:
-                self.deployment_inference_broker.revoke(claim.lease)
-            if self.deployment_media_broker is not None:
-                self.deployment_media_broker.revoke(claim.lease)
-            if self.deployment_resource_broker is not None:
-                self.deployment_resource_broker.revoke(claim.lease)
+            broker_cleanup_complete = _revoke_startup_brokers(claim.lease)
             if worker_resource_scope is not None:
-                worker_resource_scope.cleanup()
-                worker_resource_scope = None
-            _stop_startup_heartbeat()
+                _try_startup_cleanup("resource_scope", worker_resource_scope.cleanup)
+                if getattr(worker_resource_scope, "released", False):
+                    worker_resource_scope = None
+            _try_startup_cleanup("startup_heartbeat", _stop_startup_heartbeat)
             self._audit_generation(AuthorityAuditReason.GENERATION_START_FAILED, claim.lease)
-            try:
-                self.authority_store.transition_worker_lease(
-                    claim.lease,
-                    state=WorkerLeaseState.REVOKED,
-                    generation_state=WorkerGenerationState.FAILED,
-                )
-            except AuthorizationRejected:
-                pass
-            if process.poll() is None:
-                process.terminate()
-                try:
-                    process.wait(timeout=2)
-                except subprocess.TimeoutExpired:
-                    process.kill()
-                    try:
-                        process.wait(timeout=2)
-                    except subprocess.TimeoutExpired:
-                        pass
-            else:
-                process.wait()
-            if process.poll() is not None:
+            authority_cleanup_complete = _fence_failed_start(claim.lease)
+            process_exited = self._try_stop_and_close_process(
+                process,
+                worker_generation=generation.worker_generation,
+            )
+            runtime_cleanup_complete = (
                 self._try_cleanup_generation_runtime(
                     owner_home,
                     generation.worker_generation,
                     socket_path=socket_path,
                 )
+                if process_exited
+                else False
+            )
+            _retain_incomplete_startup_cleanup(
+                lease=claim.lease,
+                process=process,
+                process_exited=process_exited,
+                broker_cleanup_complete=broker_cleanup_complete,
+                authority_cleanup_complete=authority_cleanup_complete,
+                runtime_cleanup_complete=runtime_cleanup_complete,
+            )
             if isinstance(exc, (OwnerWorkerUnavailableError, TimeoutError)):
                 raise
-            raise OwnerWorkerStartupError("owner worker startup failed") from exc
+            if isinstance(exc, Exception):
+                raise OwnerWorkerStartupError("owner worker startup failed") from exc
+            raise
 
         handle = OwnerWorkerHandle(
             owner_key=owner_key,
@@ -1019,50 +1160,54 @@ class OwnerWorkerSupervisor:
                 self.deployment_media_broker.activate(active_lease)
             if self.deployment_resource_broker is not None:
                 self.deployment_resource_broker.activate(active_lease)
-        except Exception as exc:
+        except BaseException as exc:
             observe_latency_stage(
                 stage="owner_worker.ready.lease_activate",
                 started_at=activation_started_at,
                 outcome="error",
                 path=readiness_path,
             )
-            if self.deployment_inference_broker is not None:
-                self.deployment_inference_broker.revoke(active_lease)
-            if self.deployment_media_broker is not None:
-                self.deployment_media_broker.revoke(active_lease)
-            if self.deployment_resource_broker is not None:
-                self.deployment_resource_broker.revoke(active_lease)
+            broker_cleanup_complete = _revoke_startup_brokers(active_lease)
             self._audit_generation(AuthorityAuditReason.GENERATION_START_FAILED, active_lease)
-            try:
-                self.authority_store.transition_worker_lease(
-                    active_lease,
-                    state=WorkerLeaseState.REVOKED,
-                    generation_state=WorkerGenerationState.FAILED,
-                )
-            except AuthorizationRejected:
-                pass
-            if process.poll() is None:
-                process.terminate()
-                try:
-                    process.wait(timeout=2)
-                except subprocess.TimeoutExpired:
-                    process.kill()
-                    try:
-                        process.wait(timeout=2)
-                    except subprocess.TimeoutExpired:
-                        pass
-            else:
-                process.wait()
-            if handle.resource_scope is not None:
-                handle.resource_scope.cleanup()
-                handle.resource_scope = None
-            self._try_cleanup_generation_runtime(
-                owner_home,
-                generation.worker_generation,
-                socket_path=socket_path,
+            authority_cleanup_complete = _fence_failed_start(active_lease)
+            process_exited = self._try_stop_and_close_process(
+                process,
+                worker_generation=generation.worker_generation,
             )
-            raise OwnerWorkerStartupError("owner worker relay activation failed") from exc
-        with self._lock:
+            if handle.resource_scope is not None:
+                _try_startup_cleanup("resource_scope", handle.resource_scope.cleanup)
+                if getattr(handle.resource_scope, "released", False):
+                    handle.resource_scope = None
+            worker_resource_scope = handle.resource_scope
+            runtime_cleanup_complete = (
+                self._try_cleanup_generation_runtime(
+                    owner_home,
+                    generation.worker_generation,
+                    socket_path=socket_path,
+                )
+                if process_exited
+                else False
+            )
+            _retain_incomplete_startup_cleanup(
+                lease=active_lease,
+                process=process,
+                process_exited=process_exited,
+                broker_cleanup_complete=broker_cleanup_complete,
+                authority_cleanup_complete=authority_cleanup_complete,
+                runtime_cleanup_complete=runtime_cleanup_complete,
+            )
+            if isinstance(exc, Exception):
+                raise OwnerWorkerStartupError(
+                    "owner worker relay activation failed"
+                ) from exc
+            raise
+        with self._start_finished:
+            if self._shutting_down:
+                self._terminating_handles[owner_key] = handle
+                self._start_finished.notify_all()
+                raise OwnerWorkerUnavailableError(
+                    "owner worker supervisor is shutting down"
+                )
             self._handles[owner_key] = handle
         self._audit_generation(AuthorityAuditReason.GENERATION_ACTIVE, active_lease)
         observe_latency_stage(
@@ -1138,17 +1283,52 @@ class OwnerWorkerSupervisor:
 
     def shutdown(self) -> None:
         """Drain every locally owned generation before the Dashboard exits."""
-        with self._lock:
+        with self._start_finished:
+            self._shutting_down = True
+            self._start_finished.notify_all()
+            while self._shutdown_in_progress:
+                self._start_finished.wait()
+            if self._shutdown_complete:
+                return
+            self._shutdown_in_progress = True
+        completed = False
+        try:
+            self._shutdown_once()
+            completed = True
+        finally:
+            with self._start_finished:
+                self._shutdown_complete = completed
+                self._shutdown_in_progress = False
+                self._start_finished.notify_all()
+
+    def _shutdown_once(self) -> None:
+        with self._start_finished:
+            while self._in_flight_starts or self._terminating_in_progress:
+                self._start_finished.wait()
             handles = tuple(self._handles.items())
             reserved = [
                 (owner_key, handle)
                 for owner_key, handle in handles
                 if self._reserve_termination_locked(owner_key, handle)
             ]
+            reserved.extend(
+                (owner_key, handle)
+                for owner_key, handle in self._terminating_handles.items()
+                if all(existing is not handle for _key, existing in reserved)
+            )
         first_error = None
         draining: list[tuple[str, OwnerWorkerHandle, OwnerWorkerAuthorityLease, OwnerWorkerClient]] = []
         for owner_key, handle in reserved:
-            if handle.process.poll() is not None:
+            try:
+                process_exited = (
+                    handle.process is None
+                    or handle.process_handle_closed
+                    or handle.process.poll() is not None
+                )
+            except Exception as exc:
+                first_error = first_error or exc
+                process_exited = False
+            if process_exited:
                 continue
             lease = self._lease_for_handle(handle)
             client = self.client_cls(
@@ -1182,18 +1362,52 @@ class OwnerWorkerSupervisor:
                 first_error = first_error or exc
         for owner_key, handle in reserved:
             try:
-                self._teardown_terminated_handle(
+                self._drain_and_teardown_reserved_handle(
                     owner_key,
                     handle,
                     planned_restart=True,
+                    skip_control_drain=True,
                 )
-            except Exception as exc:
+            except BaseException as exc:
                 first_error = first_error or exc
         if self.launcher is not None:
             try:
                 self.launcher.close()
             except Exception as exc:
                 first_error = first_error or exc
+            for owner_key, handle in reserved:
+                with self._lock:
+                    retained = self._terminating_handles.get(owner_key) is handle
+                if not retained:
+                    continue
+                confirm_exit = getattr(
+                    handle.process,
+                    "confirm_exit_after_launcher_close",
+                    None,
+                )
+                try:
+                    launcher_reaped = (
+                        True
+                        if handle.process is None or handle.process_handle_closed
+                        else bool(confirm_exit())
+                        if callable(confirm_exit)
+                        else False
+                    )
+                except Exception as exc:
+                    first_error = first_error or exc
+                    launcher_reaped = False
+                if launcher_reaped:
+                    try:
+                        self._finalize_launcher_reaped_handle(owner_key, handle)
+                    except Exception as exc:
+                        first_error = first_error or exc
+        with self._lock:
+            retained_after_shutdown = tuple(self._terminating_handles)
+        if retained_after_shutdown:
+            first_error = first_error or RuntimeError(
+                "owner worker shutdown could not discharge process ownership: "
+                + ", ".join(retained_after_shutdown)
+            )
         for broker in (
             self.deployment_inference_broker,
             self.deployment_media_broker,
@@ -1205,6 +1419,72 @@ class OwnerWorkerSupervisor:
                 broker.close()
             except Exception as exc:
                 first_error = first_error or exc
+        if first_error is not None:
+            raise first_error
+
+    def _finalize_launcher_reaped_handle(
+        self,
+        owner_key: str,
+        handle: OwnerWorkerHandle,
+    ) -> None:
+        """Discharge retained ownership after launcher-wide reaping."""
+        first_error: Exception | None = None
+        if not handle.process_handle_closed:
+            try:
+                self._close_process_handle(handle.process)
+            except Exception as exc:
+                first_error = exc
+            finally:
+                # A failed close may already have released the descriptor. Retrying
+                # can close an unrelated descriptor after the number has been reused.
+                handle.process_handle_closed = True
+        retired_lease = self._lease_for_handle(handle)
+        broker_cleanup_pending = False
+        for broker in (
+            self.deployment_inference_broker,
+            self.deployment_media_broker,
+            self.deployment_resource_broker,
+        ):
+            if broker is None:
+                continue
+            try:
+                broker.revoke(retired_lease)
+            except Exception as exc:
+                first_error = first_error or exc
+                broker_cleanup_pending = True
+        handle.broker_cleanup_pending = broker_cleanup_pending
+        if handle.resource_scope is not None:
+            scope = handle.resource_scope
+            try:
+                scope.cleanup()
+            except Exception as exc:
+                first_error = first_error or exc
+            if getattr(scope, "released", False):
+                handle.resource_scope = None
+        handle.runtime_cleanup_pending = not self._try_cleanup_generation_runtime(
+            handle.owner_home,
+            handle.worker_generation,
+            socket_path=handle.socket_path,
+        )
+        authority_discharged = False
+        try:
+            authority_discharged = self._finalize_handle_authority(
+                handle,
+                process_exited=True,
+            )
+        except Exception as exc:
+            first_error = first_error or exc
+        with self._start_finished:
+            if (
+                handle.process_handle_closed
+                and handle.resource_scope is None
+                and not handle.broker_cleanup_pending
+                and not handle.runtime_cleanup_pending
+                and authority_discharged
+                and self._terminating_handles.get(owner_key) is handle
+            ):
+                self._terminating_handles.pop(owner_key, None)
+            self._start_finished.notify_all()
         if first_error is not None:
             raise first_error
 
@@ -1293,6 +1573,8 @@ class OwnerWorkerSupervisor:
         observed_at = time.time() if now is None else float(now)
         reserved: list[tuple[str, OwnerWorkerHandle]] = []
         with self._lock:
+            if self._shutting_down:
+                return set()
             for owner_key, handle in tuple(self._handles.items()):
                 should_retire = (
                     handle.process.poll() is not None
@@ -1306,6 +1588,12 @@ class OwnerWorkerSupervisor:
                     should_retire
                     and handle.active_uses <= 0
                     and self._reserve_termination_locked(owner_key, handle)
+                ):
+                    reserved.append((owner_key, handle))
+            for owner_key, handle in self._terminating_handles.items():
+                if (
+                    id(handle) not in self._terminating_in_progress
+                    and all(existing is not handle for _key, existing in reserved)
                 ):
                     reserved.append((owner_key, handle))
         for owner_key, handle in reserved:
@@ -1384,20 +1672,101 @@ class OwnerWorkerSupervisor:
         except AuthorizationRejected:
             return None
 
-    def _finalize_drained_handle(
+    def _finalize_handle_authority(
         self,
-        lease: OwnerWorkerAuthorityLease,
+        handle: OwnerWorkerHandle,
         *,
-        generation_state: WorkerGenerationState = WorkerGenerationState.TERMINATED,
-    ) -> None:
-        try:
-            self.authority_store.transition_worker_lease(
+        process_exited: bool,
+    ) -> bool:
+        """Finalize the exact durable generation without crossing ownership."""
+        lease = self.authority_store.read_owner_worker_lease(handle.owner_key)
+        generation = self.authority_store.read_worker_generation(
+            handle.owner_key,
+            handle.worker_generation,
+        )
+        if (
+            lease is None
+            or lease.worker_generation != handle.worker_generation
+            or lease.worker_id != handle.worker_id
+            or lease.lease_version != handle.lease_version
+            or lease.recovery_generation != handle.recovery_generation
+            or generation.worker_id != handle.worker_id
+            or generation.recovery_generation != handle.recovery_generation
+        ):
+            raise AuthorizationRejected("worker cleanup ownership changed")
+        if lease.state is WorkerLeaseState.STARTING:
+            lease = self.authority_store.transition_worker_lease(
                 lease,
                 state=WorkerLeaseState.REVOKED,
-                generation_state=generation_state,
+                generation_state=(
+                    WorkerGenerationState.FAILED
+                    if process_exited
+                    else WorkerGenerationState.REVOKED
+                ),
             )
-        except AuthorizationRejected:
-            pass
+            generation = self.authority_store.read_worker_generation(
+                handle.owner_key,
+                handle.worker_generation,
+            )
+        elif lease.state is WorkerLeaseState.ACTIVE:
+            lease = self.authority_store.transition_worker_lease(
+                lease,
+                state=WorkerLeaseState.DRAINING,
+                generation_state=WorkerGenerationState.DRAINING,
+            )
+            self._audit_generation(
+                AuthorityAuditReason.GENERATION_DRAINING,
+                lease,
+            )
+        if lease.state is WorkerLeaseState.DRAINING:
+            lease = self.authority_store.transition_worker_lease(
+                lease,
+                state=WorkerLeaseState.REVOKED,
+                generation_state=(
+                    WorkerGenerationState.TERMINATED
+                    if process_exited
+                    else WorkerGenerationState.REVOKED
+                ),
+            )
+            generation = self.authority_store.read_worker_generation(
+                handle.owner_key,
+                handle.worker_generation,
+            )
+        elif (
+            process_exited
+            and lease.state is WorkerLeaseState.REVOKED
+            and generation.state is WorkerGenerationState.REVOKED
+        ):
+            generation = self.authority_store.transition_worker_generation(
+                handle.owner_key,
+                handle.worker_generation,
+                worker_id=handle.worker_id,
+                state=WorkerGenerationState.TERMINATED,
+                expected_recovery_generation=handle.recovery_generation,
+            )
+        expected_generation_states = (
+            {WorkerGenerationState.TERMINATED, WorkerGenerationState.FAILED}
+            if process_exited
+            else {
+                WorkerGenerationState.REVOKED,
+                WorkerGenerationState.TERMINATED,
+                WorkerGenerationState.FAILED,
+            }
+        )
+        if (
+            lease.state is not WorkerLeaseState.REVOKED
+            or generation.state not in expected_generation_states
+        ):
+            raise RuntimeError("owner worker authority cleanup is incomplete")
+        self._audit_generation(
+            (
+                AuthorityAuditReason.GENERATION_TERMINATED
+                if process_exited
+                else AuthorityAuditReason.GENERATION_REVOKED
+            ),
+            lease,
+        )
+        return True
 
     def _cleanup_generation_runtime(
         self,
@@ -1430,7 +1799,7 @@ class OwnerWorkerSupervisor:
         worker_generation: int,
         *,
         socket_path: Path | None = None,
-    ) -> None:
+    ) -> bool:
         try:
             self._cleanup_generation_runtime(
                 owner_home,
@@ -1443,6 +1812,135 @@ class OwnerWorkerSupervisor:
                 extra={"worker_generation": worker_generation},
                 exc_info=True,
             )
+            return False
+        return True
+
+    @staticmethod
+    def _close_process_handle(process: Any | None) -> None:
+        close = getattr(process, "close", None)
+        if callable(close):
+            close()
+
+    @staticmethod
+    def _stop_process(process: Any) -> tuple[bool, Exception | None]:
+        """Stop and reap one child while retaining the first observation error."""
+        first_error: Exception | None = None
+        process_exited = False
+        try:
+            process_exited = process.poll() is not None
+        except Exception as exc:
+            first_error = exc
+        if process_exited:
+            try:
+                process.wait()
+            except Exception as exc:
+                first_error = first_error or exc
+        else:
+            try:
+                process.terminate()
+            except Exception as exc:
+                first_error = first_error or exc
+            try:
+                process.wait(timeout=2)
+                process_exited = True
+            except subprocess.TimeoutExpired:
+                try:
+                    process.kill()
+                except Exception as exc:
+                    first_error = first_error or exc
+                try:
+                    process.wait(timeout=2)
+                    process_exited = True
+                except subprocess.TimeoutExpired:
+                    pass
+                except Exception as exc:
+                    first_error = first_error or exc
+            except Exception as exc:
+                first_error = first_error or exc
+        if not process_exited:
+            try:
+                process_exited = process.poll() is not None
+            except Exception as exc:
+                first_error = first_error or exc
+        return process_exited, first_error
+
+    def _try_stop_and_close_process(self, process: Any, *, worker_generation: int) -> bool:
+        """Best-effort failed-start cleanup that preserves the startup error."""
+        try:
+            process_exited, cleanup_error = self._stop_process(process)
+        except BaseException:
+            _log.warning(
+                "Owner worker process cleanup was interrupted during startup",
+                extra={"worker_generation": worker_generation},
+                exc_info=True,
+            )
+            try:
+                process_exited = process.poll() is not None
+            except BaseException:
+                process_exited = False
+            cleanup_error = None
+        if cleanup_error is not None:
+            _log.warning(
+                "Owner worker process cleanup failed during startup",
+                extra={"worker_generation": worker_generation},
+                exc_info=(
+                    type(cleanup_error),
+                    cleanup_error,
+                    cleanup_error.__traceback__,
+                ),
+            )
+        if process_exited:
+            try:
+                self._close_process_handle(process)
+            except BaseException:
+                _log.warning(
+                    "Owner worker process handle cleanup failed during startup",
+                    extra={"worker_generation": worker_generation},
+                    exc_info=True,
+                )
+        return process_exited
+
+    def _retain_startup_cleanup(
+        self,
+        *,
+        owner_key: str,
+        owner_home: Path,
+        socket_path: Path,
+        lease: OwnerWorkerAuthorityLease,
+        process: Any | None,
+        process_exited: bool,
+        resource_scope: Any | None,
+        broker_cleanup_pending: bool,
+        runtime_cleanup_pending: bool,
+    ) -> None:
+        """Keep exact generation ownership until every failed-start cleanup completes."""
+        handle = OwnerWorkerHandle(
+            owner_key=owner_key,
+            owner_home=owner_home,
+            worker_generation=lease.worker_generation,
+            worker_id=lease.worker_id,
+            lease_version=lease.lease_version,
+            recovery_generation=lease.recovery_generation,
+            socket_path=socket_path,
+            process=process,
+            pid=process.pid if process is not None else None,
+            accepting=False,
+            resource_scope=(
+                None
+                if resource_scope is not None
+                and getattr(resource_scope, "released", False)
+                else resource_scope
+            ),
+            process_handle_closed=process is None or process_exited,
+            broker_cleanup_pending=broker_cleanup_pending,
+            runtime_cleanup_pending=runtime_cleanup_pending,
+        )
+        with self._start_finished:
+            current = self._terminating_handles.get(owner_key)
+            if current is not None and current.process is not process:
+                raise RuntimeError("owner worker cleanup ownership collision")
+            self._terminating_handles[owner_key] = handle
+            self._start_finished.notify_all()
 
     def _reserve_termination_locked(self, owner_key: str, handle: OwnerWorkerHandle) -> bool:
         """Detach an exact handle before running any external teardown work.
@@ -1486,8 +1984,38 @@ class OwnerWorkerSupervisor:
         planned_restart: bool = False,
         readiness_path: str | None = None,
         control_timeout: float | None = None,
+        skip_control_drain: bool = False,
     ) -> None:
         """Drain one reserved live Worker before ordered generation teardown."""
+        handle_identity = id(handle)
+        with self._lock:
+            if handle_identity in self._terminating_in_progress:
+                return
+            self._terminating_in_progress.add(handle_identity)
+        try:
+            self._drain_and_teardown_reserved_handle_once(
+                owner_key,
+                handle,
+                planned_restart=planned_restart,
+                readiness_path=readiness_path,
+                control_timeout=control_timeout,
+                skip_control_drain=skip_control_drain,
+            )
+        finally:
+            with self._start_finished:
+                self._terminating_in_progress.discard(handle_identity)
+                self._start_finished.notify_all()
+
+    def _drain_and_teardown_reserved_handle_once(
+        self,
+        owner_key: str,
+        handle: OwnerWorkerHandle,
+        *,
+        planned_restart: bool,
+        readiness_path: str | None,
+        control_timeout: float | None,
+        skip_control_drain: bool,
+    ) -> None:
         drain_stage = (
             observed_latency_stage(
                 stage="owner_worker.ready.replacement_drain",
@@ -1498,7 +2026,12 @@ class OwnerWorkerSupervisor:
         )
         try:
             with drain_stage:
-                if handle.process.poll() is None:
+                if (
+                    not skip_control_drain
+                    and handle.process is not None
+                    and not handle.process_handle_closed
+                    and handle.process.poll() is None
+                ):
                     lease = self._lease_for_handle(handle)
                     client = self.client_cls(
                         handle.socket_path,
@@ -1549,10 +2082,8 @@ class OwnerWorkerSupervisor:
         an owner-use lease back through ``release_use()`` and must acquire it.
         """
         first_error = None
-        draining = self._drain_handle(handle)
-        if draining is not None:
-            self._audit_generation(AuthorityAuditReason.GENERATION_DRAINING, draining)
-        retired_lease = draining or self._lease_for_handle(handle)
+        process_exited = False
+        authority_discharged = False
 
         def _cleanup(callback: Callable[[], None]) -> None:
             nonlocal first_error
@@ -1562,16 +2093,35 @@ class OwnerWorkerSupervisor:
                 first_error = first_error or exc
 
         try:
+            retired_lease = self._lease_for_handle(handle)
+            try:
+                draining = self._drain_handle(handle)
+            except Exception as exc:
+                first_error = first_error or exc
+            else:
+                if draining is not None:
+                    retired_lease = draining
+                    self._audit_generation(
+                        AuthorityAuditReason.GENERATION_DRAINING,
+                        draining,
+                    )
             # Fence exact capability/bootstrap admission before closing bridge or
             # touching the process. Cleanup continues after individual failures so
             # no broker endpoint, process, or cgroup reservation is leaked.
+            broker_cleanup_pending = False
             for broker in (
                 self.deployment_inference_broker,
                 self.deployment_media_broker,
                 self.deployment_resource_broker,
             ):
-                if broker is not None:
-                    _cleanup(lambda broker=broker: broker.revoke(retired_lease))
+                if broker is None:
+                    continue
+                try:
+                    broker.revoke(retired_lease)
+                except Exception as exc:
+                    first_error = first_error or exc
+                    broker_cleanup_pending = True
+            handle.broker_cleanup_pending = broker_cleanup_pending
             if self.generation_bridge_revoker is not None:
                 _cleanup(
                     lambda: self.generation_bridge_revoker(
@@ -1580,53 +2130,52 @@ class OwnerWorkerSupervisor:
                     )
                 )
 
-            process_exited = handle.process.poll() is not None
-            if process_exited:
-                _cleanup(handle.process.wait)
+            if handle.process is None or handle.process_handle_closed:
+                process_exited = True
             else:
+                process_exited, process_error = self._stop_process(handle.process)
+                first_error = first_error or process_error
+            if process_exited and not handle.process_handle_closed:
                 try:
-                    handle.process.terminate()
-                    handle.process.wait(timeout=2)
-                except subprocess.TimeoutExpired:
-                    handle.process.kill()
-                    try:
-                        handle.process.wait(timeout=2)
-                    except subprocess.TimeoutExpired:
-                        pass
-                except Exception as exc:
+                    self._close_process_handle(handle.process)
+                except BaseException as exc:
                     first_error = first_error or exc
-                process_exited = handle.process.poll() is not None
+                finally:
+                    # Once exit is confirmed there is no safe signaling operation
+                    # left to retain. In particular, retrying close after EINTR can
+                    # target a descriptor number that the OS has already reused.
+                    handle.process_handle_closed = True
             if handle.resource_scope is not None:
                 scope = handle.resource_scope
                 _cleanup(scope.cleanup)
                 if getattr(scope, "released", False):
                     handle.resource_scope = None
             if process_exited:
-                self._try_cleanup_generation_runtime(
+                handle.runtime_cleanup_pending = not self._try_cleanup_generation_runtime(
                     handle.owner_home,
                     handle.worker_generation,
                     socket_path=handle.socket_path,
                 )
-            if draining is not None:
-                terminal_state = (
-                    WorkerGenerationState.TERMINATED
-                    if process_exited
-                    else WorkerGenerationState.REVOKED
+            try:
+                authority_discharged = self._finalize_handle_authority(
+                    handle,
+                    process_exited=process_exited,
                 )
-                self._finalize_drained_handle(draining, generation_state=terminal_state)
-                self._audit_generation(
-                    (
-                        AuthorityAuditReason.GENERATION_TERMINATED
-                        if process_exited
-                        else AuthorityAuditReason.GENERATION_REVOKED
-                    ),
-                    draining,
-                )
+            except Exception as exc:
+                first_error = first_error or exc
             if first_error is not None:
                 raise first_error
         finally:
             with self._start_finished:
-                if self._terminating_handles.get(owner_key) is handle:
+                if (
+                    process_exited
+                    and handle.process_handle_closed
+                    and handle.resource_scope is None
+                    and not handle.broker_cleanup_pending
+                    and not handle.runtime_cleanup_pending
+                    and authority_discharged
+                    and self._terminating_handles.get(owner_key) is handle
+                ):
                     self._terminating_handles.pop(owner_key, None)
                 self._start_finished.notify_all()
 

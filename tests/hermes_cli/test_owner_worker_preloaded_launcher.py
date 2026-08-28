@@ -5,6 +5,8 @@ import errno
 import os
 import signal
 import socket
+import subprocess
+import threading
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -231,6 +233,619 @@ def test_launcher_process_handle_signals_only_by_pidfd(monkeypatch):
 
     assert signaled == [(41, signal.SIGTERM), (41, signal.SIGKILL)]
     assert closed == [41]
+
+
+def test_launcher_process_handle_close_is_atomic_under_concurrency(monkeypatch):
+    import hermes_cli.owner_worker.preloaded_launcher as launcher_module
+
+    closed = []
+    close_entered = threading.Event()
+    release_close = threading.Event()
+    monkeypatch.setattr(launcher_module, "_pidfd_open", lambda _pid: 41)
+
+    def close(fd):
+        closed.append(fd)
+        close_entered.set()
+        assert release_close.wait(timeout=2)
+
+    monkeypatch.setattr(launcher_module.os, "close", close)
+    handle = LauncherProcessHandle(1234, SimpleNamespace())
+    threads = [threading.Thread(target=handle.close) for _ in range(2)]
+
+    for thread in threads:
+        thread.start()
+    assert close_entered.wait(timeout=2)
+    release_close.set()
+    for thread in threads:
+        thread.join(timeout=2)
+        assert not thread.is_alive()
+
+    assert closed == [41]
+    assert handle._pidfd == -1
+
+
+def test_launcher_spawn_pidfd_open_baseexception_closes_and_revokes_ownership(
+    monkeypatch,
+):
+    import hermes_cli.owner_worker.preloaded_launcher as launcher_module
+
+    class _PidfdOpenFailure(BaseException):
+        pass
+
+    class _Channel:
+        def __init__(self):
+            self.close_calls = 0
+
+        def close(self):
+            self.close_calls += 1
+
+    class _Process:
+        def __init__(self):
+            self.returncode = None
+            self.wait_calls = []
+
+        def poll(self):
+            return self.returncode
+
+        def wait(self, timeout=None):
+            self.wait_calls.append(timeout)
+            self.returncode = 0
+            return self.returncode
+
+        def terminate(self):
+            raise AssertionError("graceful launcher shutdown should not terminate")
+
+        def kill(self):
+            raise AssertionError("graceful launcher shutdown should not kill")
+
+    channel = _Channel()
+    process = _Process()
+    launcher = object.__new__(OwnerWorkerLauncher)
+    launcher._channel = channel
+    launcher._process = process
+    launcher._lock = threading.Lock()
+    launcher._closed = False
+    monkeypatch.setattr(
+        launcher_module.uuid,
+        "uuid4",
+        lambda: SimpleNamespace(hex="fixed-nonce"),
+    )
+    sent_operations = []
+
+    def send_packet(_channel, payload, *_args):
+        sent_operations.append(payload["op"])
+
+    responses = iter(
+        (
+            {
+                "version": _PROTOCOL_VERSION,
+                "op": "launched",
+                "nonce": "fixed-nonce",
+                "pid": 1234,
+            },
+            {
+                "version": _PROTOCOL_VERSION,
+                "op": "shutdown",
+                "nonce": "fixed-nonce",
+            },
+        )
+    )
+    monkeypatch.setattr(launcher_module, "_send_packet", send_packet)
+    monkeypatch.setattr(
+        launcher_module,
+        "_recv_packet",
+        lambda _channel: (next(responses), []),
+    )
+    failure = _PidfdOpenFailure("pidfd open failed")
+    monkeypatch.setattr(
+        launcher_module,
+        "_pidfd_open",
+        lambda _pid: (_ for _ in ()).throw(failure),
+    )
+    close_events = []
+    original_close = launcher.close
+
+    def close():
+        close_events.append("entered")
+        original_close()
+        close_events.append("returned")
+
+    monkeypatch.setattr(launcher, "close", close)
+
+    with pytest.raises(_PidfdOpenFailure) as captured:
+        launcher.spawn(
+            ["--owner-key", "ok1_test"],
+            env={},
+            cwd_fd=1,
+            stdout_fd=1,
+            stderr_fd=2,
+            start_fd=1,
+            relay_fds={},
+        )
+
+    assert captured.value is failure
+    assert close_events == ["entered", "returned"]
+    assert sent_operations == ["launch", "shutdown"]
+    assert process.wait_calls == [launcher_module._LAUNCHER_SHUTDOWN_TIMEOUT]
+    assert channel.close_calls == 1
+    assert launcher._closed is True
+    assert launcher._channel is None
+    assert launcher._process is None
+    with pytest.raises(OwnerWorkerLauncherError, match="unavailable"):
+        launcher.spawn(
+            ["--owner-key", "ok1_test"],
+            env={},
+            cwd_fd=1,
+            stdout_fd=1,
+            stderr_fd=2,
+            start_fd=1,
+            relay_fds={},
+        )
+
+
+@pytest.mark.parametrize(
+    "status_error",
+    [
+        socket.timeout("status timed out"),
+        EOFError("status channel closed"),
+        OSError(errno.EIO, "status failed"),
+        OwnerWorkerLauncherError("status failed"),
+    ],
+    ids=["socket-timeout", "eof", "os-error", "launcher-error"],
+)
+def test_launcher_process_handle_readable_pidfd_falls_back_on_status_error(
+    monkeypatch,
+    status_error,
+):
+    import hermes_cli.owner_worker.preloaded_launcher as launcher_module
+
+    class _Selector:
+        def __init__(self):
+            self.registered = []
+            self.select_calls = []
+            self.closed = False
+
+        def register(self, fd, event):
+            self.registered.append((fd, event))
+
+        def select(self, timeout=None):
+            self.select_calls.append(timeout)
+            return [(41, launcher_module.selectors.EVENT_READ)]
+
+        def close(self):
+            self.closed = True
+
+    selector = _Selector()
+    status_calls = []
+
+    def child_returncode(pid):
+        status_calls.append(pid)
+        raise status_error
+
+    launcher = SimpleNamespace(_child_returncode=child_returncode)
+    monkeypatch.setattr(launcher_module, "_pidfd_open", lambda _pid: 41)
+    monkeypatch.setattr(
+        launcher_module.selectors,
+        "DefaultSelector",
+        lambda: selector,
+    )
+    handle = LauncherProcessHandle(1234, launcher)
+
+    assert handle.poll() == 1
+    assert handle.returncode == 1
+    assert status_calls == [1234]
+    assert selector.registered == [(41, launcher_module.selectors.EVENT_READ)]
+    assert selector.select_calls == [0]
+    assert selector.closed is True
+
+
+def test_launcher_spawn_ambiguous_rpc_failure_poisons_channel(monkeypatch):
+    import hermes_cli.owner_worker.preloaded_launcher as launcher_module
+
+    class _Channel:
+        closed = False
+
+        def close(self):
+            self.closed = True
+
+    class _Process:
+        def __init__(self):
+            self.returncode = None
+            self.wait_calls = []
+
+        def poll(self):
+            return self.returncode
+
+        def wait(self, timeout=None):
+            self.wait_calls.append(timeout)
+            self.returncode = 0
+            return self.returncode
+
+        def terminate(self):
+            raise AssertionError("EOF cleanup should reap the launcher")
+
+        def kill(self):
+            raise AssertionError("EOF cleanup should reap the launcher")
+
+    process = _Process()
+    launcher = object.__new__(OwnerWorkerLauncher)
+    launcher._lock = threading.Lock()
+    launcher._closed = False
+    launcher._process = process
+    launcher._channel = _Channel()
+    monkeypatch.setattr(launcher_module, "_send_packet", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        launcher_module,
+        "_recv_packet",
+        lambda *_args: (_ for _ in ()).throw(socket.timeout("ambiguous response")),
+    )
+
+    with pytest.raises(socket.timeout, match="ambiguous response"):
+        launcher.spawn(
+            ["--owner-key", "ok1_test"],
+            env={},
+            cwd_fd=1,
+            stdout_fd=1,
+            stderr_fd=2,
+            start_fd=1,
+            relay_fds={},
+        )
+
+    assert launcher._closed is True
+    assert launcher._channel is None
+    assert launcher._process is None
+    assert process.wait_calls == [launcher_module._LAUNCHER_SHUTDOWN_TIMEOUT]
+    with pytest.raises(OwnerWorkerLauncherError, match="unavailable"):
+        launcher.spawn(
+            ["--owner-key", "ok1_test"],
+            env={},
+            cwd_fd=1,
+            stdout_fd=1,
+            stderr_fd=2,
+            start_fd=1,
+            relay_fds={},
+        )
+
+
+def test_launcher_status_invalid_response_poisons_channel(monkeypatch):
+    import hermes_cli.owner_worker.preloaded_launcher as launcher_module
+
+    class _Channel:
+        closed = False
+
+        def close(self):
+            self.closed = True
+
+    class _Process:
+        def __init__(self):
+            self.returncode = None
+            self.wait_calls = []
+
+        def poll(self):
+            return self.returncode
+
+        def wait(self, timeout=None):
+            self.wait_calls.append(timeout)
+            self.returncode = 0
+            return self.returncode
+
+        def terminate(self):
+            raise AssertionError("EOF cleanup should reap the launcher")
+
+        def kill(self):
+            raise AssertionError("EOF cleanup should reap the launcher")
+
+    process = _Process()
+    launcher = object.__new__(OwnerWorkerLauncher)
+    launcher._lock = threading.Lock()
+    launcher._closed = False
+    launcher._process = process
+    launcher._channel = _Channel()
+    monkeypatch.setattr(launcher_module, "_send_packet", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        launcher_module,
+        "_recv_packet",
+        lambda *_args: (
+            {
+                "version": _PROTOCOL_VERSION,
+                "op": "status",
+                "nonce": "stale-response",
+                "pid": 1234,
+                "known": True,
+                "returncode": 0,
+            },
+            [],
+        ),
+    )
+
+    with pytest.raises(OwnerWorkerLauncherError, match="status is invalid"):
+        launcher._child_returncode(1234)
+
+    assert launcher._closed is True
+    assert launcher._channel is None
+    assert launcher._process is None
+    assert process.wait_calls == [launcher_module._LAUNCHER_SHUTDOWN_TIMEOUT]
+
+
+def test_launcher_close_waits_for_graceful_child_cleanup_before_escalating(monkeypatch):
+    import hermes_cli.owner_worker.preloaded_launcher as launcher_module
+
+    class _Channel:
+        def __init__(self):
+            self.closed = False
+
+        def close(self):
+            self.closed = True
+
+    class _Process:
+        def __init__(self):
+            self.returncode = None
+            self.wait_calls = []
+            self.terminate_calls = 0
+            self.kill_calls = 0
+
+        def poll(self):
+            return self.returncode
+
+        def wait(self, timeout=None):
+            self.wait_calls.append(timeout)
+            self.returncode = 0
+            return 0
+
+        def terminate(self):
+            self.terminate_calls += 1
+
+        def kill(self):
+            self.kill_calls += 1
+
+    channel = _Channel()
+    process = _Process()
+    launcher = object.__new__(OwnerWorkerLauncher)
+    launcher._channel = channel
+    launcher._process = process
+    launcher._lock = threading.Lock()
+    launcher._closed = False
+    monkeypatch.setattr(launcher_module.uuid, "uuid4", lambda: SimpleNamespace(hex="shutdown-nonce"))
+    monkeypatch.setattr(launcher_module, "_send_packet", lambda *_args: None)
+    monkeypatch.setattr(
+        launcher_module,
+        "_recv_packet",
+        lambda _channel: (
+            {
+                "version": _PROTOCOL_VERSION,
+                "op": "shutdown",
+                "nonce": "shutdown-nonce",
+            },
+            [],
+        ),
+    )
+
+    launcher.close()
+
+    assert channel.closed is True
+    assert process.wait_calls == [launcher_module._LAUNCHER_SHUTDOWN_TIMEOUT]
+    assert process.terminate_calls == 0
+    assert process.kill_calls == 0
+    assert launcher._process is None
+
+
+def test_launcher_close_escalates_after_graceful_cleanup_timeout(monkeypatch):
+    import hermes_cli.owner_worker.preloaded_launcher as launcher_module
+
+    class _Channel:
+        def close(self):
+            pass
+
+    class _Process:
+        def __init__(self):
+            self.returncode = None
+            self.wait_calls = []
+            self.terminate_calls = 0
+            self.kill_calls = 0
+
+        def poll(self):
+            return self.returncode
+
+        def wait(self, timeout=None):
+            self.wait_calls.append(timeout)
+            if self.terminate_calls == 0:
+                raise subprocess.TimeoutExpired("launcher", timeout)
+            self.returncode = -signal.SIGTERM
+            return self.returncode
+
+        def terminate(self):
+            self.terminate_calls += 1
+
+        def kill(self):
+            self.kill_calls += 1
+
+    process = _Process()
+    launcher = object.__new__(OwnerWorkerLauncher)
+    launcher._channel = _Channel()
+    launcher._process = process
+    launcher._lock = threading.Lock()
+    launcher._closed = False
+    monkeypatch.setattr(launcher_module.uuid, "uuid4", lambda: SimpleNamespace(hex="shutdown-nonce"))
+    monkeypatch.setattr(launcher_module, "_send_packet", lambda *_args: None)
+    monkeypatch.setattr(
+        launcher_module,
+        "_recv_packet",
+        lambda _channel: (
+            {
+                "version": _PROTOCOL_VERSION,
+                "op": "shutdown",
+                "nonce": "shutdown-nonce",
+            },
+            [],
+        ),
+    )
+
+    launcher.close()
+
+    assert process.wait_calls == [launcher_module._LAUNCHER_SHUTDOWN_TIMEOUT, 2]
+    assert process.terminate_calls == 1
+    assert process.kill_calls == 0
+    assert launcher._process is None
+
+
+def test_launcher_close_retries_reap_after_sigkill_wait_timeout(monkeypatch):
+    import hermes_cli.owner_worker.preloaded_launcher as launcher_module
+
+    class _Channel:
+        def close(self):
+            pass
+
+    class _Process:
+        def __init__(self):
+            self.returncode = None
+            self.wait_calls = []
+            self.terminate_calls = 0
+            self.kill_calls = 0
+
+        def poll(self):
+            return self.returncode
+
+        def wait(self, timeout=None):
+            self.wait_calls.append(timeout)
+            if len(self.wait_calls) < 4:
+                raise subprocess.TimeoutExpired("launcher", timeout)
+            self.returncode = -9
+            return self.returncode
+
+        def terminate(self):
+            self.terminate_calls += 1
+
+        def kill(self):
+            self.kill_calls += 1
+
+    process = _Process()
+    launcher = object.__new__(OwnerWorkerLauncher)
+    launcher._channel = _Channel()
+    launcher._process = process
+    launcher._lock = threading.Lock()
+    launcher._closed = False
+    monkeypatch.setattr(
+        launcher_module.uuid,
+        "uuid4",
+        lambda: SimpleNamespace(hex="shutdown-nonce"),
+    )
+    monkeypatch.setattr(launcher_module, "_send_packet", lambda *_args: None)
+    monkeypatch.setattr(
+        launcher_module,
+        "_recv_packet",
+        lambda _channel: (
+            {
+                "version": _PROTOCOL_VERSION,
+                "op": "shutdown",
+                "nonce": "shutdown-nonce",
+            },
+            [],
+        ),
+    )
+
+    with pytest.raises(subprocess.TimeoutExpired):
+        launcher.close()
+
+    assert launcher._closed is True
+    assert launcher._process is process
+
+    launcher.close()
+
+    assert process.wait_calls == [launcher_module._LAUNCHER_SHUTDOWN_TIMEOUT, 2, 2, 2]
+    assert process.terminate_calls == 2
+    assert process.kill_calls == 1
+    assert launcher._process is None
+
+
+def test_launcher_close_is_idempotent(monkeypatch):
+    import hermes_cli.owner_worker.preloaded_launcher as launcher_module
+
+    class _Channel:
+        close_calls = 0
+
+        def close(self):
+            self.close_calls += 1
+
+    process = SimpleNamespace(
+        poll=lambda: 0,
+    )
+    channel = _Channel()
+    launcher = object.__new__(OwnerWorkerLauncher)
+    launcher._channel = channel
+    launcher._process = process
+    launcher._lock = threading.Lock()
+    launcher._closed = False
+    monkeypatch.setattr(launcher_module, "_send_packet", lambda *_args: None)
+    monkeypatch.setattr(
+        launcher_module,
+        "_recv_packet",
+        lambda _channel: ({"version": _PROTOCOL_VERSION, "op": "shutdown", "nonce": "ignored"}, []),
+    )
+
+    launcher.close()
+    launcher.close()
+
+    assert channel.close_calls == 1
+    assert launcher._closed is True
+
+
+def test_launcher_spawn_rejects_closed_launcher():
+    launcher = object.__new__(OwnerWorkerLauncher)
+    launcher._lock = threading.Lock()
+    launcher._closed = True
+    launcher._process = None
+    launcher._channel = None
+
+    with pytest.raises(OwnerWorkerLauncherError, match="unavailable"):
+        launcher.spawn(
+            ["--owner-key", "ok1_test"],
+            env={},
+            cwd_fd=1,
+            stdout_fd=1,
+            stderr_fd=2,
+            start_fd=1,
+            relay_fds={},
+        )
+
+
+def test_launcher_process_handle_confirms_exit_after_launcher_close(monkeypatch):
+    import hermes_cli.owner_worker.preloaded_launcher as launcher_module
+
+    class _Selector:
+        def __init__(self):
+            self.select_results = iter(([], [(41, 1)]))
+            self.registered = []
+            self.closed = False
+
+        def register(self, fd, event):
+            self.registered.append((fd, event))
+
+        def select(self, timeout=None):
+            return next(self.select_results)
+
+        def close(self):
+            self.closed = True
+
+    selector = _Selector()
+    signaled = []
+    monkeypatch.setattr(launcher_module.signal, "SIGKILL", 9, raising=False)
+    monkeypatch.setattr(launcher_module, "_pidfd_open", lambda _pid: 41)
+    monkeypatch.setattr(
+        launcher_module,
+        "_pidfd_send_signal",
+        lambda pidfd, sig: signaled.append((pidfd, sig)),
+    )
+    monkeypatch.setattr(
+        launcher_module.selectors,
+        "DefaultSelector",
+        lambda: selector,
+    )
+    handle = LauncherProcessHandle(1234, SimpleNamespace())
+
+    assert handle.confirm_exit_after_launcher_close(timeout=0.25) is True
+    assert selector.registered == [(41, launcher_module.selectors.EVENT_READ)]
+    assert signaled == [(41, signal.SIGKILL)]
+    assert selector.closed is True
 
 
 def test_validate_launch_requires_exact_version_and_core_descriptor_order():

@@ -31,6 +31,7 @@ from hermes_cli.owner_worker import (
     OwnerWorkerSupervisor,
     OwnerWorkerUnavailableError,
 )
+from hermes_cli.owner_worker.supervisor import OwnerWorkerHandle
 from hermes_cli.owner_worker.tokens import (
     AUD_OWNER_WORKER_HTTP,
     AUD_OWNER_WORKER_WS,
@@ -69,6 +70,7 @@ class _FakeProcess:
         self.terminated = False
         self.killed = False
         self.wait_calls = 0
+        self.close_calls = 0
 
     def poll(self):
         return self.returncode
@@ -85,6 +87,9 @@ class _FakeProcess:
         self.wait_calls += 1
         return self.returncode
 
+    def close(self):
+        self.close_calls += 1
+
 
 @pytest.fixture(autouse=True)
 def _simulate_linux_controlled_roots(monkeypatch, request):
@@ -97,7 +102,7 @@ def _simulate_linux_controlled_roots(monkeypatch, request):
         monkeypatch.setattr(
             supervisor_module,
             "_seed_owner_worker_skills",
-            lambda _owner_home: {"copied": [], "updated": []},
+            lambda _owner_home, **_kwargs: {"copied": [], "updated": []},
         )
 
 
@@ -169,6 +174,40 @@ def _active_lease(tmp_path, *, owner_key="ok1_owner_a", worker_id="worker-a"):
         generation_state=WorkerGenerationState.ACTIVE,
     )
     return store, active
+
+
+def _install_active_handle(
+    supervisor: OwnerWorkerSupervisor,
+    owner: _Owner,
+    process: _FakeProcess,
+    *,
+    worker_id: str | None = None,
+) -> OwnerWorkerHandle:
+    claim = supervisor.authority_store.claim_worker_start(
+        owner.owner_key,
+        worker_id=worker_id or f"worker-{process.pid}",
+    )
+    lease = supervisor.authority_store.transition_worker_lease(
+        claim.lease,
+        state=WorkerLeaseState.ACTIVE,
+        generation_state=WorkerGenerationState.ACTIVE,
+    )
+    socket_path = supervisor.socket_path_for(owner, lease.worker_generation)
+    socket_path.parent.mkdir(parents=True, exist_ok=True)
+    socket_path.touch()
+    handle = OwnerWorkerHandle(
+        owner_key=owner.owner_key,
+        owner_home=owner.owner_home.resolve(),
+        worker_generation=lease.worker_generation,
+        worker_id=lease.worker_id,
+        lease_version=lease.lease_version,
+        recovery_generation=lease.recovery_generation,
+        socket_path=socket_path,
+        process=process,
+        pid=process.pid,
+    )
+    supervisor._handles[owner.owner_key] = handle
+    return handle
 
 
 def test_capability_is_exact_owner_generation_lease_scope_and_path_bound(tmp_path):
@@ -753,6 +792,96 @@ def test_supervisor_syncs_owner_skills_before_process_launch(tmp_path, monkeypat
     supervisor.shutdown()
 
 
+def test_supervisor_initialization_closes_owned_launcher_on_snapshot_failure(
+    tmp_path, monkeypatch
+):
+    import hermes_cli.owner_worker.supervisor as supervisor_module
+    import tools.skills_sync as skills_sync
+
+    class _Launcher:
+        def __init__(self):
+            self.close_calls = 0
+
+        def close(self):
+            self.close_calls += 1
+
+    launcher = _Launcher()
+    monkeypatch.setattr(supervisor_module, "OwnerWorkerLauncher", lambda: launcher)
+    monkeypatch.setattr(
+        skills_sync,
+        "prepare_bundled_skill_snapshot",
+        lambda: (_ for _ in ()).throw(RuntimeError("snapshot failed")),
+    )
+
+    with pytest.raises(RuntimeError, match="snapshot failed"):
+        OwnerWorkerSupervisor(
+            control_home=tmp_path / "control",
+            process_factory=supervisor_module.subprocess.Popen,
+        )
+
+    assert launcher.close_calls == 1
+
+
+def test_supervisor_initialization_closes_owned_launcher_on_snapshot_interrupt(
+    tmp_path, monkeypatch
+):
+    import hermes_cli.owner_worker.supervisor as supervisor_module
+    import tools.skills_sync as skills_sync
+
+    class _Launcher:
+        def __init__(self):
+            self.close_calls = 0
+
+        def close(self):
+            self.close_calls += 1
+
+    launcher = _Launcher()
+    monkeypatch.setattr(supervisor_module, "OwnerWorkerLauncher", lambda: launcher)
+    monkeypatch.setattr(
+        skills_sync,
+        "prepare_bundled_skill_snapshot",
+        lambda: (_ for _ in ()).throw(KeyboardInterrupt("snapshot interrupted")),
+    )
+
+    with pytest.raises(KeyboardInterrupt, match="snapshot interrupted"):
+        OwnerWorkerSupervisor(
+            control_home=tmp_path / "control",
+            process_factory=supervisor_module.subprocess.Popen,
+        )
+
+    assert launcher.close_calls == 1
+
+
+def test_supervisor_initialization_does_not_close_injected_launcher_on_snapshot_failure(
+    tmp_path, monkeypatch
+):
+    import hermes_cli.owner_worker.supervisor as supervisor_module
+    import tools.skills_sync as skills_sync
+
+    class _Launcher:
+        def __init__(self):
+            self.close_calls = 0
+
+        def close(self):
+            self.close_calls += 1
+
+    launcher = _Launcher()
+    monkeypatch.setattr(
+        skills_sync,
+        "prepare_bundled_skill_snapshot",
+        lambda: (_ for _ in ()).throw(RuntimeError("snapshot failed")),
+    )
+
+    with pytest.raises(RuntimeError, match="snapshot failed"):
+        OwnerWorkerSupervisor(
+            control_home=tmp_path / "control",
+            process_factory=supervisor_module.subprocess.Popen,
+            launcher=launcher,
+        )
+
+    assert launcher.close_calls == 0
+
+
 def test_supervisor_skill_sync_failure_prevents_generation_claim(tmp_path, monkeypatch):
     import hermes_cli.owner_worker.supervisor as supervisor_module
 
@@ -1120,7 +1249,267 @@ def test_supervisor_resource_setup_failure_closes_child_descriptor_and_reservati
     assert supervisor.authority_store.read_owner_worker_lease(owner.owner_key).state is WorkerLeaseState.REVOKED
 
 
-def test_supervisor_resource_membership_failure_releases_reservation(tmp_path):
+def test_supervisor_retains_partial_runtime_after_mkdir_cleanup_failure(
+    tmp_path, monkeypatch,
+):
+    owner = _Owner("ok1_partial_runtime_cleanup", tmp_path / "owner")
+    supervisor = OwnerWorkerSupervisor(
+        control_home=tmp_path / "control",
+        client_cls=_FakeClient,
+        process_factory=lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("must not spawn")
+        ),
+        startup_timeout=0.1,
+    )
+    cleanup_calls = 0
+
+    class _Roots:
+        def mkdirs(self, *_args):
+            raise RuntimeError("mkdir failed after partial creation")
+
+        def close(self):
+            pass
+
+    def cleanup_runtime(*_args, **_kwargs):
+        nonlocal cleanup_calls
+        cleanup_calls += 1
+        if cleanup_calls == 1:
+            raise OSError("partial runtime cleanup failed")
+
+    monkeypatch.setattr(supervisor, "_controlled_roots_for", lambda _paths: _Roots())
+    monkeypatch.setattr(supervisor, "_cleanup_generation_runtime", cleanup_runtime)
+
+    with pytest.raises(RuntimeError, match="mkdir failed after partial creation"):
+        supervisor.get_or_start(owner)
+
+    retained = supervisor._terminating_handles[owner.owner_key]
+    assert retained.process is None
+    assert retained.process_handle_closed is True
+    assert retained.runtime_cleanup_pending is True
+    assert cleanup_calls == 1
+
+    supervisor.maintenance_tick()
+
+    assert cleanup_calls == 2
+    assert supervisor._terminating_handles == {}
+
+
+def test_supervisor_pre_spawn_cleanup_preserves_primary_error_when_cleanup_fails(
+    tmp_path, monkeypatch,
+):
+    from types import SimpleNamespace
+
+    owner = _Owner("ok1_pre_spawn_cleanup_failure", tmp_path / "owner")
+    class _Scope:
+        released = False
+
+        def cleanup(self):
+            raise RuntimeError("scope cleanup failed")
+
+    class _Manager:
+        policy = SimpleNamespace(global_limits=SimpleNamespace(max_owner_workers=1))
+
+        def admit_worker(self, _lease):
+            return _Scope()
+
+        def admit_executor(self, *_args, **_kwargs):
+            raise AssertionError
+
+    supervisor = OwnerWorkerSupervisor(
+        control_home=tmp_path / "control",
+        client_cls=_FakeClient,
+        process_factory=lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("must not spawn")
+        ),
+        startup_timeout=0.1,
+        resource_manager=_Manager(),
+    )
+    monkeypatch.setattr(
+        supervisor.deployment_resource_broker,
+        "register",
+        lambda _lease: (_ for _ in ()).throw(ValueError("registration failed")),
+    )
+    with pytest.raises(OwnerWorkerStartupError, match="resource admission failed") as failure:
+        supervisor.get_or_start(owner)
+
+    assert isinstance(failure.value.__cause__, ValueError)
+    assert not any(
+        thread.name.startswith("owner-worker-heartbeat-") and thread.is_alive()
+        for thread in threading.enumerate()
+    )
+    assert supervisor.authority_store.read_owner_worker_lease(
+        owner.owner_key
+    ).state is WorkerLeaseState.REVOKED
+    assert set(supervisor._terminating_handles) == {owner.owner_key}
+    retained = supervisor._terminating_handles[owner.owner_key]
+    assert retained.process is None
+    assert retained.process_handle_closed is True
+    assert retained.resource_scope is not None
+
+    scope = retained.resource_scope
+    scope.cleanup = lambda: setattr(scope, "released", True)
+    supervisor.maintenance_tick()
+
+    assert supervisor._terminating_handles == {}
+
+
+def test_supervisor_post_claim_setup_failure_fences_starting_generation(
+    tmp_path, monkeypatch,
+):
+    owner = _Owner("ok1_post_claim_setup_failure", tmp_path / "owner")
+    supervisor = OwnerWorkerSupervisor(
+        control_home=tmp_path / "control",
+        client_cls=_FakeClient,
+        process_factory=lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("must not spawn")
+        ),
+        startup_timeout=0.1,
+    )
+    monkeypatch.setattr(
+        supervisor,
+        "_env_for",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            OSError("environment unavailable")
+        ),
+    )
+
+    with pytest.raises(OwnerWorkerStartupError, match="startup setup failed") as failure:
+        supervisor.get_or_start(owner)
+
+    assert isinstance(failure.value.__cause__, OSError)
+    lease = supervisor.authority_store.read_owner_worker_lease(owner.owner_key)
+    generation = supervisor.authority_store.read_worker_generation(owner.owner_key, 1)
+    assert lease.state is WorkerLeaseState.REVOKED
+    assert generation.state is WorkerGenerationState.FAILED
+    assert supervisor._handles == {}
+    assert supervisor._terminating_handles == {}
+
+
+def test_supervisor_heartbeat_start_failure_fences_starting_generation(
+    tmp_path, monkeypatch,
+):
+    import hermes_cli.owner_worker.supervisor as supervisor_module
+
+    owner = _Owner("ok1_heartbeat_start_failure", tmp_path / "owner")
+    supervisor = OwnerWorkerSupervisor(
+        control_home=tmp_path / "control",
+        client_cls=_FakeClient,
+        process_factory=lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("must not spawn")
+        ),
+        startup_timeout=0.1,
+    )
+
+    class _Thread:
+        def __init__(self, **_kwargs):
+            pass
+
+        def start(self):
+            raise RuntimeError("heartbeat thread unavailable")
+
+        def is_alive(self):
+            return False
+
+    monkeypatch.setattr(supervisor_module.threading, "Thread", _Thread)
+
+    with pytest.raises(OwnerWorkerStartupError, match="startup setup failed") as failure:
+        supervisor.get_or_start(owner)
+
+    assert isinstance(failure.value.__cause__, RuntimeError)
+    lease = supervisor.authority_store.read_owner_worker_lease(owner.owner_key)
+    generation = supervisor.authority_store.read_worker_generation(owner.owner_key, 1)
+    assert lease.state is WorkerLeaseState.REVOKED
+    assert generation.state is WorkerGenerationState.FAILED
+    assert supervisor._terminating_handles == {}
+
+
+def test_supervisor_post_claim_interrupt_is_fenced_and_propagated(
+    tmp_path, monkeypatch,
+):
+    owner = _Owner("ok1_post_claim_interrupt", tmp_path / "owner")
+    supervisor = OwnerWorkerSupervisor(
+        control_home=tmp_path / "control",
+        client_cls=_FakeClient,
+        process_factory=lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("must not spawn")
+        ),
+        startup_timeout=0.1,
+    )
+    monkeypatch.setattr(
+        supervisor,
+        "_env_for",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            KeyboardInterrupt("startup interrupted")
+        ),
+    )
+
+    with pytest.raises(KeyboardInterrupt, match="startup interrupted"):
+        supervisor.get_or_start(owner)
+
+    lease = supervisor.authority_store.read_owner_worker_lease(owner.owner_key)
+    generation = supervisor.authority_store.read_worker_generation(owner.owner_key, 1)
+    assert lease.state is WorkerLeaseState.REVOKED
+    assert generation.state is WorkerGenerationState.FAILED
+    assert supervisor._handles == {}
+    assert supervisor._terminating_handles == {}
+
+
+def test_supervisor_mkdir_cleanup_preserves_primary_error_when_revoke_fails(
+    tmp_path, monkeypatch,
+):
+    from types import SimpleNamespace
+
+    owner = _Owner("ok1_mkdir_cleanup_failure", tmp_path / "owner")
+
+    class _Scope:
+        released = False
+
+        def cleanup(self):
+            raise RuntimeError("scope cleanup failed")
+
+    class _Manager:
+        policy = SimpleNamespace(global_limits=SimpleNamespace(max_owner_workers=1))
+
+        def admit_worker(self, _lease):
+            return _Scope()
+
+        def admit_executor(self, *_args, **_kwargs):
+            raise AssertionError
+
+    class _Roots:
+        def mkdirs(self, *_args):
+            raise RuntimeError("mkdir failed")
+
+        def close(self):
+            pass
+
+    supervisor = OwnerWorkerSupervisor(
+        control_home=tmp_path / "control",
+        client_cls=_FakeClient,
+        process_factory=lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("must not spawn")
+        ),
+        startup_timeout=0.1,
+        resource_manager=_Manager(),
+    )
+    monkeypatch.setattr(supervisor, "_controlled_roots_for", lambda _paths: _Roots())
+    monkeypatch.setattr(
+        supervisor.deployment_resource_broker,
+        "revoke",
+        lambda _lease: (_ for _ in ()).throw(ValueError("revoke failed")),
+    )
+
+    with pytest.raises(RuntimeError, match="mkdir failed"):
+        supervisor.get_or_start(owner)
+
+    assert supervisor.authority_store.read_owner_worker_lease(
+        owner.owner_key
+    ).state is WorkerLeaseState.REVOKED
+
+
+def test_supervisor_resource_membership_failure_releases_reservation(
+    tmp_path, monkeypatch,
+):
     from types import SimpleNamespace
 
     owner = _Owner("ok1_resource_failure", tmp_path / "owner")
@@ -1152,13 +1541,14 @@ def test_supervisor_resource_membership_failure_releases_reservation(tmp_path):
             raise AssertionError
 
     manager = _Manager()
+    process = _FakeProcess()
 
     def fake_process_factory(*args, **kwargs):
         argv = args[0]
         child_gate_fds.append(os.dup(int(argv[argv.index("--start-fd") + 1])))
         child_resource_fds.append(os.dup(int(kwargs["env"]["HERMES_DEPLOYMENT_RESOURCE_BROKER_FD"])))
         Path(argv[argv.index("--socket") + 1]).touch()
-        return _FakeProcess()
+        return process
 
     supervisor = OwnerWorkerSupervisor(
         control_home=tmp_path / "control", client_cls=_FakeClient,
@@ -1170,7 +1560,9 @@ def test_supervisor_resource_membership_failure_releases_reservation(tmp_path):
         supervisor.get_or_start(owner)
 
     assert manager.scope.released
-    assert supervisor.authority_store.read_owner_worker_lease(owner.owner_key).state is WorkerLeaseState.REVOKED
+    assert process.close_calls == 1
+    lease = supervisor.authority_store.read_owner_worker_lease(owner.owner_key)
+    assert lease.state is WorkerLeaseState.REVOKED
     for fd in (*child_gate_fds, *child_resource_fds):
         os.close(fd)
 
@@ -1312,7 +1704,7 @@ def test_supervisor_does_not_reclaim_healthy_or_ambiguous_orphan_lease(tmp_path)
     assert restarted.authority_store.read_owner_worker_lease(owner.owner_key).state is WorkerLeaseState.ACTIVE
 
 
-def test_supervisor_shutdown_drains_all_local_workers_in_order(tmp_path):
+def test_supervisor_shutdown_drains_all_local_workers_in_order(tmp_path, monkeypatch):
     owner = _Owner("ok1_shutdown", tmp_path / "owner")
     events = []
 
@@ -1321,40 +1713,90 @@ def test_supervisor_shutdown_drains_all_local_workers_in_order(tmp_path):
             events.append("terminate")
             super().terminate()
 
-    def fake_process_factory(*args, **kwargs):
-        argv = args[0]
-        Path(argv[argv.index("--socket") + 1]).touch()
-        return _OrderedProcess()
+        def close(self):
+            events.append("close")
+            super().close()
 
     supervisor = OwnerWorkerSupervisor(
         control_home=tmp_path / "control",
         client_cls=_FakeClient,
-        process_factory=fake_process_factory,
+        process_factory=lambda *_args, **_kwargs: None,
         startup_timeout=0.1,
         startup_cooldown=0,
         generation_bridge_revoker=lambda _lease, **_kwargs: events.append("bridges"),
     )
-    handle = supervisor.get_or_start(owner)
+    handle = _install_active_handle(supervisor, owner, _OrderedProcess())
+
+    def cleanup_runtime(*_args, **_kwargs):
+        handle.socket_path.unlink()
+        handle.socket_path.parent.rmdir()
+
+    monkeypatch.setattr(supervisor, "_cleanup_generation_runtime", cleanup_runtime)
 
     supervisor.shutdown()
 
-    assert events == ["bridges", "terminate"]
+    assert events == ["bridges", "terminate", "close"]
+    assert handle.process.close_calls == 1
     assert supervisor._handles == {}
     assert not handle.socket_path.exists()
     assert supervisor.authority_store.read_owner_worker_lease(owner.owner_key).state is WorkerLeaseState.REVOKED
+
+
+def test_supervisor_concurrent_shutdown_closes_process_once(tmp_path, monkeypatch):
+    owner = _Owner("ok1_concurrent_shutdown", tmp_path / "owner")
+    close_entered = threading.Event()
+    release_close = threading.Event()
+    errors: list[BaseException] = []
+
+    class _BlockingCloseProcess(_FakeProcess):
+        def close(self):
+            super().close()
+            close_entered.set()
+            assert release_close.wait(timeout=2)
+
+    supervisor = OwnerWorkerSupervisor(
+        control_home=tmp_path / "control",
+        client_cls=_FakeClient,
+        process_factory=lambda *_args, **_kwargs: None,
+        startup_timeout=0.1,
+        startup_cooldown=0,
+    )
+    handle = _install_active_handle(supervisor, owner, _BlockingCloseProcess())
+    monkeypatch.setattr(
+        supervisor,
+        "_cleanup_generation_runtime",
+        lambda *_args, **_kwargs: None,
+    )
+
+    def shutdown():
+        try:
+            supervisor.shutdown()
+        except BaseException as exc:  # pragma: no cover - makes thread errors visible
+            errors.append(exc)
+
+    threads = [threading.Thread(target=shutdown) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    assert close_entered.wait(timeout=2)
+    release_close.set()
+    for thread in threads:
+        thread.join(timeout=2)
+        assert not thread.is_alive()
+
+    assert errors == []
+    assert handle.process.close_calls == 1
+    assert supervisor._terminating_handles == {}
 
 
 def test_supervisor_shutdown_failure_still_releases_resource_scope(tmp_path):
     owner = _Owner("ok1_shutdown_failure", tmp_path / "owner")
     supervisor = OwnerWorkerSupervisor(
         control_home=tmp_path / "control", client_cls=_FakeClient,
-        process_factory=lambda *args, **_kwargs: (
-            Path(args[0][args[0].index("--socket") + 1]).touch() or _FakeProcess()
-        ),
+        process_factory=lambda *_args, **_kwargs: None,
         startup_timeout=0.1,
         generation_bridge_revoker=lambda _lease, **_kwargs: (_ for _ in ()).throw(RuntimeError("bridge cleanup failed")),
     )
-    handle = supervisor.get_or_start(owner)
+    handle = _install_active_handle(supervisor, owner, _FakeProcess())
 
     class _Scope:
         released = False
@@ -1369,6 +1811,7 @@ def test_supervisor_shutdown_failure_still_releases_resource_scope(tmp_path):
         supervisor.shutdown()
 
     assert handle.process.terminated
+    assert handle.process.close_calls == 1
     assert scope.released
     assert supervisor._handles == {}
     assert supervisor._terminating_handles == {}
@@ -1390,19 +1833,14 @@ def test_supervisor_shutdown_revoker_can_release_active_use_from_event_loop(tmp_
     loop_thread.start()
     assert loop_ready.wait(timeout=1)
 
-    def fake_process_factory(*args, **kwargs):
-        argv = args[0]
-        Path(argv[argv.index("--socket") + 1]).touch()
-        return _FakeProcess()
-
     supervisor = OwnerWorkerSupervisor(
         control_home=tmp_path / "control",
         client_cls=_FakeClient,
-        process_factory=fake_process_factory,
+        process_factory=lambda *_args, **_kwargs: None,
         startup_timeout=0.1,
         startup_cooldown=0,
     )
-    handle = supervisor.get_or_start(owner)
+    handle = _install_active_handle(supervisor, owner, _FakeProcess())
     use_lease = supervisor.acquire_use(handle)
 
     async def close_bridge():
@@ -1466,31 +1904,61 @@ def test_supervisor_get_or_start_reuses_cached_generation_without_health_probe(t
 
 def test_supervisor_reported_failure_retires_idle_generation(tmp_path):
     owner = _Owner("ok1_transport_failure", tmp_path / "owner")
-
-    def fake_process_factory(*args, **_kwargs):
-        argv = args[0]
-        Path(argv[argv.index("--socket") + 1]).touch()
-        return _FakeProcess()
-
     supervisor = OwnerWorkerSupervisor(
         control_home=tmp_path / "control",
         client_cls=_FakeClient,
-        process_factory=fake_process_factory,
+        process_factory=lambda *_args, **_kwargs: None,
         startup_timeout=0.1,
         startup_cooldown=0,
     )
-    first = supervisor.get_or_start(owner)
+    first = _install_active_handle(supervisor, owner, _FakeProcess())
 
     assert supervisor.report_request_failure(first) is True
     with pytest.raises(OwnerWorkerUnavailableError, match="retiring"):
         supervisor.get_or_start(owner)
 
     assert supervisor.maintenance_tick() == {owner.owner_key}
-    replacement = supervisor.get_or_start(owner)
+    replacement = _install_active_handle(supervisor, owner, _FakeProcess(pid=4322))
 
     assert replacement is not first
     assert first.process.terminated
+    assert first.process.close_calls == 1
+    assert replacement.process.close_calls == 0
     assert supervisor._handles[owner.owner_key] is replacement
+    assert supervisor._terminating_handles == {}
+
+
+def test_supervisor_repeated_generation_churn_closes_each_process_once(
+    tmp_path, monkeypatch,
+):
+    owner = _Owner("ok1_generation_churn", tmp_path / "owner")
+    supervisor = OwnerWorkerSupervisor(
+        control_home=tmp_path / "control",
+        client_cls=_FakeClient,
+        process_factory=lambda *_args, **_kwargs: None,
+        startup_timeout=0.1,
+        startup_cooldown=0,
+    )
+    monkeypatch.setattr(
+        supervisor,
+        "_cleanup_generation_runtime",
+        lambda *_args, **_kwargs: None,
+    )
+    processes: list[_FakeProcess] = []
+
+    for generation in range(1, 7):
+        process = _FakeProcess(pid=4321 + generation)
+        processes.append(process)
+        handle = _install_active_handle(supervisor, owner, process)
+        assert handle.worker_generation == generation
+        assert supervisor.report_request_failure(handle) is True
+        assert supervisor.maintenance_tick() == {owner.owner_key}
+        assert handle.process.close_calls == 1
+
+    supervisor.shutdown()
+
+    assert [process.close_calls for process in processes] == [1] * 6
+    assert supervisor._handles == {}
     assert supervisor._terminating_handles == {}
 
 
@@ -1548,20 +2016,14 @@ def test_supervisor_stale_failure_report_does_not_fence_replacement(tmp_path):
 
 def test_supervisor_reported_failure_waits_for_active_use_release(tmp_path):
     owner = _Owner("ok1_failure_active_use", tmp_path / "owner")
-
-    def fake_process_factory(*args, **_kwargs):
-        argv = args[0]
-        Path(argv[argv.index("--socket") + 1]).touch()
-        return _FakeProcess()
-
     supervisor = OwnerWorkerSupervisor(
         control_home=tmp_path / "control",
         client_cls=_FakeClient,
-        process_factory=fake_process_factory,
+        process_factory=lambda *_args, **_kwargs: None,
         startup_timeout=0.1,
         startup_cooldown=0,
     )
-    handle = supervisor.get_or_start(owner)
+    handle = _install_active_handle(supervisor, owner, _FakeProcess())
     use = supervisor.acquire_use(handle)
 
     assert supervisor.report_request_failure(handle) is True
@@ -1575,26 +2037,35 @@ def test_supervisor_reported_failure_waits_for_active_use_release(tmp_path):
     assert handle.process.terminated is True
 
 
-def test_supervisor_restart_uses_new_generation_and_socket_with_reused_pid(tmp_path):
+def test_supervisor_restart_uses_new_generation_and_socket_with_reused_pid(
+    tmp_path, monkeypatch,
+):
     owner = _Owner("ok1_restart", tmp_path / "owner")
-    spawned: list[dict] = []
-
-    def fake_process_factory(*args, **kwargs):
-        spawned.append({"args": args, "kwargs": kwargs})
-        argv = args[0]
-        Path(argv[argv.index("--socket") + 1]).touch()
-        return _FakeProcess(pid=4321)
-
     supervisor = OwnerWorkerSupervisor(
         control_home=tmp_path / "control",
         client_cls=_FakeClient,
-        process_factory=fake_process_factory,
+        process_factory=lambda *_args, **_kwargs: None,
         startup_timeout=0.1,
         startup_cooldown=0,
     )
-    first = supervisor.get_or_start(owner)
+    monkeypatch.setattr(
+        supervisor,
+        "_cleanup_generation_runtime",
+        lambda *_args, **_kwargs: None,
+    )
+    first = _install_active_handle(
+        supervisor,
+        owner,
+        _FakeProcess(pid=4321),
+        worker_id="worker-first",
+    )
     supervisor._terminate_handle(owner.owner_key, first)
-    second = supervisor.get_or_start(owner)
+    second = _install_active_handle(
+        supervisor,
+        owner,
+        _FakeProcess(pid=4321),
+        worker_id="worker-second",
+    )
 
     assert first.pid == second.pid == 4321
     assert (first.worker_generation, second.worker_generation) == (1, 2)
@@ -1948,6 +2419,10 @@ def test_supervisor_fences_and_closes_bridges_before_terminating_exact_generatio
             events.append("terminate")
             super().terminate()
 
+        def close(self):
+            events.append("close")
+            super().close()
+
     def fake_process_factory(*args, **kwargs):
         argv = args[0]
         Path(argv[argv.index("--socket") + 1]).touch()
@@ -1987,7 +2462,7 @@ def test_supervisor_fences_and_closes_bridges_before_terminating_exact_generatio
 
     supervisor._terminate_handle(owner.owner_key, handle)
 
-    assert events == ["bridges", "terminate"]
+    assert events == ["bridges", "terminate", "close"]
     assert not socket_path.exists()
     assert not socket_path.parent.exists()
     assert all(path.read_text() == "keep" for path in persistent_paths)
@@ -1995,35 +2470,37 @@ def test_supervisor_fences_and_closes_bridges_before_terminating_exact_generatio
     assert supervisor.authority_store.read_owner_worker_lease(owner.owner_key).state is WorkerLeaseState.REVOKED
 
 
-def test_supervisor_reaps_already_exited_process_with_wait(tmp_path):
+def test_supervisor_reaps_already_exited_process_with_wait(tmp_path, monkeypatch):
     owner = _Owner("ok1_reaped", tmp_path / "owner")
-
-    def fake_process_factory(*args, **kwargs):
-        argv = args[0]
-        Path(argv[argv.index("--socket") + 1]).touch()
-        return _FakeProcess()
-
     supervisor = OwnerWorkerSupervisor(
         control_home=tmp_path / "control",
         client_cls=_FakeClient,
-        process_factory=fake_process_factory,
+        process_factory=lambda *_args, **_kwargs: None,
         startup_timeout=0.1,
         startup_cooldown=0,
     )
-    handle = supervisor.get_or_start(owner)
-    handle.process.returncode = 0
+    monkeypatch.setattr(
+        supervisor,
+        "_cleanup_generation_runtime",
+        lambda *_args, **_kwargs: None,
+    )
+    process = _FakeProcess()
+    process.returncode = 0
+    handle = _install_active_handle(supervisor, owner, process)
 
     supervisor.maintenance_tick()
 
     assert handle.process.wait_calls == 1
+    assert handle.process.close_calls == 1
     assert not handle.process.terminated
     assert not handle.process.killed
     assert supervisor._handles == {}
-    assert not handle.socket_path.exists()
     assert supervisor.authority_store.read_worker_generation(owner.owner_key, 1).state is WorkerGenerationState.TERMINATED
 
 
-def test_supervisor_does_not_mark_unconfirmed_process_exit_terminated(tmp_path):
+def test_supervisor_does_not_mark_unconfirmed_process_exit_terminated(
+    tmp_path, monkeypatch,
+):
     owner = _Owner("ok1_hung", tmp_path / "owner")
 
     class _HungProcess(_FakeProcess):
@@ -2034,45 +2511,339 @@ def test_supervisor_does_not_mark_unconfirmed_process_exit_terminated(tmp_path):
             self.wait_calls += 1
             raise subprocess.TimeoutExpired("owner-worker", timeout)
 
-    def fake_process_factory(*args, **kwargs):
-        argv = args[0]
-        Path(argv[argv.index("--socket") + 1]).touch()
-        return _HungProcess()
-
     supervisor = OwnerWorkerSupervisor(
         control_home=tmp_path / "control",
         client_cls=_FakeClient,
-        process_factory=fake_process_factory,
+        process_factory=lambda *_args, **_kwargs: None,
         startup_timeout=0.1,
         startup_cooldown=0,
     )
-    handle = supervisor.get_or_start(owner)
+    monkeypatch.setattr(
+        supervisor,
+        "_cleanup_generation_runtime",
+        lambda *_args, **_kwargs: None,
+    )
+    handle = _install_active_handle(supervisor, owner, _HungProcess())
 
     supervisor._terminate_handle(owner.owner_key, handle)
 
     assert handle.process.terminated and handle.process.killed
+    assert handle.process.close_calls == 0
     assert handle.socket_path.exists()
+    assert supervisor._terminating_handles == {owner.owner_key: handle}
     assert supervisor.authority_store.read_worker_generation(owner.owner_key, 1).state is WorkerGenerationState.REVOKED
     assert supervisor.authority_store.read_owner_worker_lease(owner.owner_key).state is WorkerLeaseState.REVOKED
 
+    handle.process.poll = lambda: handle.process.returncode
+    handle.process.wait = lambda timeout=None: handle.process.returncode
+    supervisor.maintenance_tick()
 
-def test_supervisor_cleanup_failure_does_not_skip_lifecycle_finalization(tmp_path, monkeypatch):
-    owner = _Owner("ok1_cleanup_failure", tmp_path / "owner")
+    assert handle.process.close_calls == 1
+    assert supervisor._terminating_handles == {}
 
-    def fake_process_factory(*args, **kwargs):
-        del kwargs
-        argv = args[0]
-        Path(argv[argv.index("--socket") + 1]).touch()
-        return _FakeProcess()
+
+def test_supervisor_retains_failed_authority_cleanup_without_reclosing_process(
+    tmp_path, monkeypatch,
+):
+    owner = _Owner("ok1_authority_cleanup_retry", tmp_path / "owner")
+    supervisor = OwnerWorkerSupervisor(
+        control_home=tmp_path / "control",
+        client_cls=_FakeClient,
+        process_factory=lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        supervisor,
+        "_cleanup_generation_runtime",
+        lambda *_args, **_kwargs: None,
+    )
+    handle = _install_active_handle(supervisor, owner, _FakeProcess())
+    real_transition = supervisor.authority_store.transition_worker_lease
+    transition_calls = 0
+
+    def transition(lease, *, state, generation_state):
+        nonlocal transition_calls
+        transition_calls += 1
+        if state is WorkerLeaseState.REVOKED and transition_calls == 2:
+            raise OSError("authority unavailable")
+        return real_transition(
+            lease,
+            state=state,
+            generation_state=generation_state,
+        )
+
+    monkeypatch.setattr(
+        supervisor.authority_store,
+        "transition_worker_lease",
+        transition,
+    )
+
+    with pytest.raises(OSError, match="authority unavailable"):
+        supervisor._terminate_handle(owner.owner_key, handle)
+
+    assert handle.process.close_calls == 1
+    assert handle.process_handle_closed is True
+    assert supervisor._terminating_handles == {owner.owner_key: handle}
+    assert supervisor.authority_store.read_owner_worker_lease(
+        owner.owner_key
+    ).state is WorkerLeaseState.DRAINING
+
+    supervisor.maintenance_tick()
+
+    assert handle.process.close_calls == 1
+    assert supervisor._terminating_handles == {}
+    assert supervisor.authority_store.read_worker_generation(
+        owner.owner_key, 1
+    ).state is WorkerGenerationState.TERMINATED
+
+
+def test_supervisor_retains_failed_resource_cleanup_without_reclosing_process(
+    tmp_path, monkeypatch,
+):
+    owner = _Owner("ok1_scope_cleanup_retry", tmp_path / "owner")
+    supervisor = OwnerWorkerSupervisor(
+        control_home=tmp_path / "control",
+        client_cls=_FakeClient,
+        process_factory=lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        supervisor,
+        "_cleanup_generation_runtime",
+        lambda *_args, **_kwargs: None,
+    )
+    handle = _install_active_handle(supervisor, owner, _FakeProcess())
+
+    class _Scope:
+        released = False
+        cleanup_calls = 0
+
+        def cleanup(self):
+            self.cleanup_calls += 1
+            if self.cleanup_calls == 1:
+                raise OSError("scope cleanup failed")
+            self.released = True
+
+    scope = _Scope()
+    handle.resource_scope = scope
+
+    with pytest.raises(OSError, match="scope cleanup failed"):
+        supervisor._terminate_handle(owner.owner_key, handle)
+
+    assert handle.process.close_calls == 1
+    assert handle.process_handle_closed is True
+    assert supervisor._terminating_handles == {owner.owner_key: handle}
+
+    supervisor.maintenance_tick()
+
+    assert handle.process.close_calls == 1
+    assert scope.cleanup_calls == 2
+    assert supervisor._terminating_handles == {}
+
+
+def test_supervisor_retains_failed_runtime_cleanup_without_reclosing_process(
+    tmp_path, monkeypatch,
+):
+    owner = _Owner("ok1_runtime_cleanup_retry", tmp_path / "owner")
+    supervisor = OwnerWorkerSupervisor(
+        control_home=tmp_path / "control",
+        client_cls=_FakeClient,
+        process_factory=lambda *_args, **_kwargs: None,
+    )
+    process = _FakeProcess()
+    handle = _install_active_handle(supervisor, owner, process)
+    cleanup_calls = 0
+
+    def cleanup_runtime(*_args, **_kwargs):
+        nonlocal cleanup_calls
+        cleanup_calls += 1
+        if cleanup_calls == 1:
+            raise OSError("runtime cleanup failed")
+
+    monkeypatch.setattr(supervisor, "_cleanup_generation_runtime", cleanup_runtime)
+
+    supervisor._terminate_handle(owner.owner_key, handle)
+
+    assert process.close_calls == 1
+    assert handle.process_handle_closed is True
+    assert handle.runtime_cleanup_pending is True
+    assert supervisor._terminating_handles == {owner.owner_key: handle}
+
+    supervisor.maintenance_tick()
+
+    assert process.close_calls == 1
+    assert cleanup_calls == 2
+    assert handle.runtime_cleanup_pending is False
+    assert supervisor._terminating_handles == {}
+
+
+def test_supervisor_shutdown_waits_for_in_flight_start(tmp_path):
+    supervisor = OwnerWorkerSupervisor(
+        control_home=tmp_path / "control",
+        client_cls=_FakeClient,
+        process_factory=lambda *_args, **_kwargs: None,
+    )
+    supervisor._in_flight_starts = 1
+    shutdown_finished = threading.Event()
+
+    thread = threading.Thread(
+        target=lambda: (supervisor.shutdown(), shutdown_finished.set()),
+    )
+    thread.start()
+    time.sleep(0.05)
+
+    assert not shutdown_finished.is_set()
+    with supervisor._start_finished:
+        supervisor._in_flight_starts = 0
+        supervisor._start_finished.notify_all()
+    thread.join(timeout=1)
+
+    assert shutdown_finished.is_set()
+
+
+def test_supervisor_shutdown_finalizes_launcher_reaped_retained_handle(
+    tmp_path, monkeypatch,
+):
+    owner = _Owner("ok1_launcher_reaped", tmp_path / "owner")
+
+    class _RetainedProcess(_FakeProcess):
+        def __init__(self):
+            super().__init__()
+            self.confirm_calls = 0
+
+        def poll(self):
+            return None
+
+        def wait(self, timeout=None):
+            self.wait_calls += 1
+            raise subprocess.TimeoutExpired("owner-worker", timeout)
+
+        def confirm_exit_after_launcher_close(self):
+            self.confirm_calls += 1
+            return True
+
+    class _Launcher:
+        def __init__(self):
+            self.close_calls = 0
+
+        def close(self):
+            self.close_calls += 1
+
+    launcher = _Launcher()
+    supervisor = OwnerWorkerSupervisor(
+        control_home=tmp_path / "control",
+        client_cls=_FakeClient,
+        process_factory=lambda *_args, **_kwargs: None,
+        startup_timeout=0.1,
+        startup_cooldown=0,
+    )
+    supervisor.launcher = launcher
+    monkeypatch.setattr(
+        supervisor,
+        "_cleanup_generation_runtime",
+        lambda *_args, **_kwargs: None,
+    )
+    handle = _install_active_handle(supervisor, owner, _RetainedProcess())
+
+    supervisor.shutdown()
+
+    assert launcher.close_calls == 1
+    assert handle.process.terminated and handle.process.killed
+    assert handle.process.confirm_calls == 1
+    assert handle.process.close_calls == 1
+    assert supervisor._handles == {}
+    assert supervisor._terminating_handles == {}
+    assert supervisor.authority_store.read_worker_generation(
+        owner.owner_key, 1
+    ).state is WorkerGenerationState.TERMINATED
+    assert supervisor.authority_store.read_owner_worker_lease(
+        owner.owner_key
+    ).state is WorkerLeaseState.REVOKED
+
+
+def test_supervisor_launcher_reaped_finalizer_retains_failed_resource_cleanup(
+    tmp_path, monkeypatch,
+):
+    owner = _Owner("ok1_launcher_cleanup_retry", tmp_path / "owner")
+    supervisor = OwnerWorkerSupervisor(
+        control_home=tmp_path / "control",
+        client_cls=_FakeClient,
+        process_factory=lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        supervisor,
+        "_cleanup_generation_runtime",
+        lambda *_args, **_kwargs: None,
+    )
+    handle = _install_active_handle(supervisor, owner, _FakeProcess())
+    assert supervisor._reserve_termination_locked(owner.owner_key, handle)
+
+    class _Scope:
+        released = False
+
+        def cleanup(self):
+            raise OSError("scope cleanup failed")
+
+    handle.resource_scope = _Scope()
+
+    with pytest.raises(OSError, match="scope cleanup failed"):
+        supervisor._finalize_launcher_reaped_handle(owner.owner_key, handle)
+    with pytest.raises(OSError, match="scope cleanup failed"):
+        supervisor._finalize_launcher_reaped_handle(owner.owner_key, handle)
+
+    assert handle.process.close_calls == 1
+    assert handle.process_handle_closed is True
+    assert supervisor._terminating_handles == {owner.owner_key: handle}
+    assert supervisor.authority_store.read_worker_generation(
+        owner.owner_key, 1
+    ).state is WorkerGenerationState.TERMINATED
+
+
+def test_supervisor_shutdown_reports_retained_nonlauncher_process_ownership(
+    tmp_path, monkeypatch,
+):
+    owner = _Owner("ok1_shutdown_retained", tmp_path / "owner")
+
+    class _HungProcess(_FakeProcess):
+        def poll(self):
+            return None
+
+        def wait(self, timeout=None):
+            self.wait_calls += 1
+            raise subprocess.TimeoutExpired("owner-worker", timeout)
 
     supervisor = OwnerWorkerSupervisor(
         control_home=tmp_path / "control",
         client_cls=_FakeClient,
-        process_factory=fake_process_factory,
+        process_factory=lambda *_args, **_kwargs: None,
         startup_timeout=0.1,
         startup_cooldown=0,
     )
-    handle = supervisor.get_or_start(owner)
+    monkeypatch.setattr(
+        supervisor,
+        "_cleanup_generation_runtime",
+        lambda *_args, **_kwargs: None,
+    )
+    handle = _install_active_handle(supervisor, owner, _HungProcess())
+
+    with pytest.raises(RuntimeError, match="could not discharge process ownership"):
+        supervisor.shutdown()
+
+    assert handle.process.close_calls == 0
+    assert supervisor._terminating_handles == {owner.owner_key: handle}
+    assert supervisor.authority_store.read_worker_generation(
+        owner.owner_key, 1
+    ).state is WorkerGenerationState.REVOKED
+
+
+def test_supervisor_cleanup_failure_does_not_skip_lifecycle_finalization(tmp_path, monkeypatch):
+    owner = _Owner("ok1_cleanup_failure", tmp_path / "owner")
+    supervisor = OwnerWorkerSupervisor(
+        control_home=tmp_path / "control",
+        client_cls=_FakeClient,
+        process_factory=lambda *_args, **_kwargs: None,
+        startup_timeout=0.1,
+        startup_cooldown=0,
+    )
+    handle = _install_active_handle(supervisor, owner, _FakeProcess())
     monkeypatch.setattr(
         supervisor,
         "_cleanup_generation_runtime",
@@ -2145,6 +2916,288 @@ def test_supervisor_startup_throttle_is_per_owner(tmp_path):
 
     assert second.owner_key == owners[1].owner_key
     assert len(spawned) == 2
+
+
+def test_supervisor_startup_transition_failure_still_closes_process_handle(
+    tmp_path, monkeypatch,
+):
+    owner = _Owner("ok1_startup_transition_failure", tmp_path / "owner")
+    process = _FakeProcess()
+    process.returncode = 1
+
+    def fake_process_factory(*args, **_kwargs):
+        argv = args[0]
+        Path(argv[argv.index("--socket") + 1]).touch()
+        return process
+
+    supervisor = OwnerWorkerSupervisor(
+        control_home=tmp_path / "control",
+        client_cls=_FakeClient,
+        process_factory=fake_process_factory,
+        startup_timeout=0.1,
+        startup_cooldown=0,
+    )
+    real_transition = supervisor.authority_store.transition_worker_lease
+
+    def transition(lease, *, state, generation_state):
+        if state is WorkerLeaseState.REVOKED:
+            raise OSError("authority unavailable")
+        return real_transition(
+            lease,
+            state=state,
+            generation_state=generation_state,
+        )
+
+    monkeypatch.setattr(supervisor.authority_store, "transition_worker_lease", transition)
+
+    with pytest.raises(OwnerWorkerStartupError, match="exited during startup"):
+        supervisor.get_or_start(owner)
+
+    assert process.close_calls == 1
+    assert set(supervisor._terminating_handles) == {owner.owner_key}
+    retained = supervisor._terminating_handles[owner.owner_key]
+    assert retained.process_handle_closed is True
+
+    monkeypatch.setattr(
+        supervisor.authority_store,
+        "transition_worker_lease",
+        real_transition,
+    )
+    supervisor.maintenance_tick()
+
+    assert process.close_calls == 1
+    assert supervisor._terminating_handles == {}
+
+
+def test_supervisor_relay_transition_failure_still_closes_process_handle(
+    tmp_path, monkeypatch,
+):
+    from hermes_cli.deployment_media import (
+        DeploymentMediaPolicy,
+        DeploymentMediaRoute,
+        DeploymentMediaRouteDescriptor,
+    )
+
+    owner = _Owner("ok1_relay_transition_failure", tmp_path / "owner")
+    process = _FakeProcess()
+
+    def fake_process_factory(*args, **_kwargs):
+        argv = args[0]
+        Path(argv[argv.index("--socket") + 1]).touch()
+        return process
+
+    policy = DeploymentMediaPolicy(
+        routes=(
+            DeploymentMediaRoute(
+                descriptor=DeploymentMediaRouteDescriptor(
+                    kind="image",
+                    provider="apiyi",
+                    models=("gpt-image-2-medium",),
+                    default_model="gpt-image-2-medium",
+                ),
+                key_env="TEST_OWNER_WORKER_MEDIA_KEY",
+                executor="plugins.image_gen.apiyi:generate_apiyi_image_bytes",
+            ),
+        ),
+        policy_id="media-policy-v1",
+    )
+    supervisor = OwnerWorkerSupervisor(
+        control_home=tmp_path / "control",
+        client_cls=_FakeClient,
+        process_factory=fake_process_factory,
+        startup_timeout=0.1,
+        startup_cooldown=0,
+        deployment_media_policy=policy,
+    )
+    monkeypatch.setattr(
+        supervisor.deployment_media_broker,
+        "activate",
+        lambda _lease: (_ for _ in ()).throw(RuntimeError("activation failed")),
+    )
+    real_transition = supervisor.authority_store.transition_worker_lease
+
+    def transition(lease, *, state, generation_state):
+        if state is WorkerLeaseState.REVOKED:
+            raise OSError("authority unavailable")
+        return real_transition(
+            lease,
+            state=state,
+            generation_state=generation_state,
+        )
+
+    monkeypatch.setattr(supervisor.authority_store, "transition_worker_lease", transition)
+
+    with pytest.raises(OwnerWorkerStartupError, match="relay activation"):
+        supervisor.get_or_start(owner)
+
+    assert process.close_calls == 1
+    assert set(supervisor._terminating_handles) == {owner.owner_key}
+    retained = supervisor._terminating_handles[owner.owner_key]
+    assert retained.process_handle_closed is True
+
+    monkeypatch.setattr(
+        supervisor.authority_store,
+        "transition_worker_lease",
+        real_transition,
+    )
+    supervisor.maintenance_tick()
+
+    assert process.close_calls == 1
+    assert supervisor._terminating_handles == {}
+
+
+def test_supervisor_startup_cleanup_preserves_primary_error_when_close_fails(
+    tmp_path, monkeypatch,
+):
+    owner = _Owner("ok1_startup_close_failure", tmp_path / "owner")
+    process = _FakeProcess()
+
+    def close():
+        process.close_calls += 1
+        raise OSError("pidfd close failed")
+
+    process.close = close
+
+    def fake_process_factory(*args, **_kwargs):
+        argv = args[0]
+        Path(argv[argv.index("--socket") + 1]).touch()
+        process.returncode = 1
+        return process
+
+    supervisor = OwnerWorkerSupervisor(
+        control_home=tmp_path / "control",
+        client_cls=_FakeClient,
+        process_factory=fake_process_factory,
+        startup_timeout=0.1,
+        startup_cooldown=0,
+    )
+
+    with pytest.raises(OwnerWorkerStartupError, match="exited during startup"):
+        supervisor.get_or_start(owner)
+
+    assert process.close_calls == 1
+    assert supervisor._handles == {}
+    assert supervisor._terminating_handles == {}
+    assert supervisor._starting_owner_keys == set()
+    assert supervisor.authority_store.read_worker_generation(
+        owner.owner_key, 1
+    ).state is WorkerGenerationState.FAILED
+
+
+def test_supervisor_keyboard_interrupt_after_spawn_cleans_process_and_fence(
+    tmp_path,
+):
+    owner = _Owner("ok1_keyboard_interrupt", tmp_path / "owner")
+    process = _FakeProcess()
+
+    class _InterruptClient(_FakeClient):
+        def verify_health(self, **_kwargs):
+            raise KeyboardInterrupt("operator interrupt")
+
+    def fake_process_factory(*args, **_kwargs):
+        argv = args[0]
+        Path(argv[argv.index("--socket") + 1]).touch()
+        return process
+
+    supervisor = OwnerWorkerSupervisor(
+        control_home=tmp_path / "control",
+        client_cls=_InterruptClient,
+        process_factory=fake_process_factory,
+        startup_timeout=0.1,
+        startup_cooldown=0,
+    )
+
+    with pytest.raises(KeyboardInterrupt, match="operator interrupt"):
+        supervisor.get_or_start(owner)
+
+    assert process.close_calls == 1
+    assert supervisor._handles == {}
+    assert supervisor._terminating_handles == {}
+    assert supervisor.authority_store.read_owner_worker_lease(
+        owner.owner_key
+    ).state is WorkerLeaseState.REVOKED
+    assert supervisor.authority_store.read_worker_generation(
+        owner.owner_key,
+        1,
+    ).state is WorkerGenerationState.FAILED
+
+
+def test_supervisor_startup_cleanup_interrupt_does_not_replace_primary_error(
+    tmp_path, monkeypatch,
+):
+    owner = _Owner("ok1_cleanup_interrupt", tmp_path / "owner")
+    process = _FakeProcess()
+    real_stop = OwnerWorkerSupervisor._stop_process
+    stop_calls = 0
+
+    def interrupt_stop(candidate):
+        nonlocal stop_calls
+        stop_calls += 1
+        if stop_calls == 1:
+            raise KeyboardInterrupt("cleanup interrupted")
+        return real_stop(candidate)
+
+    def fake_process_factory(*args, **_kwargs):
+        argv = args[0]
+        socket_path = Path(argv[argv.index("--socket") + 1])
+        socket_path.parent.mkdir(parents=True, exist_ok=True)
+        socket_path.touch()
+        return process
+
+    supervisor = OwnerWorkerSupervisor(
+        control_home=tmp_path / "control",
+        client_cls=_FakeClient,
+        process_factory=fake_process_factory,
+        startup_timeout=0.1,
+        startup_cooldown=0,
+    )
+    monkeypatch.setattr(supervisor, "_stop_process", interrupt_stop)
+    monkeypatch.setattr(os, "fchmod", lambda *_args, **_kwargs: None, raising=False)
+    monkeypatch.setattr(
+        supervisor,
+        "_controlled_roots_for",
+        lambda _paths: type(
+            "_Roots",
+            (),
+            {
+                "mkdirs": lambda *_args, **_kwargs: None,
+                "open_relative": lambda *_args, **_kwargs: os.open(
+                    owner.owner_home / "workspaces" / "default-placeholder",
+                    os.O_CREAT | os.O_RDWR,
+                    0o600,
+                ),
+                "open_append_file": lambda *_args, **_kwargs: os.open(
+                    owner.owner_home / "runtime" / "logs" / "owner-worker.log",
+                    os.O_CREAT | os.O_APPEND | os.O_WRONLY,
+                    0o600,
+                ),
+                "close": lambda *_args, **_kwargs: None,
+            },
+        )(),
+    )
+    monkeypatch.setattr(
+        supervisor,
+        "_wait_until_healthy",
+        lambda **_kwargs: (_ for _ in ()).throw(ValueError("health failed")),
+    )
+    monkeypatch.setattr(
+        supervisor,
+        "_cleanup_generation_runtime",
+        lambda *_args, **_kwargs: None,
+    )
+
+    with pytest.raises(OwnerWorkerStartupError, match="startup failed") as failure:
+        supervisor.get_or_start(owner)
+
+    assert isinstance(failure.value.__cause__, ValueError)
+    assert process.close_calls == 0
+    assert supervisor._terminating_handles[owner.owner_key].process is process
+
+    supervisor.maintenance_tick()
+
+    assert stop_calls == 2
+    assert process.close_calls == 1
+    assert supervisor._terminating_handles == {}
 
 
 def test_supervisor_process_launch_failure_reclaims_generation_runtime(tmp_path):
@@ -2228,20 +3281,23 @@ def test_supervisor_relay_activation_failure_revokes_active_worker(tmp_path, mon
 
     assert supervisor._handles == {}
     assert process.returncode is not None
+    assert process.close_calls == 1
     assert not supervisor.socket_path_for(owner, 1).parent.exists()
     assert supervisor.authority_store.read_owner_worker_lease(owner.owner_key).state is WorkerLeaseState.REVOKED
     assert supervisor.authority_store.read_worker_generation(owner.owner_key, 1).state is WorkerGenerationState.FAILED
 
 
-def test_supervisor_startup_exit_is_typed_and_releases_the_fence(tmp_path):
+def test_supervisor_startup_exit_is_typed_and_releases_the_fence(
+    tmp_path, monkeypatch,
+):
     owner = _Owner("ok1_startup_exit", tmp_path / "owner")
+    process = _FakeProcess()
+    process.returncode = 1
 
     def fake_process_factory(*args, **kwargs):
         del kwargs
         argv = args[0]
         Path(argv[argv.index("--socket") + 1]).touch()
-        process = _FakeProcess()
-        process.returncode = 1
         return process
 
     supervisor = OwnerWorkerSupervisor(
@@ -2256,6 +3312,7 @@ def test_supervisor_startup_exit_is_typed_and_releases_the_fence(tmp_path):
         supervisor.get_or_start(owner)
 
     assert supervisor._handles == {}
+    assert process.close_calls == 1
     assert not supervisor.socket_path_for(owner, 1).parent.exists()
     assert supervisor._starting_owner_keys == set()
     assert supervisor._in_flight_starts == 0
@@ -2371,6 +3428,48 @@ def test_supervisor_evicts_only_idle_workers(tmp_path):
     assert not active.process.terminated
     assert idle.process.terminated
     lease.release()
+
+
+def _open_pidfd_count() -> int:
+    count = 0
+    for entry in Path("/proc/self/fd").iterdir():
+        try:
+            if os.readlink(entry) == "anon_inode:[pidfd]":
+                count += 1
+        except OSError:
+            pass
+    return count
+
+
+@pytest.mark.skipif(
+    not sys.platform.startswith("linux") or not Path("/proc/self/fd").is_dir(),
+    reason="owner worker descriptor accounting requires Linux procfs",
+)
+def test_supervisor_real_generation_churn_does_not_leak_pidfds(tmp_path):
+    socket_root = Path("/tmp") / f"hfd{os.getpid():x}"
+    socket_root.mkdir(mode=0o700, exist_ok=True)
+    owner_home = ensure_owner_runtime_dirs(socket_root / "u")
+    owner = _Owner("ok1_fd_churn", owner_home)
+    supervisor = OwnerWorkerSupervisor(
+        control_home=socket_root / "c",
+        global_home=socket_root / "g",
+        startup_timeout=10,
+        startup_cooldown=0,
+    )
+
+    try:
+        baseline_pidfds = _open_pidfd_count()
+        for generation in range(1, 6):
+            handle = supervisor.get_or_start(owner)
+            assert handle.worker_generation == generation
+            supervisor._terminate_handle(owner.owner_key, handle)
+            assert _open_pidfd_count() <= baseline_pidfds
+    finally:
+        supervisor.shutdown()
+        if socket_root.exists():
+            import shutil
+
+            shutil.rmtree(socket_root)
 
 
 @pytest.mark.skipif(not sys.platform.startswith("linux"), reason="controlled roots require Linux")

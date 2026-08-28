@@ -103,7 +103,7 @@ scripts/run_tests.sh \
 
 以上只证明状态机、schema、admission、lease-bound broker、deadline/output bounds 和 cleanup contract，不能证明真实 kernel boundary。签核 `multi_user_resource_governance` 前必须在 production-equivalent delegated cgroup v2 host 附上：
 
-- `check-executor-cgroup-host.py --require-ready` 的去敏 JSON；
+- `check-executor-cgroup-host.py --expected-soft-nofile 65536 --expected-hard-nofile 1048576 --require-ready` 的去敏 JSON；
 - `smoke-executor-resources.py` 的 limit/event/cleanup JSON；
 - PowerPoint smoke 通过同一 `CgroupV2Manager` + `ToolExecutorSupervisor` 路径的 JSON；
 - owner A 达到并发与 CPU/内存/PID 边界时 owner B 小任务仍成功的 A/B 记录；

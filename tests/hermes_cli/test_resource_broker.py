@@ -79,6 +79,11 @@ def _identity(lease):
     )
 
 
+def _join_peer_thread(peer):
+    peer.thread.join(timeout=5)
+    assert not peer.thread.is_alive(), "resource broker peer thread did not stop"
+
+
 def test_private_resource_broker_round_trip_is_lease_bound_and_deidentified(tmp_path):
     store, starting = _starting_lease(tmp_path)
     manager = _Manager()
@@ -197,6 +202,85 @@ def test_resource_broker_generation_shutdown_is_idempotent_after_peer_disconnect
     with pytest.raises(ResourceBrokerError, match="unavailable"):
         client.reserve_executor(_identity(active), "invocation-b")
     broker.close()
+
+
+def test_resource_broker_retries_failed_reservation_cleanup_on_revoke(tmp_path):
+    store, starting = _starting_lease(tmp_path)
+    manager = _Manager()
+    broker = DeploymentResourceBroker(manager=manager, authority_store=store)
+    client = OwnerResourceBrokerClient(broker.register(starting))
+    active = _activate(store, starting)
+    broker.activate(active)
+    peer = broker._peers[broker._key(active)]
+    client.reserve_executor(_identity(active), "invocation-a")
+    scope = manager.admissions[-1][2]
+    cleanup_calls = 0
+    allow_cleanup = threading.Event()
+
+    def cleanup():
+        nonlocal cleanup_calls
+        cleanup_calls += 1
+        if not allow_cleanup.is_set():
+            raise OSError("scope cleanup failed")
+        scope.released = True
+
+    scope.cleanup = cleanup
+
+    with pytest.raises(OSError, match="scope cleanup failed"):
+        broker.revoke(active)
+    _join_peer_thread(peer)
+
+    assert cleanup_calls == 2
+    assert scope.released is False
+    assert broker._cleanup_peers == {broker._generation_key(active): peer}
+
+    allow_cleanup.set()
+    broker.revoke(active)
+
+    assert cleanup_calls == 3
+    assert scope.released is True
+    assert broker._cleanup_peers == {}
+    client.close()
+    broker.close()
+
+
+def test_resource_broker_close_retries_retained_failed_reservation_cleanup(tmp_path):
+    store, starting = _starting_lease(tmp_path)
+    manager = _Manager()
+    broker = DeploymentResourceBroker(manager=manager, authority_store=store)
+    client = OwnerResourceBrokerClient(broker.register(starting))
+    active = _activate(store, starting)
+    broker.activate(active)
+    peer = broker._peers[broker._key(active)]
+    client.reserve_executor(_identity(active), "invocation-a")
+    scope = manager.admissions[-1][2]
+    cleanup_calls = 0
+    allow_cleanup = threading.Event()
+
+    def cleanup():
+        nonlocal cleanup_calls
+        cleanup_calls += 1
+        if not allow_cleanup.is_set():
+            raise OSError("scope cleanup failed")
+        scope.released = True
+
+    scope.cleanup = cleanup
+
+    with pytest.raises(ResourceBrokerError, match="resource broker cleanup failed"):
+        broker.close()
+    _join_peer_thread(peer)
+
+    assert cleanup_calls == 2
+    assert scope.released is False
+    assert broker._cleanup_peers == {broker._generation_key(active): peer}
+
+    allow_cleanup.set()
+    broker.close()
+
+    assert cleanup_calls == 3
+    assert scope.released is True
+    assert broker._cleanup_peers == {}
+    client.close()
 
 
 def test_resource_broker_generation_shutdown_preserves_protocol_rejection(tmp_path):
