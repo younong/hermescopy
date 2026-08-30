@@ -19,6 +19,7 @@ from hermes_cli.deployment_inference import (
     DeploymentInferenceRoute,
     deployment_descriptor_from_environment,
     policy_from_control_plane_environment,
+    request_path_for_api_mode,
 )
 from hermes_cli.owner_worker.inference_relay import (
     DeploymentInferenceBroker,
@@ -113,6 +114,22 @@ def test_descriptor_rejects_incomplete_or_unsupported_worker_environment(monkeyp
         deployment_descriptor_from_environment()
 
 
+@pytest.mark.parametrize(
+    ("api_mode", "path"),
+    [
+        ("chat_completions", "/v1/chat/completions"),
+        ("anthropic_messages", "/v1/messages"),
+        ("codex_responses", "/v1/responses"),
+    ],
+)
+def test_supported_api_modes_map_to_exact_relay_paths(api_mode, path):
+    assert _policy(api_mode=api_mode).descriptor().api_mode == api_mode
+    assert request_path_for_api_mode(api_mode) == path
+
+    with pytest.raises(DeploymentInferencePolicyInvalid, match="unsupported"):
+        request_path_for_api_mode("bedrock_converse")
+
+
 def test_control_plane_factory_builds_compression_route_from_provider_models(monkeypatch):
     monkeypatch.setenv("HERMES_DEPLOYMENT_INFERENCE_PROVIDER", "custom:deployment")
     monkeypatch.setenv("HERMES_DEPLOYMENT_INFERENCE_MODEL", "gpt-safe")
@@ -137,6 +154,34 @@ def test_control_plane_factory_builds_compression_route_from_provider_models(mon
     assert [route.payload() for route in policy.route_descriptors()] == [
         {"provider": "custom:deployment", "model": "gpt-safe", "api_mode": "chat_completions"},
         {"provider": "custom:codex", "model": "gpt-5.6-luna", "api_mode": "chat_completions", "name": "codex"},
+    ]
+
+
+def test_control_plane_factory_builds_codex_responses_route(monkeypatch):
+    monkeypatch.setenv("HERMES_DEPLOYMENT_INFERENCE_PROVIDER", "custom:deployment")
+    monkeypatch.setenv("HERMES_DEPLOYMENT_INFERENCE_MODEL", "gpt-safe")
+    monkeypatch.setenv("HERMES_DEPLOYMENT_INFERENCE_API_MODE", "chat_completions")
+    monkeypatch.setenv(
+        "HERMES_DEPLOYMENT_INFERENCE_ALLOWED_MODELS",
+        "gpt-safe,gpt-5.6-sol",
+    )
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config_readonly",
+        lambda: {
+            "providers": {
+                "codex": {
+                    "api": "https://api.openai.com/v1",
+                    "models": {"gpt-5.6-sol": {}},
+                },
+            },
+        },
+    )
+
+    routes = policy_from_control_plane_environment().route_descriptors()
+
+    assert [route.payload() for route in routes] == [
+        {"provider": "custom:deployment", "model": "gpt-safe", "api_mode": "chat_completions"},
+        {"provider": "custom:codex", "model": "gpt-5.6-sol", "api_mode": "codex_responses", "name": "codex"},
     ]
 
 
@@ -239,6 +284,43 @@ def test_broker_requires_exact_provider_and_model_pair(tmp_path):
     }
     with pytest.raises(DeploymentInferenceRelayError, match="provider/model"):
         broker._request_parts(active, wrong_provider)
+
+
+def test_broker_rejects_responses_path_mismatch_before_credentials(tmp_path):
+    credential_resolutions = []
+
+    def resolve_runtime():
+        credential_resolutions.append(True)
+        return {
+            "provider": "custom:codex",
+            "api_mode": "codex_responses",
+            "base_url": "https://api.openai.com/v1",
+            "api_key": "control-plane-secret",
+        }
+
+    policy = DeploymentInferencePolicy(
+        provider="custom:codex",
+        model="gpt-5.6-sol",
+        api_mode="codex_responses",
+        runtime_resolver=resolve_runtime,
+    )
+    store = AuthorityStore(tmp_path / "control")
+    claim = store.claim_worker_start("ok1_owner", worker_id="worker-1")
+    active = store.transition_worker_lease(
+        claim.lease,
+        state=WorkerLeaseState.ACTIVE,
+        generation_state=WorkerGenerationState.ACTIVE,
+    )
+    broker = DeploymentInferenceBroker(policy=policy, authority_store=store)
+    request = _request_for_model("gpt-5.6-sol")
+    request["headers"] = {
+        "x-hermes-deployment-provider": "custom:codex",
+    }
+
+    with pytest.raises(DeploymentInferenceRelayError, match="API mode"):
+        broker._request_parts(active, request)
+
+    assert credential_resolutions == []
 
 
 def test_broker_rejects_requests_for_starting_or_revoked_worker(tmp_path):
@@ -1400,6 +1482,63 @@ def test_owner_relay_streams_sse_and_injects_control_plane_credential(tmp_path, 
             relay.close()
 
 
+def test_owner_relay_forwards_native_codex_responses_without_translation(tmp_path):
+    with _upstream_server() as (server, received):
+        policy = DeploymentInferencePolicy(
+            provider="custom:codex",
+            model="gpt-5.6-sol",
+            api_mode="codex_responses",
+            runtime_resolver=lambda: {
+                "provider": "custom:codex",
+                "api_mode": "codex_responses",
+                "base_url": f"http://127.0.0.1:{server.server_port}/v1",
+                "api_key": "control-plane-secret",
+            },
+        )
+        broker, active, relay = _activate_relay(
+            AuthorityStore(tmp_path / "control"),
+            policy,
+        )
+        request_body = json.dumps(
+            {
+                "model": "gpt-5.6-sol",
+                "instructions": "Be concise.",
+                "input": [{"role": "user", "content": "hello"}],
+                "stream": True,
+            },
+            separators=(",", ":"),
+        ).encode()
+        try:
+            with httpx.Client(timeout=5.0) as client:
+                with client.stream(
+                    "POST",
+                    f"{relay.base_url}/responses",
+                    headers={
+                        "Authorization": "Bearer worker-marker",
+                        "Content-Type": "application/json",
+                        "x-hermes-deployment-provider": "custom:codex",
+                    },
+                    content=request_body,
+                ) as response:
+                    assert response.status_code == 200
+                    assert response.headers["content-type"] == "text/event-stream"
+                    assert b"".join(response.iter_raw()) == b"data: first\n\ndata: second\n\n"
+
+            upstream = received[0]
+            upstream_headers = {
+                name.lower(): value
+                for name, value in upstream["headers"].items()
+            }
+            assert upstream["path"] == "/v1/responses"
+            assert upstream["body"] == request_body
+            assert upstream_headers["authorization"] == "Bearer control-plane-secret"
+            assert "x-hermes-deployment-provider" not in upstream_headers
+            assert "worker-marker" not in str(upstream_headers)
+        finally:
+            broker.revoke(active)
+            relay.close()
+
+
 @pytest.mark.parametrize(
     ("base_path", "expected_path"),
     [
@@ -1781,7 +1920,7 @@ def test_owner_relay_route_metadata_is_live_lease_fenced_and_secret_free(tmp_pat
             model="gpt-safe",
             api_mode="chat_completions",
             runtime_resolver=initial_policy.runtime_resolver,
-            allowed_models=("gpt-safe", "k3-256k"),
+            allowed_models=("gpt-safe", "k3-256k", "gpt-5.6-sol"),
             routes=(
                 DeploymentInferenceRoute(
                     provider="custom:kimi-code",
@@ -1796,6 +1935,18 @@ def test_owner_relay_route_metadata_is_live_lease_fenced_and_secret_free(tmp_pat
                         "api_key": "kimi-control-plane-secret",
                     },
                 ),
+                DeploymentInferenceRoute(
+                    provider="custom:codex",
+                    model="gpt-5.6-sol",
+                    api_mode="codex_responses",
+                    name="Codex",
+                    runtime_resolver=lambda: {
+                        "provider": "custom:codex",
+                        "api_mode": "codex_responses",
+                        "base_url": "https://api.openai.com/v1",
+                        "api_key": "codex-control-plane-secret",
+                    },
+                ),
             ),
         )
         updated = httpx.get(
@@ -1803,9 +1954,17 @@ def test_owner_relay_route_metadata_is_live_lease_fenced_and_secret_free(tmp_pat
             timeout=5,
         )
         assert updated.status_code == 200
-        assert [route["model"] for route in updated.json()] == ["gpt-safe", "k3-256k"]
+        assert [
+            (route["model"], route["api_mode"])
+            for route in updated.json()
+        ] == [
+            ("gpt-safe", "chat_completions"),
+            ("k3-256k", "anthropic_messages"),
+            ("gpt-5.6-sol", "codex_responses"),
+        ]
         assert "secret" not in updated.text
         assert "kimi.example.test" not in updated.text
+        assert "api.openai.com" not in updated.text
 
         store.transition_worker_lease(
             active,

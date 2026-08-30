@@ -12,7 +12,10 @@ def _deployment_env(monkeypatch) -> None:
     monkeypatch.setenv("HERMES_DEPLOYMENT_INFERENCE_MODEL", "gpt-safe")
     monkeypatch.setenv("HERMES_DEPLOYMENT_INFERENCE_API_MODE", "chat_completions")
     monkeypatch.setenv("HERMES_DEPLOYMENT_INFERENCE_POLICY_ID", "policy-v1")
-    monkeypatch.setenv("HERMES_DEPLOYMENT_INFERENCE_ALLOWED_MODELS", "gpt-safe,gpt-safe-mini")
+    monkeypatch.setenv(
+        "HERMES_DEPLOYMENT_INFERENCE_ALLOWED_MODELS",
+        "gpt-safe,gpt-safe-mini,gpt-5.6-sol",
+    )
     monkeypatch.setenv("HERMES_DEPLOYMENT_INFERENCE_RELAY_BASE_URL", "http://127.0.0.1:39123/v1")
     monkeypatch.setattr(
         "hermes_cli.deployment_inference.route_descriptors_from_control_plane",
@@ -27,6 +30,12 @@ def _deployment_env(monkeypatch) -> None:
                 model="gpt-safe-mini",
                 api_mode="anthropic_messages",
                 name="Kimi Code",
+            ),
+            DeploymentInferenceRouteDescriptor(
+                provider="custom:codex",
+                model="gpt-5.6-sol",
+                api_mode="codex_responses",
+                name="Codex",
             ),
         ),
     )
@@ -149,6 +158,26 @@ def test_blank_owner_selects_exact_secondary_deployment_route(monkeypatch):
     assert rp.resolve_deployment_inference_runtime(
         requested="custom:deployment",
         target_model="gpt-safe-mini",
+    ) is None
+
+
+def test_blank_owner_selects_exact_codex_responses_route(monkeypatch):
+    _deployment_env(monkeypatch)
+    monkeypatch.setattr(rp, "read_raw_config", lambda: {})
+
+    resolved = rp.resolve_deployment_inference_runtime(
+        requested="custom:codex",
+        target_model="gpt-5.6-sol",
+    )
+
+    assert resolved["provider"] == "custom:codex"
+    assert resolved["api_mode"] == "codex_responses"
+    assert resolved["api_key"] == "deployment-inference-relay"
+    assert resolved["model"] == "gpt-5.6-sol"
+    assert resolved["base_url"] == "http://127.0.0.1:39123/v1"
+    assert rp.resolve_deployment_inference_runtime(
+        requested="custom:deployment",
+        target_model="gpt-5.6-sol",
     ) is None
 
 

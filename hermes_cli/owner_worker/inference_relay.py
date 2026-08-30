@@ -44,7 +44,11 @@ _RELAY_DEADLINE_HEADER = "x-hermes-relay-deadline-seconds"
 _MAX_CONCURRENT_BROKER_REQUESTS = 8
 _MAX_CONCURRENT_WORKER_REQUESTS = 8
 _MAX_IN_FLIGHT_RESPONSE_FRAMES = 16
-_ALLOWED_PATHS = frozenset({"/v1/chat/completions", "/v1/messages"})
+_ALLOWED_PATHS = frozenset({
+    "/v1/chat/completions",
+    "/v1/messages",
+    "/v1/responses",
+})
 _PROVIDER_HEADER = "x-hermes-deployment-provider"
 _VERSION_SEGMENT_RE = re.compile(r"^v\d+(?:\.\d+)*$")
 _HOP_BY_HOP_HEADERS = frozenset({
