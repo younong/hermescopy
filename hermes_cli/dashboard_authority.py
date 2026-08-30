@@ -34,12 +34,14 @@ from hermes_cli.dashboard_auth.lifecycle import (
 )
 from hermes_cli.dashboard_auth.ws_tickets import (
     TicketInvalid,
+    inspect_ticket_keyring,
     load_ticket_keyring_for_recovery,
     write_ticket_keyring_for_recovery,
 )
 from hermes_cli.sqlite_util import (
     SQLITE_HEADER,
     SQLITE_SIDECAR_SUFFIXES,
+    copy_sqlite_forensics,
     sha256_file,
     write_txn,
 )
@@ -85,6 +87,13 @@ class AuthorityStatus:
     size: int | None
     preserved: bool | None
     recovery_guidance: str | None = None
+    authority_id: str | None = None
+    keyring_bound: bool | None = None
+    keyring_authority_id: str | None = None
+    keyring_recovery_generation: int | None = None
+    keyring_state: str | None = None
+    continuity_match: bool | None = None
+    continuity_reason: str | None = None
 
 
 def _validated_marker(store: AuthorityStore) -> dict[str, object] | None:
@@ -150,34 +159,80 @@ def authority_status(control_home: Path | None = None) -> AuthorityStatus:
                 str(key): (value, str(storage_type))
                 for key, value, storage_type in conn.execute(
                     "SELECT key, value, typeof(value) FROM authority_meta WHERE key IN "
-                    "('schema_version', 'recovery_generation', 'recovery_required')"
+                    "('schema_version', 'authority_id', 'recovery_generation', "
+                    "'recovery_required', 'keyring_bound')"
                 ).fetchall()
             }
             schema_value, schema_type = values["schema_version"]
+            authority_id_value, authority_id_type = values["authority_id"]
             generation_value, generation_type = values["recovery_generation"]
             recovery_value, recovery_type = values["recovery_required"]
+            bound_value, bound_type = values["keyring_bound"]
             if (
                 schema_type != "integer"
+                or authority_id_type != "text"
                 or generation_type != "integer"
                 or recovery_type != "integer"
+                or bound_type != "integer"
                 or isinstance(schema_value, bool)
                 or isinstance(generation_value, bool)
                 or isinstance(recovery_value, bool)
+                or isinstance(bound_value, bool)
                 or not isinstance(schema_value, int)
+                or not isinstance(authority_id_value, str)
                 or not isinstance(generation_value, int)
                 or not isinstance(recovery_value, int)
+                or not isinstance(bound_value, int)
+                or not authority_id_value
                 or schema_value < 1
                 or generation_value < 0
                 or recovery_value not in (0, 1)
+                or bound_value not in (0, 1)
             ):
                 raise ValueError("invalid authority metadata")
             schema = schema_value
+            authority_id = authority_id_value
             generation = generation_value
             recovery_required = recovery_value
+            keyring_bound = bound_value == 1
     except (sqlite3.Error, KeyError, TypeError, ValueError) as exc:
         raise AuthorityRecoveryError("authority status is unavailable") from exc
+    keyring_authority_id = None
+    keyring_generation = None
+    keyring_state = None
+    continuity_match = None
+    continuity_reason = None
+    if keyring_bound:
+        try:
+            keyring = inspect_ticket_keyring(home)
+            witness = keyring["replay_continuity"]
+            keyring_authority_id = witness.authority_id
+            keyring_generation = witness.recovery_generation
+            keyring_state = "ready" if witness.ready else "recovery_required"
+            continuity_match = (
+                witness.authority_id == authority_id
+                and witness.recovery_generation == generation
+                and witness.ready
+            )
+            if not continuity_match:
+                continuity_reason = (
+                    "authority_id_mismatch"
+                    if witness.authority_id != authority_id
+                    else "recovery_generation_mismatch"
+                )
+        except TicketInvalid:
+            keyring_state = "unavailable"
+            continuity_reason = "ticket_keyring_unavailable"
+            continuity_match = False
+    if recovery_required == 1:
+        state = "recovery_required"
+        continuity_reason = continuity_reason or "authority_recovery_required"
+    elif keyring_bound and not continuity_match:
+        state = "recovery_required"
+    else:
+        state = "healthy"
     return AuthorityStatus(
-        "recovery_required" if recovery_required == 1 else "healthy",
+        state,
         schema,
         generation,
         None,
@@ -185,7 +240,14 @@ def authority_status(control_home: Path | None = None) -> AuthorityStatus:
         sha256_file(store.path),
         store.path.stat().st_size,
         None,
-        _RECOVERY_GUIDANCE if recovery_required == 1 else None,
+        _RECOVERY_GUIDANCE if state == "recovery_required" else None,
+        authority_id,
+        keyring_bound,
+        keyring_authority_id,
+        keyring_generation,
+        keyring_state,
+        continuity_match,
+        continuity_reason,
     )
 
 
@@ -368,6 +430,144 @@ def _fsync_directory(path: Path) -> None:
         os.close(descriptor)
 
 
+def _preserve_keyring_forensics(path: Path, incident_id: str) -> Path:
+    try:
+        status = path.lstat()
+    except OSError as exc:
+        raise AuthorityRecoveryError("ticket keyring is unavailable") from exc
+    if stat.S_ISLNK(status.st_mode) or not stat.S_ISREG(status.st_mode):
+        raise AuthorityRecoveryError("ticket keyring must be a regular file")
+    try:
+        digest = sha256_file(path)
+    except OSError as exc:
+        raise AuthorityRecoveryError("ticket keyring is unavailable") from exc
+    backup = path.with_name(f"{path.name}.continuity.{incident_id}.{digest[:16]}.bak")
+    if not backup.exists():
+        try:
+            _copy_regular_file(path, backup)
+        except (OSError, ValueError) as exc:
+            raise AuthorityRecoveryError("ticket keyring evidence preservation failed") from exc
+    _fsync_directory(path.parent)
+    return backup
+
+
+def recover_continuity(
+    *, incident_id: str, control_home: Path | None = None
+) -> AuthorityStatus:
+    """Recover a metadata-only replay-continuity quarantine offline."""
+    home = Path(control_home) if control_home is not None else control_plane_home()
+    incident = str(incident_id).lower()
+    if (
+        len(incident) != 16
+        or any(ch not in "0123456789abcdef" for ch in incident)
+    ):
+        raise AuthorityRecoveryError("continuity incident ID is invalid")
+    store = AuthorityStore(home)
+    marker = _validated_marker(store)
+    if marker is not None:
+        raise AuthorityRecoveryError(
+            "corruption marker requires the digest-pinned authority recover command"
+        )
+    current = authority_status(home)
+    if current.state != "recovery_required" or not current.keyring_bound:
+        raise AuthorityRecoveryError("authority continuity recovery is not required")
+    digest = sha256_file(store.path)
+    store._audit_recovery_event(  # noqa: SLF001 - explicit operator lifecycle
+        AuthorityAuditEvent.RECOVERY_STARTED,
+        AuthorityAuditReason.RECOVERY_STARTED,
+        digest=digest,
+    )
+    try:
+        with authority_lifecycle_lock(home, exclusive=True):
+            if copy_sqlite_forensics(store.path) is None:
+                raise AuthorityRecoveryError("authority evidence preservation failed")
+            keyring_path = home / "browser_ws_ticket_keyring.json"
+            _preserve_keyring_forensics(keyring_path, incident)
+            keyring = inspect_ticket_keyring(home)
+            witness = keyring["replay_continuity"]
+            candidate_fd, candidate_name = tempfile.mkstemp(
+                prefix=".authority-continuity-source.", dir=home
+            )
+            os.close(candidate_fd)
+            Path(candidate_name).unlink()
+            rebuilt_fd, rebuilt_name = tempfile.mkstemp(
+                prefix=".authority-continuity-built.", dir=home
+            )
+            os.close(rebuilt_fd)
+            Path(rebuilt_name).unlink()
+            candidate = Path(candidate_name)
+            rebuilt = Path(rebuilt_name)
+            try:
+                _copy_candidate_source(store.path, candidate)
+                if sha256_file(candidate) != digest:
+                    raise AuthorityRecoveryError("authority changed while being copied")
+                _validate_candidate(candidate)
+                _sqlite_rebuild(candidate, rebuilt)
+                fenced = _fence_candidate(
+                    rebuilt,
+                    keyring_authority_id=witness.authority_id,
+                    keyring_generation=witness.recovery_generation,
+                )
+                _validate_candidate(rebuilt)
+                live_stat = store.path.stat()
+                if os.name != "nt":
+                    os.chown(rebuilt, live_stat.st_uid, live_stat.st_gid)
+                os.chmod(rebuilt, stat.S_IMODE(live_stat.st_mode))
+                for suffix in SQLITE_SIDECAR_SUFFIXES:
+                    try:
+                        store.path.with_name(store.path.name + suffix).unlink()
+                    except FileNotFoundError:
+                        pass
+                _fsync_directory(home)
+                os.replace(rebuilt, store.path)
+                _fsync_directory(home)
+
+                recovered = ReplayContinuity(fenced.authority_id, fenced.recovery_generation, True)
+                keyring["replay_continuity"] = recovered
+                write_ticket_keyring_for_recovery(keyring, control_home=home)
+                with sqlite3.connect(store.path, timeout=5, isolation_level=None) as conn:
+                    with write_txn(conn):
+                        conn.execute(
+                            "UPDATE authority_meta SET value=0 "
+                            "WHERE key='recovery_required'"
+                        )
+                _validate_candidate(store.path)
+                _fsync_directory(home)
+            finally:
+                for path in (candidate, rebuilt):
+                    for suffix in ("", *SQLITE_SIDECAR_SUFFIXES):
+                        try:
+                            path.with_name(path.name + suffix).unlink()
+                        except FileNotFoundError:
+                            pass
+    except (
+        AuthorityLifecycleLockError,
+        AuthorityRecoveryError,
+        AuthorityUnavailable,
+        TicketInvalid,
+        OSError,
+        sqlite3.Error,
+    ) as exc:
+        store._audit_recovery_event(  # noqa: SLF001 - explicit operator lifecycle
+            AuthorityAuditEvent.RECOVERY_FAILED,
+            AuthorityAuditReason.RECOVERY_FAILED,
+            digest=digest,
+        )
+        if isinstance(exc, AuthorityRecoveryError):
+            raise
+        if isinstance(exc, AuthorityLifecycleLockError):
+            raise AuthorityRecoveryError(str(exc)) from exc
+        raise AuthorityRecoveryError(
+            "authority continuity recovery failed; recovery remains required"
+        ) from exc
+    store._audit_recovery_event(  # noqa: SLF001 - explicit operator lifecycle
+        AuthorityAuditEvent.RECOVERY_COMPLETED,
+        AuthorityAuditReason.RECOVERY_COMPLETED,
+        digest=digest,
+    )
+    return authority_status(home)
+
+
 def recover_authority(
     *,
     incident_id: str,
@@ -517,6 +717,8 @@ def cmd_dashboard_authority(args) -> None:
                 expected_sha256=args.sha256,
                 repair_tls_offset_5=bool(args.repair_tls_offset_5),
             )
+        elif args.dashboard_authority_action == "recover-continuity":
+            status = recover_continuity(incident_id=args.incident)
         else:  # pragma: no cover - argparse requires an action
             raise AuthorityRecoveryError("authority action is required")
     except (AuthorityRecoveryError, AuthorityUnavailable) as exc:
@@ -529,3 +731,8 @@ def cmd_dashboard_authority(args) -> None:
         for key, value in payload.items():
             if value is not None:
                 print(f"{key}: {str(value).lower() if isinstance(value, bool) else value}")
+    if args.dashboard_authority_action == "status" and status.state not in {
+        "healthy",
+        "uninitialized",
+    }:
+        raise SystemExit(1)

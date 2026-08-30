@@ -77,8 +77,9 @@ def _b64url_decode(value: str) -> bytes:
     return base64.urlsafe_b64decode(value + "=" * (-len(value) % 4))
 
 
-def _keyring_path() -> Path:
-    return control_plane_home() / _KEYRING_NAME
+def _keyring_path(control_home: Path | None = None) -> Path:
+    home = Path(control_home) if control_home is not None else control_plane_home()
+    return home / _KEYRING_NAME
 
 
 def browser_ticket_keyring_backup_paths() -> tuple[Path, ...]:
@@ -171,8 +172,10 @@ def _serializable_keyring(keyring: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
-def _write_keyring(payload: Mapping[str, Any]) -> None:
-    path = _keyring_path()
+def _write_keyring(
+    payload: Mapping[str, Any], *, keyring_path: Path | None = None
+) -> None:
+    path = keyring_path or _keyring_path()
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         parent = path.parent.lstat()
@@ -197,6 +200,11 @@ def _write_keyring(payload: Mapping[str, Any]) -> None:
             os.replace(temporary, path)
             if os.name != "nt":
                 path.chmod(stat.S_IRUSR | stat.S_IWUSR)
+                directory_fd = os.open(path.parent, os.O_RDONLY)
+                try:
+                    os.fsync(directory_fd)
+                finally:
+                    os.close(directory_fd)
         finally:
             try:
                 temporary.unlink()
@@ -222,6 +230,31 @@ def _new_keyring(witness: ReplayContinuity) -> dict[str, Any]:
     }
 
 
+def _read_keyring(path: Path) -> dict[str, Any]:
+    try:
+        status = path.lstat()
+    except FileNotFoundError as exc:
+        raise TicketInvalid("ticket_keyring_unavailable") from exc
+    except OSError as exc:
+        raise TicketInvalid("ticket_keyring_unavailable") from exc
+    if stat.S_ISLNK(status.st_mode) or not stat.S_ISREG(status.st_mode):
+        raise TicketInvalid("ticket_keyring_unavailable")
+    if os.name != "nt" and status.st_mode & (stat.S_IRWXG | stat.S_IRWXO):
+        raise TicketInvalid("ticket_keyring_unavailable")
+    try:
+        return _parse_keyring(json.loads(path.read_text(encoding="utf-8")))
+    except TicketInvalid:
+        raise
+    except (OSError, json.JSONDecodeError) as exc:
+        raise TicketInvalid("ticket_keyring_unavailable") from exc
+
+
+def inspect_ticket_keyring(control_home: Path | None = None) -> dict[str, Any]:
+    """Read and validate keyring metadata without changing authority state."""
+    with _keyring_lock:
+        return _read_keyring(_keyring_path(control_home))
+
+
 def _mark_continuity_untrusted(store: AuthorityStore) -> None:
     try:
         store.mark_replay_continuity_untrusted(reason="ticket_keyring_failure")
@@ -234,14 +267,15 @@ def _load_keyring(
     *,
     create: bool = True,
     require_continuity: bool = True,
+    keyring_path: Path | None = None,
 ) -> dict[str, Any]:
     # Same-process callers can race initial bootstrap (notably the existing
     # thread-safety unit contract); serialize creation so only one writes the
     # witness and every other caller validates the completed file.
     with _keyring_lock:
-        path = _keyring_path()
+        path = keyring_path or _keyring_path()
         try:
-            status = path.lstat()
+            path.lstat()
         except FileNotFoundError:
             if not create:
                 raise TicketInvalid("ticket_keyring_unavailable")
@@ -256,37 +290,40 @@ def _load_keyring(
                 continuity.recovery_generation,
                 True,
             ))
-            _write_keyring(payload)
+            _write_keyring(payload, keyring_path=path)
             parsed = _parse_keyring(_serializable_keyring(payload))
             store.bind_replay_continuity(parsed["replay_continuity"])
             return parsed
         except OSError as exc:
             raise TicketInvalid("ticket_keyring_unavailable") from exc
-        if stat.S_ISLNK(status.st_mode) or not stat.S_ISREG(status.st_mode):
-            raise TicketInvalid("ticket_keyring_unavailable")
-        if os.name != "nt" and status.st_mode & (stat.S_IRWXG | stat.S_IRWXO):
-            raise TicketInvalid("ticket_keyring_unavailable")
         try:
-            parsed = _parse_keyring(json.loads(path.read_text(encoding="utf-8")))
+            parsed = _read_keyring(path)
             if require_continuity:
                 store.assert_replay_continuity(parsed["replay_continuity"])
-            return parsed
         except TicketInvalid:
             _mark_continuity_untrusted(store)
             raise
-        except (AuthorityUnavailable, OSError, json.JSONDecodeError) as exc:
+        except AuthorityUnavailable as exc:
             _mark_continuity_untrusted(store)
             raise TicketInvalid("replay_continuity_unavailable") from exc
+        return parsed
 
 
 def load_ticket_keyring_for_recovery(store: AuthorityStore) -> dict[str, Any]:
     """Load signer state without enforcing the quarantined DB witness."""
-    return _load_keyring(store, create=False, require_continuity=False)
+    return _load_keyring(
+        store,
+        create=False,
+        require_continuity=False,
+        keyring_path=_keyring_path(store.control_home),
+    )
 
 
-def write_ticket_keyring_for_recovery(payload: Mapping[str, Any]) -> None:
+def write_ticket_keyring_for_recovery(
+    payload: Mapping[str, Any], *, control_home: Path | None = None
+) -> None:
     """Durably publish signer state prepared by the offline recovery command."""
-    _write_keyring(payload)
+    _write_keyring(payload, keyring_path=_keyring_path(control_home))
 
 
 def _ticket_keyring(store: AuthorityStore | None = None) -> tuple[AuthorityStore, dict[str, Any]]:

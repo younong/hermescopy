@@ -27,6 +27,7 @@ from hermes_cli.dashboard_authority import (
     authority_status,
     preserve_authority,
     recover_authority,
+    recover_continuity,
 )
 from hermes_cli.sqlite_util import sha256_file
 
@@ -198,7 +199,7 @@ def test_status_cli_serializes_json_and_text_from_isolated_home(tmp_path):
         env=env,
     )
 
-    assert json_result.returncode == 0, json_result.stderr
+    assert json_result.returncode == 1, json_result.stderr
     payload = json.loads(json_result.stdout)
     assert payload["state"] == "recovery_required"
     assert payload["schema_version"] == AUTHORITY_SCHEMA_VERSION
@@ -206,9 +207,87 @@ def test_status_cli_serializes_json_and_text_from_isolated_home(tmp_path):
     assert payload["sha256"] == sha256_file(store.path)
     assert payload["size"] == store.path.stat().st_size
     assert payload["recovery_guidance"] == _RECOVERY_GUIDANCE
-    assert text_result.returncode == 0, text_result.stderr
+    assert text_result.returncode == 1, text_result.stderr
     assert "state: recovery_required" in text_result.stdout
     assert f"recovery_guidance: {_RECOVERY_GUIDANCE}" in text_result.stdout
+
+
+def test_status_reports_bound_keyring_mismatch_without_mutating_db(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    control_home = tmp_path / "control-plane"
+    store = AuthorityStore(control_home)
+    store.activate(_scope())
+    ws_tickets.mint_ticket(user_id="user", provider="stub", store=store)
+    with sqlite3.connect(store.path) as conn:
+        conn.execute("UPDATE authority_meta SET value=1 WHERE key='recovery_generation'")
+        conn.execute("UPDATE authority_meta SET value=1 WHERE key='recovery_required'")
+
+    status = authority_status(control_home)
+
+    assert status.state == "recovery_required"
+    assert status.keyring_bound is True
+    assert status.keyring_recovery_generation == 0
+    assert status.recovery_generation == 1
+    assert status.continuity_match is False
+    assert status.continuity_reason == "recovery_generation_mismatch"
+
+
+def test_status_reports_missing_bound_keyring_without_mutating_db(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    control_home = tmp_path / "control-plane"
+    store = AuthorityStore(control_home)
+    store.activate(_scope())
+    ws_tickets.mint_ticket(user_id="user", provider="stub", store=store)
+    keyring_path = control_home / "browser_ws_ticket_keyring.json"
+    keyring_path.unlink()
+
+    status = authority_status(control_home)
+
+    assert status.state == "recovery_required"
+    assert status.keyring_bound is True
+    assert status.keyring_state == "unavailable"
+    assert status.continuity_reason == "ticket_keyring_unavailable"
+    assert store.replay_continuity().recovery_generation == 0
+
+
+def test_recover_continuity_fences_old_authority_without_marker(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    control_home = tmp_path / "control-plane"
+    store = AuthorityStore(control_home)
+    store.activate(_scope())
+    old_ticket = ws_tickets.mint_ticket(user_id="user", provider="stub", store=store)
+    with sqlite3.connect(store.path) as conn:
+        conn.execute("UPDATE authority_meta SET value=1 WHERE key='recovery_generation'")
+        conn.execute("UPDATE authority_meta SET value=1 WHERE key='recovery_required'")
+
+    result = recover_continuity(incident_id="a" * 16, control_home=control_home)
+
+    assert result.state == "healthy"
+    assert result.recovery_generation == 2
+    assert result.continuity_match is True
+    assert result.keyring_recovery_generation == 2
+    assert not store.recovery_marker_path.exists()
+    assert list(control_home.glob("browser_ws_ticket_keyring.json.continuity.*.bak"))
+    with sqlite3.connect(store.path) as conn:
+        assert conn.execute("PRAGMA integrity_check").fetchone() == ("ok",)
+        assert conn.execute("SELECT COUNT(*) FROM authorization_scopes WHERE revoked=0").fetchone() == (0,)
+        assert conn.execute("SELECT COUNT(*) FROM consumed_credentials").fetchone() == (0,)
+        assert conn.execute("SELECT value FROM authority_meta WHERE key='recovery_required'").fetchone() == (0,)
+    with pytest.raises(ws_tickets.TicketInvalid):
+        ws_tickets.consume_ticket(old_ticket, store=store)
+
+
+def test_recover_continuity_refuses_marker_backed_recovery(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    control_home = tmp_path / "control-plane"
+    store = AuthorityStore(control_home)
+    store.activate(_scope())
+    _corrupt_tls_header(store.path)
+    with pytest.raises(AuthorityCorrupt):
+        raise store._quarantine_corruption("integrity_check returned 'file is not a database'")
+
+    with pytest.raises(AuthorityRecoveryError, match="corruption marker"):
+        recover_continuity(incident_id="a" * 16, control_home=control_home)
 
 
 def test_recovery_requires_matching_incident_digest_and_offline_lock(tmp_path, monkeypatch):
