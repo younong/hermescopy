@@ -88,7 +88,38 @@ def test_group_membership_sequences_and_owner_scope(db):
             operation()
 
 
-def test_group_create_idempotency_replays_exact_request_and_rolls_back_provisioning(db):
+def test_unarchive_group_restores_writes_without_replaying_archived_work(db):
+    first = CollaborationStore(db, owner_key="owner-a")
+    second = CollaborationStore(db, owner_key="owner-b")
+    group = first.create_group("Restore", members=[_member("employee-a")])
+    first.archive_group(group.group_id)
+    archived = first.get_group(group.group_id)
+
+    restored, changed = first.unarchive_group(group.group_id)
+
+    assert changed is True
+    assert restored.status == "active"
+    assert restored.archived_at is None
+    assert restored.last_sequence == archived.last_sequence + 1
+    assert [item.group_id for item in first.list_groups()] == [group.group_id]
+    with db._lock:
+        event = db._conn.execute(
+            "SELECT event_kind, actor_kind, body_json, sequence "
+            "FROM collaboration_events WHERE group_id=? ORDER BY sequence DESC LIMIT 1",
+            (group.group_id,),
+        ).fetchone()
+    assert tuple(event) == ("group.unarchived", "owner", "{}", restored.last_sequence)
+
+    replay, replay_changed = first.unarchive_group(group.group_id)
+    assert replay_changed is False
+    assert replay == restored
+    assert first.get_group(group.group_id).last_sequence == restored.last_sequence
+    with pytest.raises(RuntimeError, match="unavailable"):
+        second.unarchive_group(group.group_id)
+
+    submitted = first.submit_owner_message(group.group_id, text="New message")
+    assert submitted.event.sequence == restored.last_sequence + 1
+
     store = CollaborationStore(db, owner_key="owner-a")
     request = {
         "name": "Idempotent",

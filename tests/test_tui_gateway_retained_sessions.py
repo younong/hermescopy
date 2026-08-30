@@ -3439,6 +3439,13 @@ def test_dashboard_owner_attach_allows_collaboration_without_chat_session(
             {},
         ),
         (
+            "collaboration.group.unarchive",
+            {"group_id": "group-a"},
+            "unarchive_group",
+            ("group-a",),
+            {},
+        ),
+        (
             "collaboration.members.update",
             {"group_id": "group-a", "employee_ids": ["employee-a"]},
             "update_members",
@@ -3529,6 +3536,7 @@ def test_collaboration_mutation_uses_dashboard_owner_authorization(owner_gateway
             {"name": "Group", "employee_ids": [], "client_idempotency_key": "create-a"},
         ),
         ("collaboration.group.archive", {"group_id": "group-a"}),
+        ("collaboration.group.unarchive", {"group_id": "group-a"}),
         ("collaboration.members.update", {"group_id": "group-a", "employee_ids": []}),
     ],
 )

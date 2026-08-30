@@ -206,6 +206,7 @@ export interface GuiChatTranslations {
     deny: string;
     refreshGroup: string;
     archiveGroup: string;
+    unarchiveGroup: string;
     groupMessage: string;
     messageGroup: string;
     chooseMentions: string;

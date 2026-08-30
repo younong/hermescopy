@@ -734,6 +734,7 @@ export const zh: Translations = {
       deny: "拒绝",
       refreshGroup: "刷新群组",
       archiveGroup: "归档群组",
+      unarchiveGroup: "解除归档群组",
       groupMessage: "群组消息",
       messageGroup: "给群组发消息…",
       chooseMentions: "选择要提及的员工",

@@ -310,6 +310,7 @@ _DASHBOARD_MUTATION_METHODS = frozenset(
         "collaboration.file.attach",
         "collaboration.group.archive",
         "collaboration.group.create",
+        "collaboration.group.unarchive",
         "collaboration.image.attach",
         "collaboration.members.update",
         "collaboration.message.submit",
@@ -7120,6 +7121,15 @@ def _collaboration_group_archive(rid, params: dict) -> dict:
         return _err(rid, -32602, "collaboration group archive params are invalid")
     return _collaboration_call(
         rid, lambda service: service.archive_group(str(params.get("group_id") or ""))
+    )
+
+
+@method("collaboration.group.unarchive")
+def _collaboration_group_unarchive(rid, params: dict) -> dict:
+    if set(params) != {"group_id"}:
+        return _err(rid, -32602, "collaboration group unarchive params are invalid")
+    return _collaboration_call(
+        rid, lambda service: service.unarchive_group(str(params.get("group_id") or ""))
     )
 
 

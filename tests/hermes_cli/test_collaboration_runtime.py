@@ -1642,7 +1642,39 @@ def test_service_archive_best_effort_interrupts_live_sessions(db):
     assert interrupted == [membership.hidden_session_id]
 
 
-def test_stale_completion_fence_cannot_append_employee_event(db):
+def test_service_unarchive_emits_group_change_without_resuming_scheduler(db):
+    events = []
+    service = CollaborationService(
+        db,
+        owner_key="owner-a",
+        resolver=_Resolver(),
+        emit=lambda *args: events.append(args),
+        ensure_member_session=lambda **_kwargs: None,
+    )
+    created = service.create_group(
+        name="Restore",
+        employee_ids=["employee-a"],
+        client_idempotency_key="unarchive-service",
+    )
+    service.archive_group(created["group"]["group_id"])
+    events.clear()
+    service.bind_scheduler(
+        SimpleNamespace(
+            interrupt_session=lambda _hidden_id: pytest.fail("unarchive interrupted a session"),
+            wake=lambda: pytest.fail("unarchive woke the scheduler"),
+        )
+    )
+
+    restored = service.unarchive_group(created["group"]["group_id"])
+
+    assert restored["group"]["status"] == "active"
+    assert restored["group"]["archived_at"] is None
+    assert events == [("collaboration.group.changed", restored["group"])]
+    events.clear()
+    replay = service.unarchive_group(created["group"]["group_id"])
+    assert replay == restored
+    assert events == []
+
     store = CollaborationStore(db, owner_key="owner-a")
     group = store.create_group(
         "Fenced",

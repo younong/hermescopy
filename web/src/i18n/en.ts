@@ -797,6 +797,7 @@ export const en: Translations = {
       deny: "Deny",
       refreshGroup: "Refresh group",
       archiveGroup: "Archive group",
+      unarchiveGroup: "Unarchive group",
       groupMessage: "Group message",
       messageGroup: "Message the group…",
       chooseMentions: "Choose employee mentions",
