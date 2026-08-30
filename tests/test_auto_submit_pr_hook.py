@@ -126,8 +126,7 @@ def test_missing_plan_in_primary_checkout_is_passive(tmp_path):
 
     result = module.process({"session_id": session_id, "cwd": str(repo)}, env)
 
-    assert "decision" not in result
-    assert "没有已批准的开发计划" in result["systemMessage"]
+    assert result == {}
     assert module.workflow.stop_retry_path(repo, session_id, env).exists() is False
 
 
