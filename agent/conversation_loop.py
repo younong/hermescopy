@@ -699,6 +699,19 @@ def _request_messages_for_observers(payload: dict, *, fallback: list) -> list:
     return messages if isinstance(messages, list) else fallback
 
 
+def _advertised_function_name(tool: Any) -> Optional[str]:
+    """Return a function tool's name across supported provider schemas."""
+    if not isinstance(tool, dict) or tool.get("type") != "function":
+        return None
+
+    function = tool.get("function")
+    if isinstance(function, dict) and isinstance(function.get("name"), str):
+        return function["name"]
+
+    name = tool.get("name")
+    return name if isinstance(name, str) else None
+
+
 def _prepare_provider_request(
     agent,
     api_messages: list,
@@ -4549,8 +4562,7 @@ def run_conversation(
                 if isinstance(advertised_tools, dict):
                     advertised_tools = advertised_tools.get("tools")
                 if any(
-                    isinstance(tool, dict)
-                    and (tool.get("function") or {}).get("name") in BRIDGE_TOOL_NAMES
+                    _advertised_function_name(tool) in BRIDGE_TOOL_NAMES
                     for tool in (advertised_tools or [])
                 ):
                     request_tool_names.update(BRIDGE_TOOL_NAMES)

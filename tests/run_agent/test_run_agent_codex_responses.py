@@ -91,15 +91,15 @@ def _codex_message_response(text: str):
     )
 
 
-def _codex_tool_call_response():
+def _codex_tool_call_response(*, name="terminal", arguments="{}"):
     return SimpleNamespace(
         output=[
             SimpleNamespace(
                 type="function_call",
                 id="fc_1",
                 call_id="call_1",
-                name="terminal",
-                arguments="{}",
+                name=name,
+                arguments=arguments,
             )
         ],
         usage=SimpleNamespace(input_tokens=12, output_tokens=4, total_tokens=16),
@@ -1155,6 +1155,48 @@ def test_run_conversation_codex_tool_round_trip(monkeypatch):
     assert result["final_response"] == "done"
     assert any(msg.get("tool_calls") for msg in result["messages"] if msg.get("role") == "assistant")
     assert any(msg.get("role") == "tool" and msg.get("tool_call_id") == "call_1" for msg in result["messages"])
+
+
+def test_run_conversation_codex_accepts_bridge_tool_call(monkeypatch):
+    """Codex's flat function schemas must admit advertised bridge tools."""
+    agent = _build_agent(monkeypatch)
+    from tools.tool_search import ToolSearchConfig
+
+    responses = [
+        _codex_tool_call_response(
+            name="tool_search",
+            arguments='{"query":"shell command"}',
+        ),
+        _codex_message_response("done"),
+    ]
+    monkeypatch.setattr(agent, "_interruptible_api_call", lambda api_kwargs: responses.pop(0))
+    monkeypatch.setattr(
+        "tools.tool_search.load_config",
+        lambda: ToolSearchConfig.from_raw({"enabled": "on"}),
+    )
+    executed = []
+
+    def _fake_execute_tool_calls(
+        assistant_message, messages, effective_task_id, api_call_count
+    ):
+        for call in assistant_message.tool_calls:
+            executed.append(call.function.name)
+            messages.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": call.id,
+                    "content": '{"results": []}',
+                }
+            )
+
+    monkeypatch.setattr(agent, "_execute_tool_calls", _fake_execute_tool_calls)
+
+    result = agent.run_conversation("find a shell command")
+
+    assert result["completed"] is True
+    assert result["final_response"] == "done"
+    assert executed == ["tool_search"]
+    assert agent._invalid_tool_retries == 0
 
 
 def test_chat_messages_to_responses_input_uses_call_id_for_function_call(monkeypatch):
