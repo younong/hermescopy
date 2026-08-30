@@ -701,7 +701,6 @@ def _dashboard_env(
             "HERMES_DEPLOYMENT_INFERENCE_MODEL": MODEL,
             "HERMES_DEPLOYMENT_INFERENCE_API_MODE": "chat_completions",
             "HERMES_DEPLOYMENT_INFERENCE_POLICY_ID": "smoke-policy-v1",
-            "HERMES_DEPLOYMENT_INFERENCE_ALLOWED_MODELS": MODEL,
             "HERMES_DEPLOYMENT_INFERENCE_SUPPORTS_VISION": "true",
             "NO_PROXY": "127.0.0.1,localhost",
             "no_proxy": "127.0.0.1,localhost",

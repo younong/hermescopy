@@ -45,7 +45,6 @@ def _policy(
         model="gpt-safe",
         api_mode=api_mode,
         policy_id="test-deployment-v1",
-        allowed_models=("gpt-safe", "gpt-safe-mini"),
         supports_vision=supports_vision,
         runtime_resolver=lambda: {
             "provider": "custom:deployment",
@@ -53,10 +52,47 @@ def _policy(
             "base_url": "https://provider.example.test/v1",
             "api_key": "control-plane-secret",
         },
+        routes=(DeploymentInferenceRoute(
+            provider="custom:deployment",
+            model="gpt-safe-mini",
+            api_mode=api_mode,
+            runtime_resolver=lambda: {
+                "provider": "custom:deployment",
+                "api_mode": api_mode,
+                "base_url": "https://provider.example.test/v1",
+                "api_key": "control-plane-secret",
+            },
+        ),),
     )
 
 
-def test_route_descriptor_exposes_context_capability_without_secrets():
+def test_model_only_route_selection_rejects_provider_ambiguity():
+    policy = DeploymentInferencePolicy(
+        provider="custom:deployment",
+        model="shared-model",
+        api_mode="chat_completions",
+        runtime_resolver=lambda: {
+            "provider": "custom:deployment",
+            "api_mode": "chat_completions",
+            "base_url": "https://provider.example.test/v1",
+            "api_key": "control-plane-secret",
+        },
+        routes=(DeploymentInferenceRoute(
+            provider="custom:other",
+            model="shared-model",
+            api_mode="chat_completions",
+            runtime_resolver=lambda: {
+                "provider": "custom:other",
+                "api_mode": "chat_completions",
+                "base_url": "https://other.example.test/v1",
+                "api_key": "other-control-plane-secret",
+            },
+        ),),
+    )
+
+    assert policy.route_for("shared-model") is None
+    assert policy.route_for("shared-model", provider="custom:deployment") is not None
+    assert policy.route_for("shared-model", provider="custom:other") is not None
     from hermes_cli.deployment_inference import DeploymentInferenceRouteDescriptor
 
     descriptor = DeploymentInferenceRouteDescriptor(
@@ -88,7 +124,6 @@ def test_policy_descriptor_and_worker_environment_are_secret_free(monkeypatch):
     monkeypatch.setenv("HERMES_DEPLOYMENT_INFERENCE_MODEL", descriptor.model)
     monkeypatch.setenv("HERMES_DEPLOYMENT_INFERENCE_API_MODE", descriptor.api_mode)
     monkeypatch.setenv("HERMES_DEPLOYMENT_INFERENCE_POLICY_ID", descriptor.policy_id)
-    monkeypatch.setenv("HERMES_DEPLOYMENT_INFERENCE_ALLOWED_MODELS", ",".join(descriptor.allowed_models))
     monkeypatch.setenv("HERMES_DEPLOYMENT_INFERENCE_SUPPORTS_VISION", "true")
     monkeypatch.setenv(
         "HERMES_DEPLOYMENT_INFERENCE_COMPRESSION_MODEL", "gpt-safe-mini"
@@ -109,7 +144,6 @@ def test_descriptor_rejects_incomplete_or_unsupported_worker_environment(monkeyp
     monkeypatch.setenv("HERMES_DEPLOYMENT_INFERENCE_MODEL", "gpt-safe")
     monkeypatch.setenv("HERMES_DEPLOYMENT_INFERENCE_API_MODE", "bedrock_converse")
     monkeypatch.setenv("HERMES_DEPLOYMENT_INFERENCE_POLICY_ID", "test")
-    monkeypatch.setenv("HERMES_DEPLOYMENT_INFERENCE_ALLOWED_MODELS", "gpt-safe")
     with pytest.raises(DeploymentInferencePolicyInvalid, match="unsupported"):
         deployment_descriptor_from_environment()
 
@@ -134,7 +168,6 @@ def test_control_plane_factory_builds_compression_route_from_provider_models(mon
     monkeypatch.setenv("HERMES_DEPLOYMENT_INFERENCE_PROVIDER", "custom:deployment")
     monkeypatch.setenv("HERMES_DEPLOYMENT_INFERENCE_MODEL", "gpt-safe")
     monkeypatch.setenv("HERMES_DEPLOYMENT_INFERENCE_API_MODE", "chat_completions")
-    monkeypatch.setenv("HERMES_DEPLOYMENT_INFERENCE_ALLOWED_MODELS", "gpt-safe,gpt-5.6-luna")
     monkeypatch.setenv("HERMES_DEPLOYMENT_INFERENCE_COMPRESSION_MODEL", "gpt-5.6-luna")
     monkeypatch.setattr(
         "hermes_cli.config.load_config_readonly",
@@ -161,10 +194,6 @@ def test_control_plane_factory_builds_codex_responses_route(monkeypatch):
     monkeypatch.setenv("HERMES_DEPLOYMENT_INFERENCE_PROVIDER", "custom:deployment")
     monkeypatch.setenv("HERMES_DEPLOYMENT_INFERENCE_MODEL", "gpt-safe")
     monkeypatch.setenv("HERMES_DEPLOYMENT_INFERENCE_API_MODE", "chat_completions")
-    monkeypatch.setenv(
-        "HERMES_DEPLOYMENT_INFERENCE_ALLOWED_MODELS",
-        "gpt-safe,gpt-5.6-sol",
-    )
     monkeypatch.setattr(
         "hermes_cli.config.load_config_readonly",
         lambda: {
@@ -185,16 +214,36 @@ def test_control_plane_factory_builds_codex_responses_route(monkeypatch):
     ]
 
 
-def test_control_plane_environment_factory_does_not_resolve_until_broker_use(monkeypatch):
+def test_control_plane_factory_skips_unsupported_optional_route(monkeypatch, caplog):
     monkeypatch.setenv("HERMES_DEPLOYMENT_INFERENCE_PROVIDER", "custom:deployment")
     monkeypatch.setenv("HERMES_DEPLOYMENT_INFERENCE_MODEL", "gpt-safe")
     monkeypatch.setenv("HERMES_DEPLOYMENT_INFERENCE_API_MODE", "chat_completions")
-    monkeypatch.delenv("HERMES_DEPLOYMENT_INFERENCE_ALLOWED_MODELS", raising=False)
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config_readonly",
+        lambda: {
+            "providers": {
+                "bedrock": {
+                    "api": "https://bedrock.example.test/v1",
+                    "api_mode": "bedrock_converse",
+                    "models": {"bedrock-model": {}},
+                },
+            },
+        },
+    )
+
+    policy = policy_from_control_plane_environment()
+
+    assert [route.model for route in policy.route_descriptors()] == ["gpt-safe"]
+    assert "bedrock-model" not in repr(policy.route_descriptors())
+    assert "bedrock-model" in caplog.text
+
+    monkeypatch.setenv("HERMES_DEPLOYMENT_INFERENCE_PROVIDER", "custom:deployment")
+    monkeypatch.setenv("HERMES_DEPLOYMENT_INFERENCE_MODEL", "gpt-safe")
+    monkeypatch.setenv("HERMES_DEPLOYMENT_INFERENCE_API_MODE", "chat_completions")
     monkeypatch.setenv("HERMES_DEPLOYMENT_INFERENCE_SUPPORTS_VISION", "false")
 
     policy = policy_from_control_plane_environment()
 
-    assert policy.descriptor().allowed_models == ("gpt-safe",)
     assert policy.descriptor().supports_vision is False
 
 
@@ -244,7 +293,6 @@ def test_descriptor_leaves_absent_vision_capability_unknown(monkeypatch):
     monkeypatch.setenv("HERMES_DEPLOYMENT_INFERENCE_MODEL", descriptor.model)
     monkeypatch.setenv("HERMES_DEPLOYMENT_INFERENCE_API_MODE", descriptor.api_mode)
     monkeypatch.setenv("HERMES_DEPLOYMENT_INFERENCE_POLICY_ID", descriptor.policy_id)
-    monkeypatch.setenv("HERMES_DEPLOYMENT_INFERENCE_ALLOWED_MODELS", ",".join(descriptor.allowed_models))
     monkeypatch.delenv("HERMES_DEPLOYMENT_INFERENCE_SUPPORTS_VISION", raising=False)
 
     assert deployment_descriptor_from_environment().supports_vision is None
@@ -256,7 +304,6 @@ def test_descriptor_rejects_invalid_vision_capability(monkeypatch):
     monkeypatch.setenv("HERMES_DEPLOYMENT_INFERENCE_MODEL", descriptor.model)
     monkeypatch.setenv("HERMES_DEPLOYMENT_INFERENCE_API_MODE", descriptor.api_mode)
     monkeypatch.setenv("HERMES_DEPLOYMENT_INFERENCE_POLICY_ID", descriptor.policy_id)
-    monkeypatch.setenv("HERMES_DEPLOYMENT_INFERENCE_ALLOWED_MODELS", ",".join(descriptor.allowed_models))
     monkeypatch.setenv("HERMES_DEPLOYMENT_INFERENCE_SUPPORTS_VISION", "maybe")
 
     with pytest.raises(DeploymentInferencePolicyInvalid, match="true or false"):
@@ -1630,7 +1677,6 @@ def test_compression_auxiliary_smoke_uses_secondary_route_without_models_probe(t
             "base_url": f"http://127.0.0.1:{server.server_port}/openai/v1",
             "api_key": "gpt-control-plane-secret",
         },
-        allowed_models=("gpt-safe", "gpt-5.6-luna"),
         compression_model="gpt-5.6-luna",
         routes=(DeploymentInferenceRoute(
             provider="custom:codex",
@@ -1659,7 +1705,6 @@ def test_compression_auxiliary_smoke_uses_secondary_route_without_models_probe(t
     monkeypatch.setenv("HERMES_DEPLOYMENT_INFERENCE_MODEL", "gpt-safe")
     monkeypatch.setenv("HERMES_DEPLOYMENT_INFERENCE_API_MODE", "chat_completions")
     monkeypatch.setenv("HERMES_DEPLOYMENT_INFERENCE_POLICY_ID", "test-deployment-v1")
-    monkeypatch.setenv("HERMES_DEPLOYMENT_INFERENCE_ALLOWED_MODELS", "gpt-safe,gpt-5.6-luna")
     monkeypatch.setenv("HERMES_DEPLOYMENT_INFERENCE_COMPRESSION_MODEL", "gpt-5.6-luna")
     monkeypatch.setattr(
         "hermes_cli.owner_runtime.is_owner_worker_env", lambda: True
@@ -1750,8 +1795,18 @@ def test_compression_auxiliary_smoke_through_owner_relay(tmp_path, monkeypatch):
             "base_url": f"http://127.0.0.1:{server.server_port}/v1",
             "api_key": "control-plane-secret",
         },
-        allowed_models=("gpt-safe", "gpt-5.6-luna"),
         compression_model="gpt-5.6-luna",
+        routes=(DeploymentInferenceRoute(
+            provider="custom:deployment",
+            model="gpt-5.6-luna",
+            api_mode="chat_completions",
+            runtime_resolver=lambda: {
+                "provider": "custom:deployment",
+                "api_mode": "chat_completions",
+                "base_url": f"http://127.0.0.1:{server.server_port}/v1",
+                "api_key": "control-plane-secret",
+            },
+        ),),
     )
     broker, active, relay = _activate_relay(
         AuthorityStore(tmp_path / "control"), policy
@@ -1813,7 +1868,6 @@ def test_owner_relay_routes_models_to_distinct_api_modes_and_credentials(tmp_pat
                 "base_url": f"http://127.0.0.1:{server.server_port}/openai/v1",
                 "api_key": "gpt-control-plane-secret",
             },
-            allowed_models=("gpt-safe", "k3-256k"),
             routes=(
                 DeploymentInferenceRoute(
                     provider="custom:kimi-code",
@@ -1920,7 +1974,6 @@ def test_owner_relay_route_metadata_is_live_lease_fenced_and_secret_free(tmp_pat
             model="gpt-safe",
             api_mode="chat_completions",
             runtime_resolver=initial_policy.runtime_resolver,
-            allowed_models=("gpt-safe", "k3-256k", "gpt-5.6-sol"),
             routes=(
                 DeploymentInferenceRoute(
                     provider="custom:kimi-code",

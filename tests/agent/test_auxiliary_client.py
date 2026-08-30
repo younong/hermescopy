@@ -195,9 +195,6 @@ class TestResolveTaskProviderModel:
         monkeypatch.setenv("HERMES_DEPLOYMENT_INFERENCE_API_MODE", "chat_completions")
         monkeypatch.setenv("HERMES_DEPLOYMENT_INFERENCE_POLICY_ID", "test-deployment-v1")
         monkeypatch.setenv(
-            "HERMES_DEPLOYMENT_INFERENCE_ALLOWED_MODELS", "gpt-safe,gpt-5.6-luna"
-        )
-        monkeypatch.setenv(
             "HERMES_DEPLOYMENT_INFERENCE_RELAY_BASE_URL",
             "http://127.0.0.1:39123/v1",
         )

@@ -243,7 +243,6 @@ def test_admin_chat_registration_resolves_from_owner_worker_descriptor(monkeypat
             model="model-a",
             api_mode="anthropic_messages",
             policy_id="policy-a",
-            allowed_models=("model-a", "model-b"),
         ),
     )
     monkeypatch.setattr(

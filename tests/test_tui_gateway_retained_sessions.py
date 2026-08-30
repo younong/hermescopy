@@ -367,7 +367,6 @@ def test_native_image_build_requires_every_attachment(owner_gateway, monkeypatch
         model="gpt-5.6-sol",
         api_mode="chat_completions",
         policy_id="policy-v1",
-        allowed_models=("gpt-5.6-sol",),
         supports_vision=True,
     )
     monkeypatch.setattr(server, "_emit", lambda *_args, **_kwargs: None)
@@ -454,7 +453,6 @@ def test_owner_worker_codex_prompt_uses_deployment_native_vision(
         model="gpt-5.6-sol",
         api_mode="chat_completions",
         policy_id="policy-v1",
-        allowed_models=("gpt-5.6-sol",),
         supports_vision=True,
     )
     monkeypatch.setattr(server, "_emit", lambda *_args, **_kwargs: None)

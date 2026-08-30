@@ -219,7 +219,6 @@ class TestModelSupportsVision:
             model="gpt-5.6-sol",
             api_mode="chat_completions",
             policy_id="deployment-default-v1",
-            allowed_models=("gpt-5.6-sol",),
             supports_vision=True,
         )
         messages = [IMG_PARTS_USER_MSG]
@@ -249,7 +248,6 @@ class TestModelSupportsVision:
             model="gpt-5.6-sol",
             api_mode="chat_completions",
             policy_id="deployment-default-v1",
-            allowed_models=("gpt-5.6-sol",),
             supports_vision=True,
         )
         with patch(
@@ -272,7 +270,6 @@ class TestModelSupportsVision:
             model="gpt-5.6-sol",
             api_mode="chat_completions",
             policy_id="deployment-default-v1",
-            allowed_models=("gpt-5.6-sol",),
             supports_vision=True,
         )
         with patch("hermes_cli.config.load_config", return_value={}), patch(
@@ -290,7 +287,6 @@ class TestModelSupportsVision:
             model="claude-sonnet-4",
             api_mode="anthropic_messages",
             policy_id="deployment-default-v1",
-            allowed_models=("claude-sonnet-4",),
         )
         fake_caps = MagicMock()
         fake_caps.supports_vision = True

@@ -8,7 +8,9 @@ receive only display-safe route descriptors and a private relay connection.
 from __future__ import annotations
 
 import importlib
+import logging
 import os
+import threading
 from dataclasses import dataclass
 from typing import Any, Callable, Mapping
 from urllib.parse import urlparse
@@ -22,6 +24,9 @@ _SUPPORTED_API_MODES = frozenset({
 _SUPPORTS_VISION_ENV = "HERMES_DEPLOYMENT_INFERENCE_SUPPORTS_VISION"
 DEPLOYMENT_INFERENCE_RELAY_MARKER = "deployment-inference-relay"
 _DEPLOYMENT_ROUTES_PATH = "/v1/hermes/deployment-routes"
+logger = logging.getLogger(__name__)
+_ROUTE_CACHE_LOCK = threading.RLock()
+_ROUTE_DESCRIPTOR_CACHE: dict[str, tuple[DeploymentInferenceRouteDescriptor, ...]] = {}
 
 
 def is_deployment_inference_relay(api_key: object) -> bool:
@@ -55,11 +60,18 @@ class DeploymentInferenceSelectionRejected(RuntimeError):
     """An explicit owner/request selection cannot use deployment inference."""
 
 
-def _normalize_compression_model(raw: object, allowed: tuple[str, ...]) -> str:
+def _normalize_compression_model(raw: object, routes: tuple["DeploymentInferenceRoute", ...]) -> str:
     compression_model = str(raw or "").strip()
-    if compression_model and compression_model not in allowed:
+    if not compression_model:
+        return ""
+    matching_routes = tuple(route for route in routes if route.model == compression_model)
+    if not matching_routes:
         raise DeploymentInferencePolicyInvalid(
-            "deployment inference compression model is not allowed"
+            "deployment inference compression model is not configured"
+        )
+    if len({route.provider for route in matching_routes}) > 1:
+        raise DeploymentInferencePolicyInvalid(
+            "deployment inference compression model is ambiguous"
         )
     return compression_model
 
@@ -128,7 +140,6 @@ class DeploymentInferenceDescriptor:
     model: str
     api_mode: str
     policy_id: str
-    allowed_models: tuple[str, ...]
     supports_vision: bool | None = None
     compression_model: str = ""
 
@@ -140,23 +151,11 @@ class DeploymentInferenceDescriptor:
             raise DeploymentInferencePolicyInvalid("deployment inference identity is required")
         if self.api_mode not in _SUPPORTED_API_MODES:
             raise DeploymentInferencePolicyInvalid("deployment inference api mode is unsupported")
-        allowed = tuple(dict.fromkeys(
-            str(value or "").strip()
-            for value in self.allowed_models
-            if str(value or "").strip()
-        ))
-        if not allowed:
-            allowed = (model,)
-        if model not in allowed:
-            raise DeploymentInferencePolicyInvalid("deployment inference descriptor models are invalid")
-        compression_model = _normalize_compression_model(
-            self.compression_model, allowed
-        )
+        compression_model = str(self.compression_model or "").strip()
 
         object.__setattr__(self, "provider", provider)
         object.__setattr__(self, "model", model)
         object.__setattr__(self, "policy_id", policy_id)
-        object.__setattr__(self, "allowed_models", allowed)
         object.__setattr__(self, "compression_model", compression_model)
         object.__setattr__(
             self,
@@ -228,7 +227,6 @@ class DeploymentInferencePolicy:
     api_mode: str
     runtime_resolver: Callable[[], Mapping[str, Any]]
     policy_id: str = "deployment-default-v1"
-    allowed_models: tuple[str, ...] = ()
     supports_vision: bool | None = None
     context_length: int | None = None
     compression_model: str = ""
@@ -244,19 +242,6 @@ class DeploymentInferencePolicy:
             raise DeploymentInferencePolicyInvalid("deployment inference runtime resolver is required")
         if self.api_mode not in _SUPPORTED_API_MODES:
             raise DeploymentInferencePolicyInvalid("deployment inference api mode is unsupported")
-        allowed = tuple(dict.fromkeys(
-            str(value or "").strip()
-            for value in self.allowed_models
-            if str(value or "").strip()
-        ))
-        if not allowed:
-            allowed = (model,)
-        if model not in allowed:
-            allowed = (model, *allowed)
-        compression_model = _normalize_compression_model(
-            self.compression_model, allowed
-        )
-
         default_route = DeploymentInferenceRoute(
             provider=provider,
             model=model,
@@ -266,27 +251,19 @@ class DeploymentInferencePolicy:
             context_length=self.context_length,
         )
         extra_routes = tuple(self.routes)
-        explicit_models = {route.model for route in extra_routes}
-        if model in explicit_models or len(explicit_models) != len(extra_routes):
+        if not all(isinstance(route, DeploymentInferenceRoute) for route in extra_routes):
+            raise DeploymentInferencePolicyInvalid("deployment inference routes are invalid")
+        route_keys = {(route.provider, route.model) for route in extra_routes}
+        if (provider, model) in route_keys or len(route_keys) != len(extra_routes):
             raise DeploymentInferencePolicyInvalid("deployment inference routes are invalid")
         routes = (default_route, *extra_routes)
-        for allowed_model in allowed:
-            if allowed_model not in {route.model for route in routes}:
-                routes += (
-                    DeploymentInferenceRoute(
-                        provider=provider,
-                        model=allowed_model,
-                        api_mode=self.api_mode,
-                        runtime_resolver=self.runtime_resolver,
-                    ),
-                )
-        if {route.model for route in routes} != set(allowed):
-            raise DeploymentInferencePolicyInvalid("deployment inference routes are invalid")
+        compression_model = _normalize_compression_model(
+            self.compression_model, routes
+        )
 
         object.__setattr__(self, "provider", provider)
         object.__setattr__(self, "model", model)
         object.__setattr__(self, "policy_id", policy_id)
-        object.__setattr__(self, "allowed_models", allowed)
         object.__setattr__(self, "supports_vision", default_route.supports_vision)
         object.__setattr__(self, "context_length", default_route.context_length)
         object.__setattr__(self, "compression_model", compression_model)
@@ -302,7 +279,6 @@ class DeploymentInferencePolicy:
             model=self.model,
             api_mode=self.api_mode,
             policy_id=self.policy_id,
-            allowed_models=self.allowed_models,
             supports_vision=self.supports_vision,
             compression_model=self.compression_model,
         )
@@ -315,15 +291,15 @@ class DeploymentInferencePolicy:
     ) -> DeploymentInferenceRoute | None:
         selected_model = str(model or "").strip()
         selected_provider = str(provider or "").strip().lower()
-        return next(
-            (
-                route
-                for route in self._all_routes
-                if route.model == selected_model
-                and (not selected_provider or route.provider == selected_provider)
-            ),
-            None,
+        matches = tuple(
+            route
+            for route in self._all_routes
+            if route.model == selected_model
+            and (not selected_provider or route.provider == selected_provider)
         )
+        if len(matches) != 1:
+            return None
+        return matches[0]
 
     def resolve_route_runtime(self, route: DeploymentInferenceRoute) -> dict[str, Any]:
         if route not in self._all_routes:
@@ -364,7 +340,6 @@ def deployment_descriptor_from_environment(
     model = str(env.get("HERMES_DEPLOYMENT_INFERENCE_MODEL", "")).strip()
     api_mode = str(env.get("HERMES_DEPLOYMENT_INFERENCE_API_MODE", "")).strip()
     policy_id = str(env.get("HERMES_DEPLOYMENT_INFERENCE_POLICY_ID", "")).strip()
-    raw_allowed = str(env.get("HERMES_DEPLOYMENT_INFERENCE_ALLOWED_MODELS", ""))
     raw_supports_vision = env.get(_SUPPORTS_VISION_ENV)
     compression_model = str(
         env.get("HERMES_DEPLOYMENT_INFERENCE_COMPRESSION_MODEL", "")
@@ -374,22 +349,17 @@ def deployment_descriptor_from_environment(
         model,
         api_mode,
         policy_id,
-        raw_allowed.strip(),
         raw_supports_vision,
         compression_model,
     )):
         return None
     if not all((provider, model, api_mode, policy_id)):
         raise DeploymentInferencePolicyInvalid("deployment inference descriptor is incomplete")
-    allowed = tuple(dict.fromkeys(item.strip() for item in raw_allowed.split(",") if item.strip()))
-    if not allowed or model not in allowed:
-        raise DeploymentInferencePolicyInvalid("deployment inference descriptor models are invalid")
     return DeploymentInferenceDescriptor(
         provider=provider,
         model=model,
         api_mode=api_mode,
         policy_id=policy_id,
-        allowed_models=allowed,
         supports_vision=_parse_optional_bool(
             raw_supports_vision,
             field=_SUPPORTS_VISION_ENV,
@@ -421,32 +391,53 @@ def deployment_routes_path() -> str:
 
 
 def route_descriptors_from_control_plane() -> tuple[DeploymentInferenceRouteDescriptor, ...]:
-    """Read the current non-secret route list over the private worker relay."""
-    try:
-        import httpx
+    """Read the current non-secret route list over the private worker relay.
 
+    A complete, validated response replaces the cache atomically.  Temporary relay
+    failures keep the last good route projection so a transient refresh outage
+    cannot make every managed model disappear.
+    """
+    relay_base_url = os.environ.get(
+        "HERMES_DEPLOYMENT_INFERENCE_RELAY_BASE_URL", ""
+    ).strip().rstrip("/")
+    try:
         from hermes_cli.owner_runtime import is_owner_worker_env
 
-        relay_base_url = os.environ.get(
-            "HERMES_DEPLOYMENT_INFERENCE_RELAY_BASE_URL", ""
-        ).strip().rstrip("/")
         if not is_owner_worker_env() or not relay_base_url:
             return ()
+        import httpx
+
         response = httpx.get(
             relay_base_url.removesuffix("/v1") + deployment_routes_path(),
             timeout=5.0,
         )
         response.raise_for_status()
         values = response.json()
-        if not isinstance(values, list):
-            return ()
-        return tuple(
+        if not isinstance(values, list) or not values:
+            raise ValueError("deployment route metadata is invalid")
+        routes = tuple(
             DeploymentInferenceRouteDescriptor(**value)
             for value in values
             if isinstance(value, dict)
         )
-    except Exception:
+        if len(routes) != len(values):
+            raise ValueError("deployment route metadata is invalid")
+        route_keys = {(route.provider, route.model) for route in routes}
+        if len(route_keys) != len(routes):
+            raise ValueError("deployment route metadata is invalid")
+    except Exception as exc:
+        with _ROUTE_CACHE_LOCK:
+            cached = _ROUTE_DESCRIPTOR_CACHE.get(relay_base_url, ())
+        if relay_base_url and cached:
+            logger.warning(
+                "deployment inference route metadata refresh failed error_type=%s",
+                type(exc).__name__,
+            )
+            return cached
         return ()
+    with _ROUTE_CACHE_LOCK:
+        _ROUTE_DESCRIPTOR_CACHE[relay_base_url] = routes
+    return routes
 
 
 def _configured_route_index() -> dict[str, list[tuple[str, str, str, bool | None, int | None]]]:
@@ -466,11 +457,20 @@ def _configured_route_index() -> dict[str, list[tuple[str, str, str, bool | None
             provider_context = None
         for model in _declared_models(entry):
             metadata = models.get(model) if isinstance(models, dict) else None
-            supports_vision = (
-                _parse_optional_bool(metadata.get("supports_vision"), field="supports_vision")
-                if isinstance(metadata, dict) and "supports_vision" in metadata
-                else None
-            )
+            try:
+                supports_vision = (
+                    _parse_optional_bool(metadata.get("supports_vision"), field="supports_vision")
+                    if isinstance(metadata, dict) and "supports_vision" in metadata
+                    else None
+                )
+            except DeploymentInferencePolicyInvalid as exc:
+                logger.warning(
+                    "deployment inference optional route skipped provider=%s model=%s error_type=%s",
+                    provider,
+                    model,
+                    type(exc).__name__,
+                )
+                continue
             context_length = metadata.get("context_length") if isinstance(metadata, dict) else None
             if not isinstance(context_length, int) or isinstance(context_length, bool) or context_length <= 0:
                 context_length = provider_context
@@ -492,17 +492,8 @@ def policy_from_control_plane_environment() -> DeploymentInferencePolicy:
     compression_model = current_env.get(
         "HERMES_DEPLOYMENT_INFERENCE_COMPRESSION_MODEL", ""
     ).strip()
-    allowed_models = tuple(dict.fromkeys(
-        item.strip()
-        for item in current_env.get("HERMES_DEPLOYMENT_INFERENCE_ALLOWED_MODELS", "").split(",")
-        if item.strip()
-    ))
     if not provider or not model or not api_mode:
         raise DeploymentInferencePolicyInvalid("deployment inference environment is incomplete")
-    if not allowed_models:
-        allowed_models = (model,)
-    if model not in allowed_models:
-        allowed_models = (model, *allowed_models)
 
     raw_supports_vision = current_env.get(_SUPPORTS_VISION_ENV)
     if raw_supports_vision is not None:
@@ -524,7 +515,14 @@ def policy_from_control_plane_environment() -> DeploymentInferencePolicy:
         except Exception:
             pass
 
-    route_index = _configured_route_index()
+    try:
+        route_index = _configured_route_index()
+    except Exception as exc:
+        logger.warning(
+            "deployment inference optional route catalog unavailable error_type=%s",
+            type(exc).__name__,
+        )
+        route_index = {}
     default_route_matches = [
         route
         for route in route_index.get(model, ())
@@ -551,34 +549,38 @@ def policy_from_control_plane_environment() -> DeploymentInferencePolicy:
         return resolve
 
     extra_routes: list[DeploymentInferenceRoute] = []
-    for allowed_model in allowed_models:
-        if allowed_model == model:
-            continue
-        matches = route_index.get(allowed_model, [])
-        if len(matches) > 1:
-            raise DeploymentInferencePolicyInvalid(
-                f"deployment inference model {allowed_model!r} has multiple configured routes"
-            )
-        if not matches:
-            raise DeploymentInferencePolicyInvalid(
-                f"deployment inference model {allowed_model!r} has no configured route"
-            )
-        (
+    seen_route_keys = {(provider, model)}
+    for route_model, matches in route_index.items():
+        for (
             route_provider,
             name,
             route_api_mode,
             route_supports_vision,
             route_context_length,
-        ) = matches[0]
-        extra_routes.append(DeploymentInferenceRoute(
-            provider=route_provider,
-            model=allowed_model,
-            api_mode=route_api_mode,
-            runtime_resolver=_runtime_resolver(route_provider, allowed_model),
-            name=name,
-            supports_vision=route_supports_vision,
-            context_length=route_context_length,
-        ))
+        ) in matches:
+            route_key = (route_provider, route_model)
+            if route_key in seen_route_keys:
+                continue
+            try:
+                route = DeploymentInferenceRoute(
+                    provider=route_provider,
+                    model=route_model,
+                    api_mode=route_api_mode,
+                    runtime_resolver=_runtime_resolver(route_provider, route_model),
+                    name=name,
+                    supports_vision=route_supports_vision,
+                    context_length=route_context_length,
+                )
+            except DeploymentInferencePolicyInvalid as exc:
+                logger.warning(
+                    "deployment inference optional route skipped provider=%s model=%s error_type=%s",
+                    route_provider,
+                    route_model,
+                    type(exc).__name__,
+                )
+                continue
+            seen_route_keys.add(route_key)
+            extra_routes.append(route)
 
     return DeploymentInferencePolicy(
         provider=provider,
@@ -586,7 +588,6 @@ def policy_from_control_plane_environment() -> DeploymentInferencePolicy:
         api_mode=api_mode,
         runtime_resolver=_runtime_resolver(provider, model),
         policy_id=policy_id,
-        allowed_models=allowed_models,
         supports_vision=supports_vision,
         context_length=default_context_length,
         compression_model=compression_model,

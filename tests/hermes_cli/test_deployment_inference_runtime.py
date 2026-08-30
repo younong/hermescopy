@@ -12,10 +12,6 @@ def _deployment_env(monkeypatch) -> None:
     monkeypatch.setenv("HERMES_DEPLOYMENT_INFERENCE_MODEL", "gpt-safe")
     monkeypatch.setenv("HERMES_DEPLOYMENT_INFERENCE_API_MODE", "chat_completions")
     monkeypatch.setenv("HERMES_DEPLOYMENT_INFERENCE_POLICY_ID", "policy-v1")
-    monkeypatch.setenv(
-        "HERMES_DEPLOYMENT_INFERENCE_ALLOWED_MODELS",
-        "gpt-safe,gpt-safe-mini,gpt-5.6-sol",
-    )
     monkeypatch.setenv("HERMES_DEPLOYMENT_INFERENCE_RELAY_BASE_URL", "http://127.0.0.1:39123/v1")
     monkeypatch.setattr(
         "hermes_cli.deployment_inference.route_descriptors_from_control_plane",

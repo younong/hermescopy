@@ -1586,17 +1586,15 @@ def resolve_deployment_inference_runtime(
             routes = route_descriptors_from_control_plane()
         except Exception:
             routes = ()
-    route = next(
-        (
-            candidate
-            for candidate in routes
-            if candidate.provider == selected_provider
-            and candidate.model == selected_model
-        ),
-        None,
+    matches = tuple(
+        candidate
+        for candidate in routes
+        if candidate.provider == selected_provider
+        and candidate.model == selected_model
     )
-    if route is None:
+    if len(matches) != 1:
         return None
+    route = matches[0]
     runtime.update({
         "provider": selected_provider,
         "requested_provider": selected_provider,

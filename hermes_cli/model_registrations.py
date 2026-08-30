@@ -134,9 +134,8 @@ def _admin_chat_route_descriptors():
         if descriptor is None:
             return ()
         # The compact startup descriptor preserves only the default route's
-        # provider and API mode. Additional allowed models can belong to exact
-        # routes with different providers, so never manufacture identities for
-        # them when the private route projection is unavailable.
+        # identity. Never manufacture secondary route identities when the
+        # private route projection is unavailable.
         return (
             DeploymentInferenceRouteDescriptor(
                 provider=descriptor.provider,

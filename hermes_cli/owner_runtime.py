@@ -44,7 +44,6 @@ OWNER_WORKER_DEPLOYMENT_RUNTIME_ENV_KEYS: tuple[str, ...] = (
     "HERMES_DEPLOYMENT_INFERENCE_MODEL",
     "HERMES_DEPLOYMENT_INFERENCE_API_MODE",
     "HERMES_DEPLOYMENT_INFERENCE_POLICY_ID",
-    "HERMES_DEPLOYMENT_INFERENCE_ALLOWED_MODELS",
     "HERMES_DEPLOYMENT_INFERENCE_SUPPORTS_VISION",
     "HERMES_DEPLOYMENT_INFERENCE_COMPRESSION_MODEL",
     "HERMES_DEPLOYMENT_INFERENCE_RELAY_FD",
@@ -255,7 +254,6 @@ def owner_worker_env_for(
             "HERMES_DEPLOYMENT_INFERENCE_MODEL": deployment_inference_descriptor.model,
             "HERMES_DEPLOYMENT_INFERENCE_API_MODE": deployment_inference_descriptor.api_mode,
             "HERMES_DEPLOYMENT_INFERENCE_POLICY_ID": deployment_inference_descriptor.policy_id,
-            "HERMES_DEPLOYMENT_INFERENCE_ALLOWED_MODELS": ",".join(deployment_inference_descriptor.allowed_models),
         })
         if deployment_inference_descriptor.supports_vision is not None:
             env["HERMES_DEPLOYMENT_INFERENCE_SUPPORTS_VISION"] = (
