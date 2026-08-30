@@ -14,7 +14,11 @@ from typing import Any, Callable, Mapping
 from urllib.parse import urlparse
 
 
-_SUPPORTED_API_MODES = frozenset({"chat_completions", "anthropic_messages"})
+_SUPPORTED_API_MODES = frozenset({
+    "chat_completions",
+    "anthropic_messages",
+    "codex_responses",
+})
 _SUPPORTS_VISION_ENV = "HERMES_DEPLOYMENT_INFERENCE_SUPPORTS_VISION"
 DEPLOYMENT_INFERENCE_RELAY_MARKER = "deployment-inference-relay"
 _DEPLOYMENT_ROUTES_PATH = "/v1/hermes/deployment-routes"
@@ -407,6 +411,8 @@ def request_path_for_api_mode(api_mode: str) -> str:
         return "/v1/messages"
     if api_mode == "chat_completions":
         return "/v1/chat/completions"
+    if api_mode == "codex_responses":
+        return "/v1/responses"
     raise DeploymentInferencePolicyInvalid("deployment inference route api mode is unsupported")
 
 
