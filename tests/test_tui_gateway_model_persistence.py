@@ -573,3 +573,123 @@ def test_persist_model_switch_uses_config_set_value_for_all_model_keys(monkeypat
         ("model.provider", "anthropic"),
         ("model.base_url", ""),
     ]
+
+
+def _capture_make_agent_kwargs(server, monkeypatch, fake_runtime):
+    """Patch AIAgent + side-effect loaders so _make_agent returns its kwargs."""
+    captured = {}
+
+    class FakeAgent:
+        def __init__(self, **kwargs):
+            captured["kwargs"] = kwargs
+            for key, value in kwargs.items():
+                setattr(self, key, value)
+
+    monkeypatch.setattr("run_agent.AIAgent", FakeAgent)
+    monkeypatch.setattr(server, "_load_cfg", lambda: {})
+    monkeypatch.setattr(server, "_load_enabled_toolsets", lambda: [])
+    monkeypatch.setattr(server, "_load_provider_routing", lambda: {})
+    monkeypatch.setattr(server, "_load_reasoning_config", lambda: None)
+    monkeypatch.setattr(server, "_load_service_tier", lambda: None)
+    monkeypatch.setattr(server, "_parse_tui_skills_env", lambda: [])
+    monkeypatch.setattr(server, "_resolve_runtime_with_fallback", lambda _kwargs: fake_runtime)
+    monkeypatch.setattr(server, "_agent_platform_for_source", lambda _source: "test")
+    runtime = server.OwnerWorkerGatewayRuntime("owner", 1, "worker", 1, 0)
+    captured["_runtime_ctx"] = server.owner_worker_gateway_runtime(runtime)
+    return captured
+
+
+def test_make_agent_does_not_let_stale_persisted_api_mode_override_relay(monkeypatch, caplog):
+    """Historical sessions whose persisted api_mode predates the current
+    deployment relay policy must not be allowed to overwrite the relay's
+    authoritative api_mode — otherwise the owner-worker relay would reject
+    the request pre-header (route api_mode mismatch).
+    """
+    from tui_gateway import server
+
+    fake_runtime = {
+        "provider": "custom:codex",
+        "requested_provider": "custom:codex",
+        "relay_provider": "custom:codex",
+        "model": "gpt-5.6-sol",
+        "base_url": "http://127.0.0.1:39123/v1",
+        "api_key": "deployment-inference-relay",
+        "api_mode": "codex_responses",
+        "source": "deployment-relay",
+        "policy_id": "policy-v1",
+    }
+    captured = _capture_make_agent_kwargs(server, monkeypatch, fake_runtime)
+
+    with caplog.at_level("WARNING", logger="tui_gateway.server"), captured["_runtime_ctx"]:
+        agent = server._make_agent(
+            "sid",
+            "key",
+            session_id="session-codex",
+            model_override={
+                "model": "gpt-5.6-sol",
+                "provider": "custom:codex",
+                "base_url": "http://127.0.0.1:39123/v1",
+                "api_key": "deployment-inference-relay",
+                "api_mode": "chat_completions",
+            },
+        )
+
+    kwargs = captured["kwargs"]
+    assert kwargs["api_mode"] == "codex_responses"
+    assert kwargs["relay_provider"] == "custom:codex"
+    assert kwargs["provider"] == "custom:codex"
+    assert kwargs["base_url"] == "http://127.0.0.1:39123/v1"
+    assert kwargs["api_key"] == "deployment-inference-relay"
+    assert agent.api_mode == "codex_responses"
+    assert agent.relay_provider == "custom:codex"
+
+    stale_warnings = [
+        record for record in caplog.records
+        if "stale persisted session api_mode" in record.getMessage()
+    ]
+    assert stale_warnings, "expected a diagnostic warning for stale persisted api_mode"
+    message = stale_warnings[0].getMessage()
+    assert "session_id=session-codex" in message
+    assert "persisted_api_mode=chat_completions" in message
+    assert "effective_api_mode=codex_responses" in message
+    # Diagnostic must never leak the relay sentinel / endpoint / key material.
+    assert "deployment-inference-relay" not in message
+    assert "39123" not in message
+    assert "127.0.0.1" not in message
+
+
+def test_make_agent_honors_explicit_persisted_api_mode_for_non_relay_runtimes(monkeypatch):
+    """Non-relay runtimes must still respect an explicit persisted api_mode so
+    user-selected provider overrides continue to work as before.
+    """
+    from tui_gateway import server
+
+    fake_runtime = {
+        "provider": "custom:anthropic",
+        "requested_provider": "custom:anthropic",
+        "model": "claude-test",
+        "base_url": "https://api.example/v1",
+        "api_key": "sk-test",
+        "api_mode": "chat_completions",
+        "source": "explicit",
+    }
+    captured = _capture_make_agent_kwargs(server, monkeypatch, fake_runtime)
+
+    with captured["_runtime_ctx"]:
+        server._make_agent(
+            "sid",
+            "key",
+            session_id="session-anthropic",
+            model_override={
+                "model": "claude-test",
+                "provider": "custom:anthropic",
+                "base_url": "https://api.example/v1",
+                "api_key": "sk-test",
+                "api_mode": "anthropic_messages",
+            },
+        )
+
+    kwargs = captured["kwargs"]
+    assert kwargs["api_mode"] == "anthropic_messages"
+    assert kwargs.get("relay_provider") is None or kwargs["relay_provider"] == ""
+    assert kwargs["provider"] == "custom:anthropic"

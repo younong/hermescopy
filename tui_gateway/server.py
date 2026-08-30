@@ -5492,8 +5492,30 @@ def _make_agent(
             runtime["base_url"] = override_base_url
         if override_api_key:
             runtime["api_key"] = override_api_key
-        if override_api_mode:
+        # Persisted session rows may carry an api_mode from before the current
+        # deployment relay policy was applied (e.g. an older codex route stored
+        # chat_completions). When the authoritative runtime is the deployment
+        # inference relay, the resolved api_mode is the single source of truth:
+        # overwriting it with stale persisted data would route a /v1/responses
+        # request to /v1/chat/completions and have the owner-worker relay
+        # reject it pre-header. Only honor the persisted mode for non-relay
+        # runtimes where explicit user intent still applies.
+        relay_runtime = (
+            runtime.get("source") == "deployment-relay"
+            or runtime.get("api_key") == "deployment-inference-relay"
+        )
+        if override_api_mode and not relay_runtime:
             runtime["api_mode"] = override_api_mode
+        elif override_api_mode and relay_runtime and override_api_mode != runtime.get("api_mode"):
+            logger.warning(
+                "ignoring stale persisted session api_mode for deployment relay: "
+                "session_id=%s model=%s requested_provider=%s persisted_api_mode=%s effective_api_mode=%s",
+                session_id or key,
+                model,
+                requested_provider,
+                override_api_mode,
+                runtime.get("api_mode"),
+            )
         if relay_provider:
             runtime["relay_provider"] = relay_provider
     else:
