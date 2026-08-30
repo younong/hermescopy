@@ -295,19 +295,31 @@ async def ensure_owner_worker_ready(request: Request) -> tuple[Any, Any]:
     try:
         handle = await start_owner_worker(supervisor, owner)
     except TimeoutError as exc:
-        _log.warning("owner worker startup timed out: %s", exc)
+        _log.warning(
+            "owner worker startup timed out error_type=%s failure_stage=%s",
+            type(exc).__name__,
+            getattr(exc, "failure_stage", "socket_wait"),
+        )
         raise HTTPException(
             status_code=503,
             detail="Owner worker startup timed out",
         ) from exc
     except (OwnerWorkerUnavailableError, OwnerWorkerStartupError) as exc:
-        _log.warning("owner worker unavailable: %s", exc)
+        _log.warning(
+            "owner worker unavailable error_type=%s failure_stage=%s",
+            type(exc).__name__,
+            getattr(exc, "failure_stage", "unknown"),
+        )
         raise HTTPException(
             status_code=503,
             detail="Owner worker is unavailable",
         ) from exc
     except OwnerWorkerHealthError as exc:
-        _log.warning("owner worker health check failed: %s", exc)
+        _log.warning(
+            "owner worker health check failed error_type=%s failure_stage=%s",
+            type(exc).__name__,
+            getattr(exc, "failure_stage", "health_verify"),
+        )
         raise HTTPException(
             status_code=502,
             detail="Owner worker request failed",
