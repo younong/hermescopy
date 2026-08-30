@@ -247,7 +247,6 @@ def test_owner_worker_environment_serializes_only_safe_deployment_descriptor(tmp
             model="gpt-safe",
             api_mode="chat_completions",
             policy_id="policy-v1",
-            allowed_models=("gpt-safe", "gpt-5.6-luna"),
             supports_vision=True,
             compression_model="gpt-5.6-luna",
         ),
@@ -263,24 +262,17 @@ def test_owner_worker_environment_serializes_only_safe_deployment_descriptor(tmp
     validate_owner_worker_runtime_environment(owner_home=owner_home, source=env)
 
 
-def test_deployment_descriptor_rejects_unallowed_compression_model():
-    from hermes_cli.deployment_inference import (
-        DeploymentInferenceDescriptor,
-        DeploymentInferencePolicyInvalid,
-    )
+def test_deployment_descriptor_accepts_compression_until_routes_are_resolved():
+    from hermes_cli.deployment_inference import DeploymentInferenceDescriptor
 
-    with pytest.raises(
-        DeploymentInferencePolicyInvalid,
-        match="compression model is not allowed",
-    ):
-        DeploymentInferenceDescriptor(
-            provider="custom:deployment",
-            model="gpt-safe",
-            api_mode="chat_completions",
-            policy_id="policy-v1",
-            allowed_models=("gpt-safe",),
-            compression_model="gpt-5.6-luna",
-        )
+    descriptor = DeploymentInferenceDescriptor(
+        provider="custom:deployment",
+        model="gpt-safe",
+        api_mode="chat_completions",
+        policy_id="policy-v1",
+        compression_model="gpt-5.6-luna",
+    )
+    assert descriptor.compression_model == "gpt-5.6-luna"
 
 
 def test_owner_worker_environment_serializes_only_safe_media_descriptor(tmp_path):
@@ -369,7 +361,6 @@ def test_owner_worker_environment_omits_unknown_deployment_vision_capability(tmp
             model="gpt-safe",
             api_mode="chat_completions",
             policy_id="policy-v1",
-            allowed_models=("gpt-safe",),
         ),
     )
 

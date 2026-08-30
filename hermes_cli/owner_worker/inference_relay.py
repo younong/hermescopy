@@ -247,10 +247,32 @@ class DeploymentInferenceBroker:
     ) -> None:
         policy.descriptor()
         self._policy_resolver = policy_resolver or (lambda: policy)
+        self._policy = policy
+        self._policy_lock = threading.RLock()
         self._authority_store = authority_store
         self._peers: dict[tuple[str, int, str, int, int], _RelayPeer] = {}
         self._lock = threading.RLock()
         self._closed = False
+
+    def _current_policy(self) -> DeploymentInferencePolicy:
+        """Refresh the policy without discarding the last known good snapshot."""
+        try:
+            candidate = self._policy_resolver()
+            if not isinstance(candidate, DeploymentInferencePolicy):
+                raise TypeError("policy resolver returned invalid policy")
+            candidate.descriptor()
+        except Exception as exc:
+            with self._policy_lock:
+                policy = self._policy
+            logger.warning(
+                "deployment inference policy refresh failed policy_id=%s error_type=%s",
+                policy.policy_id,
+                type(exc).__name__,
+            )
+            return policy
+        with self._policy_lock:
+            self._policy = candidate
+            return candidate
 
     @staticmethod
     def _key(lease: OwnerWorkerAuthorityLease) -> tuple[str, int, str, int, int]:
@@ -535,10 +557,7 @@ class DeploymentInferenceBroker:
             )
         except AuthorizationRejected as exc:
             raise DeploymentInferenceRelayError("relay worker lease is not active") from exc
-        try:
-            policy = self._policy_resolver()
-        except Exception as exc:
-            raise DeploymentInferenceRelayError("relay routing policy is unavailable") from exc
+        policy = self._current_policy()
         route = policy.route_for(selected_model, provider=selected_provider)
         if route is None:
             raise DeploymentInferenceRelayError("relay provider/model route is not allowed")
@@ -616,9 +635,9 @@ class DeploymentInferenceBroker:
                     lease,
                     states=frozenset({WorkerLeaseState.ACTIVE}),
                 )
-                policy = self._policy_resolver()
-            except Exception as exc:
-                raise DeploymentInferenceRelayError("relay routing policy is unavailable") from exc
+                policy = self._current_policy()
+            except AuthorizationRejected as exc:
+                raise DeploymentInferenceRelayError("relay worker lease is not active") from exc
             body = json.dumps(
                 [route.payload() for route in policy.route_descriptors()],
                 separators=(",", ":"),

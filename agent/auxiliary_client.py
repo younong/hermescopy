@@ -577,11 +577,12 @@ def _deployment_relay_route(
         selected_model = str(model or "").strip()
         if not selected_model:
             return None
-        return next(
-            (candidate for candidate in route_descriptors_from_control_plane()
-             if candidate.model == selected_model),
-            None,
+        routes = tuple(
+            candidate
+            for candidate in route_descriptors_from_control_plane()
+            if candidate.model == selected_model
         )
+        return routes[0] if len(routes) == 1 else None
     except Exception:
         return None
 
@@ -599,9 +600,12 @@ def _deployment_compression_route(
         from hermes_cli.deployment_inference import route_descriptors_from_control_plane
         from hermes_cli.runtime_provider import resolve_deployment_inference_runtime
         routes = route_descriptors_from_control_plane()
-        route = next((candidate for candidate in routes if candidate.model == model), None)
-        if route is None:
+        matches = tuple(
+            candidate for candidate in routes if candidate.model == model
+        )
+        if len(matches) != 1:
             return None, None, None, None
+        route = matches[0]
         runtime = resolve_deployment_inference_runtime(
             requested=route.provider,
             target_model=model,
