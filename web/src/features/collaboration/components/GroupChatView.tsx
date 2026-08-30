@@ -1,4 +1,4 @@
-import { Archive, RefreshCw, UserRoundCog } from "lucide-react";
+import { Archive, ArchiveRestore, RefreshCw, UserRoundCog } from "lucide-react";
 import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from "react";
 import { guiChatTranslations, useI18n } from "@/i18n";
 import { employeeDisplayName, employeeDisplayRole, type Employee } from "@/lib/api";
@@ -7,7 +7,7 @@ import type { CollaborationApi } from "../api";
 import type { CollaborationSubmitResponse } from "../protocol";
 import { collaborationReducer, isTerminalTarget } from "../reducer";
 import { defaultMentionSelection } from "../mentions";
-import type { CollaborationGetOptions, CollaborationSubmitMessage } from "../types";
+import type { CollaborationGetOptions, CollaborationGroup, CollaborationSubmitMessage } from "../types";
 import { initialCollaborationState, type CollaborationEmployeeIdentity } from "../types";
 import { GroupComposer, type GroupComposerSubmit } from "./GroupComposer";
 import { GroupConversation } from "./GroupConversation";
@@ -19,10 +19,11 @@ interface GroupChatViewProps {
   employees: Employee[];
   groupId: string;
   onArchive(groupId: string): Promise<void>;
+  onUnarchive(groupId: string): Promise<CollaborationGroup>;
   onGroupChanged(): void;
 }
 
-export function GroupChatView({ api, connection, employees, groupId, onArchive, onGroupChanged }: GroupChatViewProps) {
+export function GroupChatView({ api, connection, employees, groupId, onArchive, onUnarchive, onGroupChanged }: GroupChatViewProps) {
   const { t } = useI18n();
   const copy = guiChatTranslations(t).collaboration;
   const [state, dispatch] = useReducer(collaborationReducer, initialCollaborationState);
@@ -235,7 +236,21 @@ export function GroupChatView({ api, connection, employees, groupId, onArchive, 
             <button aria-label={copy.manageMembers} className="gui-chat-icon-button" onClick={() => setMemberManagerOpen(true)} type="button"><UserRoundCog /></button>
             <button aria-label={copy.archiveGroup} className="gui-chat-icon-button" onClick={() => void onArchive(groupId)} type="button"><Archive /></button>
           </>
-        ) : null}
+        ) : (
+          <button
+            aria-label={copy.unarchiveGroup}
+            className="gui-chat-icon-button"
+            onClick={() => void onUnarchive(groupId).then((group) => {
+              dispatch({
+                type: "event",
+                event: { type: "collaboration.group.changed", payload: group },
+              });
+            })}
+            type="button"
+          >
+            <ArchiveRestore />
+          </button>
+        )}
       </div>
       {state.error ? <div className="gui-chat-notice gui-chat-notice-error">{state.error}</div> : null}
       <GroupConversation employees={identities} onLoadEarlier={loadEarlier} state={state} />

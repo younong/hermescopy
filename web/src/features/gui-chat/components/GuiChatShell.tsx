@@ -686,6 +686,14 @@ export function GuiChatShell() {
     refreshGroups();
   }, [copy.shell.gatewayNotReady, refreshGroups]);
 
+  const unarchiveGroup = useCallback(async (targetGroupId: string) => {
+    const connection = connectionRef.current;
+    if (!connection) throw new Error(copy.shell.gatewayNotReady);
+    const group = await connection.collaboration.unarchiveGroup(targetGroupId);
+    refreshGroups();
+    return group;
+  }, [copy.shell.gatewayNotReady, refreshGroups]);
+
   useEffect(() => {
     const mql = window.matchMedia("(max-width: 1023px)");
     const sync = () => setNarrow(mql.matches);
@@ -1396,6 +1404,7 @@ export function GuiChatShell() {
             employees={employees}
             groupId={groupId}
             onArchive={archiveGroup}
+            onUnarchive={unarchiveGroup}
             onGroupChanged={refreshGroups}
           />
         ) : conversationPane}

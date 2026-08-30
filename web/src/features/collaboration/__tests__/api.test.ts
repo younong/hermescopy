@@ -56,15 +56,17 @@ describe("collaboration API", () => {
     expect(ensureConnected).toHaveBeenCalledTimes(5);
   });
 
-  it("uses public durable IDs for archive, target, and approval mutations", async () => {
+  it("uses public durable IDs for archive, unarchive, target, and approval mutations", async () => {
     const { api, request } = harness();
 
     await api.archiveGroup("group-a");
+    await api.unarchiveGroup("group-a");
     await api.interruptTarget("target-a");
     await api.respondToApproval("approval-a", "session");
 
     expect(request.mock.calls.map(([method, params]) => [method, params])).toEqual([
       ["collaboration.group.archive", { group_id: "group-a" }],
+      ["collaboration.group.unarchive", { group_id: "group-a" }],
       ["collaboration.target.interrupt", { target_id: "target-a" }],
       ["collaboration.approval.respond", { approval_id: "approval-a", choice: "session" }],
     ]);

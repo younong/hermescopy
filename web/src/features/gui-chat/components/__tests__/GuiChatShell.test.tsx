@@ -1762,6 +1762,7 @@ function createConnection(): TestGuiChatConnection {
     attachPdf: vi.fn(),
     collaboration: {
       archiveGroup: vi.fn(),
+      unarchiveGroup: vi.fn(),
       createGroup: vi.fn(),
       getGroup: vi.fn(),
       interruptTarget: vi.fn(),

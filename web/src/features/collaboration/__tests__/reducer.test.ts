@@ -119,6 +119,32 @@ describe("collaborationReducer", () => {
     expect(reconciled.lastSequence).toBe(4);
   });
 
+
+  it("updates an archived group when it receives an unarchive group change", () => {
+    const archived = collaborationReducer(initialCollaborationState, {
+      snapshot: snapshot([event(1)], 0, {
+        group: { ...group, archived_at: 1_700_000_000, last_sequence: 1, status: "archived" },
+      }),
+      type: "snapshot",
+    });
+
+    const restored = collaborationReducer(archived, {
+      event: gatewayEvent("collaboration.group.changed", {
+        ...group,
+        archived_at: null,
+        last_sequence: 2,
+        status: "active",
+        updated_at: 1_700_000_001,
+      }),
+      type: "event",
+    });
+
+    expect(restored.group?.status).toBe("active");
+    expect(restored.group?.archived_at).toBeNull();
+    expect(restored.lastSequence).toBe(2);
+    expect(restored.eventsBySequence[1]).toEqual(event(1));
+  });
+
   it("separates backward history cursors from the forward reconciliation watermark", () => {
     const initial = collaborationReducer(initialCollaborationState, {
       snapshot: snapshot([event(101), event(102)], 0, {

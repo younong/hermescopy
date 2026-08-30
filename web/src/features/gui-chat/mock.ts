@@ -39,6 +39,7 @@ export function connectMockGuiChat(): GuiChatConnection {
   return {
     collaboration: {
       archiveGroup: async () => { throw new Error("Group chat is unavailable in mock mode"); },
+      unarchiveGroup: async () => { throw new Error("Group chat is unavailable in mock mode"); },
       createGroup: async () => { throw new Error("Group chat is unavailable in mock mode"); },
       getGroup: async () => { throw new Error("Group chat is unavailable in mock mode"); },
       interruptTarget: async () => { throw new Error("Group chat is unavailable in mock mode"); },

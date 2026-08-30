@@ -333,6 +333,44 @@ class CollaborationStore:
         group, live_sessions = self.db._execute_write(_write)
         return self._group(group), live_sessions
 
+    def unarchive_group(self, group_id: str) -> tuple[CollaborationGroup, bool]:
+        group_id = _identifier(group_id, "group ID")
+        now = time.time()
+
+        def _write(conn):
+            group = self._owned_group_row(conn, group_id)
+            if group is None:
+                raise RuntimeError("collaboration group is unavailable")
+            if group["status"] == "active":
+                return dict(group), False
+            event = self._append_event(
+                conn,
+                group_id=group_id,
+                event_kind="group.unarchived",
+                actor_kind="owner",
+                body={},
+                now=now,
+            )
+            changed = conn.execute(
+                "UPDATE collaboration_groups SET status='active', archived_at=NULL, "
+                "updated_at=? WHERE group_id=? AND owner_key=? AND status='archived'",
+                (now, group_id, self.owner_key),
+            ).rowcount
+            if changed != 1:
+                raise RuntimeError("collaboration unarchive state changed concurrently")
+            group = self._owned_group_row(conn, group_id)
+            if (
+                group is None
+                or group["status"] != "active"
+                or group["archived_at"] is not None
+                or int(group["last_sequence"]) != int(event["sequence"])
+            ):
+                raise RuntimeError("collaboration unarchive event is inconsistent")
+            return dict(group), True
+
+        group, changed = self.db._execute_write(_write)
+        return self._group(group), changed
+
     def add_membership(
         self,
         group_id: str,

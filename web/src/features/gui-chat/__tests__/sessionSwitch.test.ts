@@ -11,6 +11,7 @@ class FakeConnection implements GuiChatConnection {
   readonly attachOwner = vi.fn().mockResolvedValue(undefined);
   readonly collaboration = {
     archiveGroup: vi.fn(),
+    unarchiveGroup: vi.fn(),
     createGroup: vi.fn(),
     getGroup: vi.fn(),
     interruptTarget: vi.fn(),

@@ -173,6 +173,13 @@ class CollaborationService:
         self.emit("collaboration.group.changed", payload)
         return {"group": payload}
 
+    def unarchive_group(self, group_id: str) -> dict[str, Any]:
+        group, changed = self.store.unarchive_group(group_id)
+        payload = self._public_group(asdict(group))
+        if changed:
+            self.emit("collaboration.group.changed", payload)
+        return {"group": payload}
+
     def update_members(
         self,
         group_id: str,

@@ -28,6 +28,7 @@ export interface CollaborationApi {
   getGroup(groupId: string, options?: CollaborationGetOptions, signal?: AbortSignal): Promise<CollaborationSnapshot>;
   createGroup(name: string, employeeIds: string[], clientIdempotencyKey: string): Promise<CollaborationSnapshot>;
   archiveGroup(groupId: string): Promise<CollaborationGroupsResponse["groups"][number]>;
+  unarchiveGroup(groupId: string): Promise<CollaborationGroupsResponse["groups"][number]>;
   updateMembers(groupId: string, employeeIds: string[]): Promise<CollaborationSnapshot>;
   submitMessage(message: CollaborationSubmitMessage): Promise<CollaborationSubmitResponse>;
   uploadAttachment(groupId: string, file: File): Promise<CollaborationAttachmentResponse>;
@@ -53,6 +54,13 @@ export function createCollaborationApi(
     archiveGroup: async (groupId) => {
       const response = await request<{ group: CollaborationGroupsResponse["groups"][number] }>(
         "collaboration.group.archive",
+        { group_id: groupId },
+      );
+      return response.group;
+    },
+    unarchiveGroup: async (groupId) => {
+      const response = await request<{ group: CollaborationGroupsResponse["groups"][number] }>(
+        "collaboration.group.unarchive",
         { group_id: groupId },
       );
       return response.group;
