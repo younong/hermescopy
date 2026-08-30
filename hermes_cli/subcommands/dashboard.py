@@ -160,6 +160,15 @@ def build_dashboard_parser(
         "--json", action="store_true", help="Print safe status metadata as JSON"
     )
     authority_recover_parser.set_defaults(func=cmd_dashboard_authority)
+    authority_continuity_parser = authority_subparsers.add_parser(
+        "recover-continuity",
+        help="Recover a metadata-only replay-continuity quarantine offline",
+    )
+    authority_continuity_parser.add_argument("--incident", required=True, metavar="ID")
+    authority_continuity_parser.add_argument(
+        "--json", action="store_true", help="Print safe status metadata as JSON"
+    )
+    authority_continuity_parser.set_defaults(func=cmd_dashboard_authority)
 
     # ``hermes dashboard users`` manages the durable, local multi-user Basic
     # auth authority. Passwords never travel in argv: reset reads stdin (or an
