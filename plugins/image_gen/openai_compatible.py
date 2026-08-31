@@ -235,20 +235,33 @@ def generate_codex_responses_image_bytes(
     chat_model = str(chat_model or "").strip()
     if not chat_model:
         try:
-            from hermes_cli.config import load_config_readonly
-
-            codex_block = (
-                (load_config_readonly().get("providers") or {}).get("codex") or {}
+            from hermes_cli.config import (
+                get_compatible_custom_providers,
+                load_config_readonly,
             )
+
+            config = load_config_readonly()
+            codex_block = (config.get("providers") or {}).get("codex") or {}
             chat_model = str(
                 codex_block.get("default_model") or codex_block.get("model") or ""
             ).strip()
+            if not chat_model:
+                for provider in get_compatible_custom_providers(config):
+                    provider_name = str(provider.get("name") or "").strip().lower()
+                    provider_key = str(provider.get("provider_key") or "").strip().lower()
+                    if provider_name not in {"codex", "custom:codex"} and provider_key != "codex":
+                        continue
+                    chat_model = str(
+                        provider.get("model") or provider.get("default_model") or ""
+                    ).strip()
+                    if chat_model:
+                        break
         except Exception:
             chat_model = ""
     if not chat_model:
         raise ValueError(
             "Codex Responses chat_model is required "
-            "(set executor_params.chat_model or providers.codex.default_model in config.yaml)"
+            "(set executor_params.chat_model or configure custom:codex in config.yaml)"
         )
     base_url = str(openai_base_url or "").strip().rstrip("/")
     if not base_url:

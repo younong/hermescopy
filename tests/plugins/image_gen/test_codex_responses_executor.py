@@ -203,6 +203,54 @@ def test_codex_responses_executor_falls_back_to_provider_default_chat_model(monk
     assert payload["model"] == "gpt-5.6-sol"
 
 
+def test_codex_responses_executor_falls_back_to_legacy_codex_provider(monkeypatch):
+    """When chat_model is empty, executor reuses custom:codex config."""
+
+    image = _png_bytes()
+    event = {
+        "item": {
+            "type": "image_generation_call",
+            "result": base64.b64encode(image).decode("ascii"),
+        },
+    }
+    response = _SseResponse([
+        "event: response.output_item.done",
+        f"data: {json.dumps(event)}",
+        "",
+        "data: [DONE]",
+        "",
+    ])
+    captured = {}
+    monkeypatch.setattr(
+        "requests.post", _request_kwargs(captured, response)
+    )
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config_readonly",
+        lambda: {
+            "custom_providers": [{
+                "name": "codex",
+                "base_url": "https://codex.example/v1",
+                "model": "gpt-5.6-sol",
+                "api_mode": "codex_responses",
+            }],
+        },
+    )
+
+    result = openai_compatible.generate_codex_responses_image_bytes(
+        prompt="draw a square",
+        aspect_ratio="1:1",
+        model="gpt-image-2",
+        references=[],
+        api_key="trusted-secret",
+        openai_base_url="https://codex.example/v1",
+    )
+
+    assert result["image_bytes"] == image
+    assert result["metadata"]["responses_model"] == "gpt-5.6-sol"
+    assert captured["kwargs"]["json"]["model"] == "gpt-5.6-sol"
+
+
+
 def test_codex_responses_executor_raises_when_no_chat_model_anywhere(monkeypatch):
     """Empty chat_model with no provider config default raises ValueError."""
 
