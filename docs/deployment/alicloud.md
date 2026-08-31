@@ -408,6 +408,8 @@ npm run deploy -- --tag v2026.7.4 --keep-releases 3 --dry-run
 
 ## Deploy 脚本模板字符串陷阱（fail-closed）
 
+跟踪 issue: [#354 — Harden Owner Worker lifecycle across Dashboard restart and deployment](https://github.com/younong/hermescopy/issues/354)。
+
 `deploy/deploy.mjs` 把远端 deploy bash 写成单个 `String.raw\`...\`` 模板字面量,并通过 `deployArchive` 把它喂给 `bash -s --`。`String.raw` 只控制反斜杠转义,不会屏蔽 `${...}` 的 JS 模板插值 — 在模板体内任何写成 `${var}` 的文本都会被 JS 当模板表达式求值,未在 JS 作用域里定义的变量直接抛 `ReferenceError`,脚本从未真正发送就停止。
 
 正确写法:和文件中其它位置保持一致,使用 **`${"${"}var}`** —— 内层的 `"${"}` 求值为字符串 `"${"`,外层的 `}` 把它的字面量合在一起,生成 bash 想要的 `${var}` 占位符。同样的逃生在 `case` pattern、`echo`、heredoc、`printf '%s'` 等等任何 bash 占位符都可能存在;一次只写对是不够的,每次新增都要审一行。
