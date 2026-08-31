@@ -808,6 +808,7 @@ runtime_pruning_status="disabled"
 
 gateway_unit="/etc/systemd/system/hermes-gateway.service"
 dashboard_unit="/etc/systemd/system/hermes-dashboard.service"
+dashboard_dropin_dir="/etc/systemd/system/hermes-dashboard.service.d"
 nginx_log_format="/etc/nginx/conf.d/00-hermes-log-format.conf"
 legacy_nginx_log_format="/etc/nginx/conf.d/hermes-log-format.conf"
 
@@ -822,10 +823,13 @@ backup_deployment_state() {
       cp -a -- "$path" "$rollback_dir/$(printf '%s' "$path" | sed 's#/#_#g')"
     fi
   done
+  if [ -d "$dashboard_dropin_dir" ]; then
+    cp -a -- "$dashboard_dropin_dir" "$rollback_dir/$(printf '%s' "$dashboard_dropin_dir" | sed 's#/#_#g')"
+  fi
 }
 
 restore_deployment_state() {
-  local path backup
+  local path backup dashboard_dropin_backup
   for path in "$gateway_unit" "$dashboard_unit" "$runner" "$sandbox_policy" "$sandbox_seccomp" "$nginx_log_format" "$legacy_nginx_log_format"; do
     backup="$rollback_dir/$(printf '%s' "$path" | sed 's#/#_#g')"
     if [ -e "$backup" ]; then
@@ -834,6 +838,13 @@ restore_deployment_state() {
       rm -f -- "$path"
     fi
   done
+  dashboard_dropin_backup="$rollback_dir/$(printf '%s' "$dashboard_dropin_dir" | sed 's#/#_#g')"
+  if [ -e "$dashboard_dropin_backup" ]; then
+    rm -rf -- "$dashboard_dropin_dir"
+    cp -a -- "$dashboard_dropin_backup" "$dashboard_dropin_dir"
+  else
+    rm -rf -- "$dashboard_dropin_dir"
+  fi
   if [ -n "$old_current_target" ]; then
     rollback_link="$current.rollback.$$"
     ln -sT "$old_current_target" "$rollback_link"
@@ -1545,6 +1556,10 @@ echo "HERMES_DEPLOY_STAGE authority_preflight=passed"
 services_touched="1"
 snapshot_authority
 install -o root -g root -m 0644 "$staged_dashboard_unit" "$dashboard_unit"
+if [ -d "$dashboard_dropin_dir" ]; then
+  echo "Removing legacy Dashboard systemd drop-in directory: $dashboard_dropin_dir"
+  rm -rf -- "$dashboard_dropin_dir"
+fi
 systemctl daemon-reload
 expected_stop_minutes="$((dashboard_stop_timeout / 60))"
 expected_stop_seconds="$((dashboard_stop_timeout % 60))"
