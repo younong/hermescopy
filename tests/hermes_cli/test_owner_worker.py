@@ -3225,40 +3225,6 @@ def test_supervisor_process_launch_failure_reclaims_generation_runtime(tmp_path)
 
 
 
-def test_supervisor_process_launch_failure_records_generation_stage(tmp_path, monkeypatch):
-    owner = _Owner("ok1_launch_failure_diagnostics", tmp_path / "owner")
-    records = []
-    monkeypatch.setattr(
-        OwnerWorkerSupervisor,
-        "_audit_generation",
-        staticmethod(lambda *args, **kwargs: records.append((args, kwargs))),
-    )
-
-    def fail_process_launch(*_args, **_kwargs):
-        raise OSError("spawn failed")
-
-    supervisor = OwnerWorkerSupervisor(
-        control_home=tmp_path / "control",
-        client_cls=_FakeClient,
-        process_factory=fail_process_launch,
-        startup_timeout=0.1,
-        startup_cooldown=0,
-    )
-
-    with pytest.raises(OwnerWorkerStartupError, match="process launch failed"):
-        supervisor.get_or_start(owner)
-
-    assert len(records) == 1
-    args, kwargs = records[0]
-    assert args[0].value == "generation_start_failed"
-    assert args[1].worker_generation == 1
-    assert kwargs["failure_stage"] == "process_spawn"
-    assert isinstance(kwargs["failure"], OSError)
-    assert kwargs["process"] is None
-    assert kwargs["socket_path"].exists() is False
-
-
-
 def test_supervisor_relay_activation_failure_revokes_active_worker(tmp_path, monkeypatch):
     from hermes_cli.deployment_media import (
         DeploymentMediaPolicy,

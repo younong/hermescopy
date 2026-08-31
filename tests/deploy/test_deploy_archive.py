@@ -97,18 +97,10 @@ def test_remote_cutover_stops_before_atomic_current_switch():
     script = DEPLOY_SCRIPT.read_text(encoding="utf-8")
 
     cutover = script.index("# Stop the old release before changing any active artifact")
-    snapshot_authority = script.index("snapshot_authority", cutover)
-    install_dashboard_unit = script.index(
-        'install -o root -g root -m 0644 "$staged_dashboard_unit" "$dashboard_unit"',
-        snapshot_authority,
-    )
-    reload_before_stop = script.index("systemctl daemon-reload", install_dashboard_unit)
-    timeout_check = script.index('systemctl show hermes-dashboard.service -p TimeoutStopUSec --value', reload_before_stop)
-    stop_dashboard = script.index("systemctl stop hermes-dashboard.service", timeout_check)
+    stop_dashboard = script.index("systemctl stop hermes-dashboard.service", cutover)
     stop_gateway = script.index("systemctl stop hermes-gateway.service", stop_dashboard)
     switch_current = script.index('mv -Tf "$next_current" "$current"')
     start_dashboard = script.index("systemctl start hermes-dashboard.service", switch_current)
-    assert snapshot_authority < install_dashboard_unit < reload_before_stop < timeout_check < stop_dashboard
     assert stop_dashboard < stop_gateway < switch_current < start_dashboard
     assert "pgrep -f '[h]ermes_cli.owner_worker.entrypoint'" not in script
     assert "systemctl restart hermes-gateway.service" not in script
@@ -125,7 +117,8 @@ def test_remote_cutover_stops_before_atomic_current_switch():
     assert "cross-release continuity preparation failed before remote deployment" in script
     authority_preflight = script.index("HERMES_DEPLOY_STAGE authority_preflight=passed")
     assert authority_preflight < stop_dashboard
-    assert stop_gateway < switch_current
+    authority_snapshot = script.index("snapshot_authority", stop_gateway)
+    assert stop_gateway < authority_snapshot < switch_current
     rollback_stop = script.index(
         "systemctl stop hermes-dashboard.service hermes-gateway.service || true"
     )

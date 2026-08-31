@@ -211,10 +211,6 @@ _AUTHORITY_EVENT_REASONS: dict[AuthorityAuditEvent, frozenset[AuthorityAuditReas
 
 _CORRELATION_ID_RE = re.compile(r"^[a-f0-9]{32,64}$")
 _DIGEST_RE = re.compile(r"^(?:sha256:)?[a-f0-9]{64}$")
-_AUDIT_FAILURE_STAGE_RE = re.compile(
-    r"^(?:authority_claim|resource_admission|broker_register|runtime_prepare|process_spawn|socket_wait|health_verify|lease_activate|cleanup)$"
-)
-_AUDIT_FAILURE_TYPE_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]{0,63}$")
 
 
 def _resolve_log_path() -> Path:
@@ -282,20 +278,12 @@ def audit_authority(
     memory_oom: int | None = None,
     memory_oom_kill: int | None = None,
     pids_max: int | None = None,
-    failure_stage: str | None = None,
-    failure_type: str | None = None,
-    worker_id: str | None = None,
-    process_id: int | None = None,
-    exit_code: int | None = None,
-    socket_exists: bool | None = None,
 ) -> None:
     """Write one allowlisted, de-identified Control Plane authority record.
 
     The helper intentionally has no ``**fields`` escape hatch. Callers must
     map failures to :class:`AuthorityAuditReason`; user-controlled values,
     URLs, identities, credentials, and exception text cannot enter this sink.
-    Startup diagnostics use a closed stage/type vocabulary and carry only the
-    opaque worker identity plus process state needed to correlate one failure.
     """
     if not isinstance(event, AuthorityAuditEvent):
         raise ValueError("authority audit event is invalid")
@@ -306,19 +294,6 @@ def audit_authority(
         raise ValueError("authority audit correlation_id is invalid")
     if audience_class not in {"browser-ws", "owner-persisted-scope", "none"}:
         raise ValueError("authority audit audience class is invalid")
-    if any(value is not None for value in (failure_stage, failure_type, worker_id, process_id, exit_code, socket_exists)):
-        if event is not AuthorityAuditEvent.WORKER_GENERATION or reason is not AuthorityAuditReason.GENERATION_START_FAILED:
-            raise ValueError("authority startup diagnostics are invalid for this event")
-        if failure_stage is None or not _AUDIT_FAILURE_STAGE_RE.fullmatch(str(failure_stage)):
-            raise ValueError("authority audit failure_stage is invalid")
-        if failure_type is None or not _AUDIT_FAILURE_TYPE_RE.fullmatch(str(failure_type)):
-            raise ValueError("authority audit failure_type is invalid")
-        if worker_id is None or not _CORRELATION_ID_RE.fullmatch(str(worker_id)):
-            raise ValueError("authority audit worker_id is invalid")
-        if process_id is not None and int(process_id) < 1:
-            raise ValueError("authority audit process_id is invalid")
-        if socket_exists is not None and not isinstance(socket_exists, bool):
-            raise ValueError("authority audit socket_exists is invalid")
 
     entry: dict[str, Any] = {
         "ts": _dt.datetime.now(_dt.timezone.utc).isoformat(),
@@ -344,19 +319,6 @@ def audit_authority(
             if normalized < 0:
                 raise ValueError(f"authority audit {key} is invalid")
             entry[key] = normalized
-    for key, value in (
-        ("failure_stage", failure_stage),
-        ("failure_type", failure_type),
-        ("worker_id", worker_id),
-    ):
-        if value is not None:
-            entry[key] = str(value)
-    if process_id is not None:
-        entry["process_id"] = int(process_id)
-    if exit_code is not None:
-        entry["exit_code"] = int(exit_code)
-    if socket_exists is not None:
-        entry["socket_exists"] = socket_exists
     for key, value in (
         ("scope_digest", scope_digest),
         ("credential_digest", credential_digest),

@@ -424,18 +424,8 @@ class OwnerWorkerSupervisor:
                 raise
 
     @staticmethod
-    def _audit_generation(
-        reason: AuthorityAuditReason,
-        lease: OwnerWorkerAuthorityLease,
-        *,
-        failure_stage: str | None = None,
-        failure: BaseException | None = None,
-        process: Any | None = None,
-        socket_path: Path | None = None,
-    ) -> None:
+    def _audit_generation(reason: AuthorityAuditReason, lease: OwnerWorkerAuthorityLease) -> None:
         try:
-            process_id = getattr(process, "pid", None) if process is not None else None
-            exit_code = getattr(process, "returncode", None) if process is not None else None
             audit_authority(
                 AuthorityAuditEvent.WORKER_GENERATION,
                 correlation_id=new_authority_correlation_id(),
@@ -443,47 +433,10 @@ class OwnerWorkerSupervisor:
                 audience_class="none",
                 worker_generation=lease.worker_generation,
                 recovery_generation=lease.recovery_generation,
-                failure_stage=failure_stage,
-                failure_type=type(failure).__name__ if failure is not None else None,
-                worker_id=lease.worker_id if failure is not None else None,
-                process_id=process_id,
-                exit_code=exit_code,
-                socket_exists=socket_path.exists() if socket_path is not None else None,
             )
         except Exception:
             # Observability cannot alter worker fencing or cleanup behavior.
             pass
-
-    @staticmethod
-    def _audit_start_failure(
-        lease: OwnerWorkerAuthorityLease,
-        exc: BaseException,
-        *,
-        failure_stage: str,
-        process: Any | None = None,
-        socket_path: Path | None = None,
-    ) -> None:
-        """Persist safe, generation-scoped evidence for one failed start."""
-        _log.warning(
-            "Owner worker startup failed",
-            extra={
-                "worker_generation": lease.worker_generation,
-                "worker_id": lease.worker_id,
-                "failure_stage": failure_stage,
-                "failure_type": type(exc).__name__,
-                "process_id": getattr(process, "pid", None) if process is not None else None,
-                "exit_code": getattr(process, "returncode", None) if process is not None else None,
-                "socket_exists": socket_path.exists() if socket_path is not None else None,
-            },
-        )
-        OwnerWorkerSupervisor._audit_generation(
-            AuthorityAuditReason.GENERATION_START_FAILED,
-            lease,
-            failure_stage=failure_stage,
-            failure=exc,
-            process=process,
-            socket_path=socket_path,
-        )
 
     def get_or_start(self, owner: Any, *, timeout: float | None = None) -> OwnerWorkerHandle:
         started_at = time.monotonic()
@@ -726,9 +679,7 @@ class OwnerWorkerSupervisor:
 
         def _ensure_startup_heartbeat() -> None:
             if heartbeat_failure:
-                failure = OwnerWorkerStartupError("owner worker startup lease heartbeat failed")
-                failure.failure_stage = "authority_claim"
-                raise failure from heartbeat_failure[0]
+                raise OwnerWorkerStartupError("owner worker startup lease heartbeat failed") from heartbeat_failure[0]
 
         try:
             socket_path = self.socket_path_for(owner, generation.worker_generation)
@@ -767,18 +718,10 @@ class OwnerWorkerSupervisor:
                     broker_cleanup_pending=False,
                     runtime_cleanup_pending=False,
                 )
-            self._audit_start_failure(
-                claim.lease,
-                exc,
-                failure_stage="runtime_prepare",
-                socket_path=socket_path,
-            )
             if isinstance(exc, Exception):
-                failure = OwnerWorkerStartupError(
+                raise OwnerWorkerStartupError(
                     "owner worker startup setup failed"
-                )
-                failure.failure_stage = "runtime_prepare"
-                raise failure from exc
+                ) from exc
             raise
 
         relay_fd = None
@@ -786,7 +729,6 @@ class OwnerWorkerSupervisor:
         resource_broker_fd = None
         worker_resource_scope = None
         resource_started_at = time.monotonic()
-        startup_failure_stage = "resource_admission"
 
         def _revoke_startup_brokers(lease: OwnerWorkerAuthorityLease) -> bool:
             cleanup_complete = True
@@ -850,18 +792,14 @@ class OwnerWorkerSupervisor:
             if self.resource_manager is not None:
                 worker_resource_scope = self.resource_manager.admit_worker(claim.lease)
             if self.deployment_inference_broker is not None:
-                startup_failure_stage = "broker_register"
                 relay_fd = self.deployment_inference_broker.register(claim.lease)
                 env["HERMES_DEPLOYMENT_INFERENCE_RELAY_FD"] = str(relay_fd)
             if self.deployment_media_broker is not None:
-                startup_failure_stage = "broker_register"
                 media_relay_fd = self.deployment_media_broker.register(claim.lease)
                 env["HERMES_DEPLOYMENT_MEDIA_RELAY_FD"] = str(media_relay_fd)
             if self.deployment_resource_broker is not None:
-                startup_failure_stage = "broker_register"
                 resource_broker_fd = self.deployment_resource_broker.register(claim.lease)
                 env["HERMES_DEPLOYMENT_RESOURCE_BROKER_FD"] = str(resource_broker_fd)
-            startup_failure_stage = "runtime_prepare"
             runtime_paths = owner_worker_runtime_paths(
                 owner_home=owner_home,
                 worker_generation=generation.worker_generation,
@@ -881,12 +819,6 @@ class OwnerWorkerSupervisor:
             if worker_resource_scope is not None:
                 _try_startup_cleanup("resource_scope", worker_resource_scope.cleanup)
             _try_startup_cleanup("startup_heartbeat", _stop_startup_heartbeat)
-            self._audit_start_failure(
-                claim.lease,
-                exc,
-                failure_stage=getattr(exc, "failure_stage", startup_failure_stage),
-                socket_path=socket_path,
-            )
             authority_cleanup_complete = _fence_failed_start(claim.lease)
             _retain_incomplete_startup_cleanup(
                 lease=claim.lease,
@@ -897,11 +829,9 @@ class OwnerWorkerSupervisor:
                 runtime_cleanup_complete=True,
             )
             if isinstance(exc, Exception):
-                failure = OwnerWorkerStartupError(
+                raise OwnerWorkerStartupError(
                     "owner worker resource admission failed"
-                )
-                failure.failure_stage = getattr(exc, "failure_stage", startup_failure_stage)
-                raise failure from exc
+                ) from exc
             raise
         observe_latency_stage(
             stage="owner_worker.ready.resource_admission",
@@ -914,7 +844,7 @@ class OwnerWorkerSupervisor:
                 RootKind.OWNER_WRITABLE,
                 f"runtime/workers/{generation.worker_generation}",
             )
-        except BaseException as exc:
+        except BaseException:
             observe_latency_stage(
                 stage="owner_worker.ready.process_spawn",
                 started_at=process_started_at,
@@ -934,12 +864,6 @@ class OwnerWorkerSupervisor:
             if worker_resource_scope is not None:
                 _try_startup_cleanup("resource_scope", worker_resource_scope.cleanup)
             _try_startup_cleanup("startup_heartbeat", _stop_startup_heartbeat)
-            self._audit_start_failure(
-                claim.lease,
-                exc,
-                failure_stage="runtime_prepare",
-                socket_path=socket_path,
-            )
             authority_cleanup_complete = _fence_failed_start(claim.lease)
             _retain_incomplete_startup_cleanup(
                 lease=claim.lease,
@@ -1113,13 +1037,7 @@ class OwnerWorkerSupervisor:
                 if process_exited
                 else False
             )
-            self._audit_start_failure(
-                claim.lease,
-                exc,
-                failure_stage="process_spawn",
-                process=process,
-                socket_path=socket_path,
-            )
+            self._audit_generation(AuthorityAuditReason.GENERATION_START_FAILED, claim.lease)
             authority_cleanup_complete = _fence_failed_start(claim.lease)
             _retain_incomplete_startup_cleanup(
                 lease=claim.lease,
@@ -1130,11 +1048,9 @@ class OwnerWorkerSupervisor:
                 runtime_cleanup_complete=runtime_cleanup_complete,
             )
             if isinstance(exc, Exception):
-                failure = OwnerWorkerStartupError(
+                raise OwnerWorkerStartupError(
                     f"owner worker process launch failed: {exc}"
-                )
-                failure.failure_stage = "process_spawn"
-                raise failure from exc
+                ) from exc
             raise
         finally:
             for descriptor in (cwd_fd, stdout_handle, stderr_handle):
@@ -1195,18 +1111,7 @@ class OwnerWorkerSupervisor:
                 if getattr(worker_resource_scope, "released", False):
                     worker_resource_scope = None
             _try_startup_cleanup("startup_heartbeat", _stop_startup_heartbeat)
-            failure_stage = (
-                "lease_activate"
-                if activation_started_at is not None
-                else getattr(exc, "failure_stage", "health_verify")
-            )
-            self._audit_start_failure(
-                claim.lease,
-                exc,
-                failure_stage=failure_stage,
-                process=process,
-                socket_path=socket_path,
-            )
+            self._audit_generation(AuthorityAuditReason.GENERATION_START_FAILED, claim.lease)
             authority_cleanup_complete = _fence_failed_start(claim.lease)
             process_exited = self._try_stop_and_close_process(
                 process,
@@ -1232,9 +1137,7 @@ class OwnerWorkerSupervisor:
             if isinstance(exc, (OwnerWorkerUnavailableError, TimeoutError)):
                 raise
             if isinstance(exc, Exception):
-                failure = OwnerWorkerStartupError("owner worker startup failed")
-                failure.failure_stage = failure_stage
-                raise failure from exc
+                raise OwnerWorkerStartupError("owner worker startup failed") from exc
             raise
 
         handle = OwnerWorkerHandle(
@@ -1265,13 +1168,7 @@ class OwnerWorkerSupervisor:
                 path=readiness_path,
             )
             broker_cleanup_complete = _revoke_startup_brokers(active_lease)
-            self._audit_start_failure(
-                active_lease,
-                exc,
-                failure_stage="lease_activate",
-                process=process,
-                socket_path=socket_path,
-            )
+            self._audit_generation(AuthorityAuditReason.GENERATION_START_FAILED, active_lease)
             authority_cleanup_complete = _fence_failed_start(active_lease)
             process_exited = self._try_stop_and_close_process(
                 process,
@@ -1300,11 +1197,9 @@ class OwnerWorkerSupervisor:
                 runtime_cleanup_complete=runtime_cleanup_complete,
             )
             if isinstance(exc, Exception):
-                failure = OwnerWorkerStartupError(
+                raise OwnerWorkerStartupError(
                     "owner worker relay activation failed"
-                )
-                failure.failure_stage = "lease_activate"
-                raise failure from exc
+                ) from exc
             raise
         with self._start_finished:
             if self._shutting_down:
@@ -2332,15 +2227,11 @@ class OwnerWorkerSupervisor:
                     )
                     last_heartbeat = time.monotonic()
                 except AuthorizationRejected as exc:
-                    failure = OwnerWorkerStartupError("owner worker startup lease heartbeat failed")
-                    failure.failure_stage = "authority_claim"
-                    raise failure from exc
+                    raise OwnerWorkerStartupError("owner worker startup lease heartbeat failed") from exc
             if process.poll() is not None:
-                failure = OwnerWorkerStartupError(
+                raise OwnerWorkerStartupError(
                     f"owner worker exited during startup with code {process.returncode}"
                 )
-                failure.failure_stage = "socket_wait"
-                raise failure
             if socket_path.exists():
                 try:
                     return self.client_cls(socket_path, control_home=self.control_home).verify_health(
@@ -2356,14 +2247,10 @@ class OwnerWorkerSupervisor:
                     last_error = exc
             time.sleep(min(self.poll_interval, max(0.0, deadline - time.monotonic())))
         if last_error is not None:
-            failure = OwnerWorkerStartupError(
+            raise OwnerWorkerStartupError(
                 f"owner worker failed health verification: {last_error}"
-            )
-            failure.failure_stage = "health_verify"
-            raise failure from last_error
-        failure = TimeoutError("timed out waiting for owner worker socket")
-        failure.failure_stage = "socket_wait"
-        raise failure
+            ) from last_error
+        raise TimeoutError("timed out waiting for owner worker socket")
 
     def _argv_for(self, owner: Any, socket_path: Path, generation: WorkerGeneration) -> list[str]:
         argv = [
