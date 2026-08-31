@@ -406,6 +406,16 @@ npm run deploy -- --tag v2026.7.4 --dry-run
 npm run deploy -- --tag v2026.7.4 --keep-releases 3 --dry-run
 ```
 
+## Deploy 脚本模板字符串陷阱（fail-closed）
+
+`deploy/deploy.mjs` 把远端 deploy bash 写成单个 `String.raw\`...\`` 模板字面量,并通过 `deployArchive` 把它喂给 `bash -s --`。`String.raw` 只控制反斜杠转义,不会屏蔽 `${...}` 的 JS 模板插值 — 在模板体内任何写成 `${var}` 的文本都会被 JS 当模板表达式求值,未在 JS 作用域里定义的变量直接抛 `ReferenceError`,脚本从未真正发送就停止。
+
+正确写法:和文件中其它位置保持一致,使用 **`${"${"}var}`** —— 内层的 `"${"}` 求值为字符串 `"${"`,外层的 `}` 把它的字面量合在一起,生成 bash 想要的 `${var}` 占位符。同样的逃生在 `case` pattern、`echo`、heredoc、`printf '%s'` 等等任何 bash 占位符都可能存在;一次只写对是不够的,每次新增都要审一行。
+
+新增 `tests/deploy/test_deploy_archive.py::test_remote_deploy_script_renders_without_reference_error` 是这一类 bug 的统一守护:它把 `String.raw\`...\`` 体内字符串**原样 inline 进一段 JS 源码**再交给 node 求值(不是经 `${body}` 插值,那样会被当成普通字符串而不重新扫描模板),以保证任何 `${...}` 都真的被 JS 当模板表达式解析。如果有人回退到裸 `${var}`,这条测试会在 dry-run 之前就红,Pytest 退出码非零;CI 或本地 `pytest` 跑一次 `tests/deploy/test_deploy_archive.py` 即可快速验证。
+
+教训:仅做"位置断言"的脚本测试(如 `test_remote_cutover_stops_before_atomic_current_switch` 用 `script.index(...)` 检验源文本顺序)永远不会捕获 JS 侧的 render 失败 —— 必须有一个真把模板字面量跑一遍 node 的测试,作为这一类 fail-closed 守门员。
+
 ## 自动冒烟、凭据与结果判定
 
 公开真实 AI 冒烟需要在执行发布的本机安装 `playwright-cli`，并在仓库根目录准备 Git 忽略、当前用户所有、权限严格为 `0600` 的 `.env.local`：

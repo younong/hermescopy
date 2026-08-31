@@ -5,6 +5,8 @@ from pathlib import Path
 import subprocess
 import tarfile
 
+import pytest
+
 
 DEPLOY_SCRIPT = Path(__file__).parents[2] / "deploy" / "deploy.mjs"
 
@@ -152,6 +154,87 @@ def _write(root: Path, relative: str, content: str = "fixture\n") -> None:
     target = root / relative
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text(content, encoding="utf-8")
+
+
+@pytest.mark.live_system_guard_bypass
+def test_remote_deploy_script_renders_without_reference_error():
+    """The ``String.raw`` template body in ``deploy.mjs`` MUST evaluate as a
+    JavaScript template literal without throwing ``ReferenceError``.
+
+    The embedded remote deploy script writes bash ``${var}`` placeholders
+    inside a ``String.raw`...``` block. JavaScript evaluates every
+    ``${...}`` as a template expression; any bare ``${var}`` the author
+    intended for bash therefore resolves against JS scope and throws, and
+    the script never reaches the server. The existing convention used
+    elsewhere in this file (positional arg expansion) is
+    ``${"${"}var}``: the inner expression evaluates to a literal ``${``,
+    and the surrounding ``}`` closes that literal as a bash placeholder.
+    See the follow-up commit for PR #355.
+
+    The existing ``test_remote_cutover_stops_before_atomic_current_switch``
+    tests assert positions inside the source text, so it would never catch
+    a JS-side render failure. This test actually round-trips the body
+    through Node and is the fail-closed guard against the whole class.
+    """
+    import re
+
+    script = DEPLOY_SCRIPT.read_text(encoding="utf-8")
+    # Match the entire `function remoteDeployScript() { return String.raw`...`;
+    # }` shape; `[\s\S]*?` is a non-greedy match across the closing backtick.
+    match = re.search(
+        r"function remoteDeployScript\(\)\s*\{\s*return\s+String\.raw`([\s\S]*?)`;\s*\}",
+        script,
+    )
+    assert match, "remoteDeployScript() shape changed; update this test"
+    body = match.group(1)
+
+    # The bash body should not contain its own backticks. If it did,
+    # the deploy.mjs source itself would not parse cleanly, so guard here.
+    assert "`" not in body, "remote deploy script body contains a stray backtick"
+
+    # Bake the body INTO a JS template literal as raw source content so
+    # Node parses it as if it were a `String.raw` template literal in
+    # production. JS will then evaluate every `${...}` it sees; the only
+    # ones that pass are ${"${"}var}, which evaluate to literal bash
+    # placeholders. Bare `${var}` references against JS scope throw
+    # ReferenceError, which is what this test guards against.
+    #
+    # The body is inlined as the literal text of a `String.raw` template
+    # in the generated JS source. Python's f-string substitution only
+    # parses `{...}` patterns inside the `{}` boundaries of the f-string,
+    # not in the substituted value, so `{` / `}` inside `body` survive.
+    python_literal_body = body
+    eval_source = (
+        "(() => {\n"
+        "  function __test__() {\n"
+        f"    return String.raw`{python_literal_body}`;\n"
+        "  }\n"
+        "  const out = __test__();\n"
+        "  process.stdout.write('OK ' + out.length);\n"
+        "})();\n"
+    )
+
+    result = subprocess.run(
+        ["node", "--eval", eval_source],
+        check=False,
+        capture_output=True,
+        text=True,
+        cwd=str(DEPLOY_SCRIPT.parents[1]),
+        timeout=30,
+    )
+    assert result.returncode == 0, (
+        "remote deploy script failed to render — bash `${var}` placeholders "
+        "likely leaked into a JS template expression. "
+        f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    )
+    head, sep, tail = result.stdout.rpartition("OK ")
+    assert sep and tail.strip().isdigit(), (
+        f"unexpected render marker: stdout={result.stdout!r}"
+    )
+    # Sanity: a healthy bash deploy script is well over 10k bytes.
+    assert int(tail.strip()) > 10000, (
+        f"unexpected render length: stdout={result.stdout!r}"
+    )
 
 
 def test_release_archive_prunes_non_runtime_trees_and_keeps_runtime_payload(tmp_path):

@@ -1551,9 +1551,9 @@ expected_stop_seconds="$((dashboard_stop_timeout % 60))"
 expected_stop_usec="$((dashboard_stop_timeout * 1000000))"
 effective_stop_timeout="$(systemctl show hermes-dashboard.service -p TimeoutStopUSec --value)"
 case "$effective_stop_timeout" in
-  "${dashboard_stop_timeout}s"|"${expected_stop_usec}us"|"${expected_stop_minutes}min ${expected_stop_seconds}s") ;;
+  "${"${"}dashboard_stop_timeout}s"|"${"${"}expected_stop_usec}us"|"${"${"}expected_stop_minutes}min ${"${"}expected_stop_seconds}s") ;;
   *)
-    echo "Dashboard stop timeout is not the configured drain budget (expected=${dashboard_stop_timeout}s actual=${effective_stop_timeout})" >&2
+    echo "Dashboard stop timeout is not the configured drain budget (expected=${"${"}dashboard_stop_timeout}s actual=${"${"}effective_stop_timeout})" >&2
     exit 1
     ;;
 esac
