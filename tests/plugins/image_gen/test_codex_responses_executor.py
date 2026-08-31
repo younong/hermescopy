@@ -160,3 +160,67 @@ def test_codex_responses_executor_rejects_empty_image_response(monkeypatch):
             openai_base_url="https://codex.example/v1",
             chat_model="gpt-5.5",
         )
+
+
+def test_codex_responses_executor_falls_back_to_provider_default_chat_model(monkeypatch):
+    """When chat_model is empty, executor reads providers.codex.default_model."""
+
+    image = _png_bytes()
+    event = {
+        "item": {
+            "type": "image_generation_call",
+            "result": base64.b64encode(image).decode("ascii"),
+        },
+    }
+    response = _SseResponse([
+        "event: response.output_item.done",
+        f"data: {json.dumps(event)}",
+        "",
+        "data: [DONE]",
+        "",
+    ])
+    captured = {}
+    monkeypatch.setattr(
+        "requests.post", _request_kwargs(captured, response)
+    )
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config_readonly",
+        lambda: {"providers": {"codex": {"default_model": "gpt-5.6-sol"}}},
+    )
+
+    result = openai_compatible.generate_codex_responses_image_bytes(
+        prompt="draw a square",
+        aspect_ratio="1:1",
+        model="gpt-image-2",
+        references=[],
+        api_key="trusted-secret",
+        openai_base_url="https://codex.example/v1",
+    )
+
+    assert result["image_bytes"] == image
+    assert result["metadata"]["responses_model"] == "gpt-5.6-sol"
+    payload = captured["kwargs"]["json"]
+    assert payload["model"] == "gpt-5.6-sol"
+
+
+def test_codex_responses_executor_raises_when_no_chat_model_anywhere(monkeypatch):
+    """Empty chat_model with no provider config default raises ValueError."""
+
+    response = _SseResponse(["data: {\"type\": \"response.completed\"}", ""])
+    monkeypatch.setattr(
+        "requests.post", lambda *args, **kwargs: response
+    )
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config_readonly",
+        lambda: {"providers": {"codex": {}}},
+    )
+
+    with pytest.raises(ValueError, match="chat_model is required"):
+        openai_compatible.generate_codex_responses_image_bytes(
+            prompt="draw",
+            aspect_ratio="1:1",
+            model="gpt-image-2",
+            references=[],
+            api_key="trusted-secret",
+            openai_base_url="https://codex.example/v1",
+        )
