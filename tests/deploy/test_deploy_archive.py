@@ -104,12 +104,34 @@ def test_remote_cutover_stops_before_atomic_current_switch():
         'install -o root -g root -m 0644 "$staged_dashboard_unit" "$dashboard_unit"',
         snapshot_authority,
     )
+    dashboard_dropin_dir = script.index(
+        'dashboard_dropin_dir="/etc/systemd/system/hermes-dashboard.service.d"'
+    )
+    backup_dropin_guard = script.index(
+        'if [ -d "$dashboard_dropin_dir" ]; then',
+        script.index("backup_deployment_state()"),
+    )
+    backup_dropin_copy = script.index(
+        'cp -a -- "$dashboard_dropin_dir" "$rollback_dir/$(printf \'%s\' "$dashboard_dropin_dir" | sed \'s#/#_#g\')"',
+        backup_dropin_guard,
+    )
+    backup_state_call = script.index("\nbackup_deployment_state\n")
+    cleanup_log = script.index(
+        'echo "Removing legacy Dashboard systemd drop-in directory: $dashboard_dropin_dir"',
+        install_dashboard_unit,
+    )
+    cleanup_dropin = script.index(
+        'rm -rf -- "$dashboard_dropin_dir"',
+        cleanup_log,
+    )
     reload_before_stop = script.index("systemctl daemon-reload", install_dashboard_unit)
     timeout_check = script.index('systemctl show hermes-dashboard.service -p TimeoutStopUSec --value', reload_before_stop)
     stop_dashboard = script.index("systemctl stop hermes-dashboard.service", timeout_check)
     stop_gateway = script.index("systemctl stop hermes-gateway.service", stop_dashboard)
     switch_current = script.index('mv -Tf "$next_current" "$current"')
     start_dashboard = script.index("systemctl start hermes-dashboard.service", switch_current)
+    assert dashboard_dropin_dir < backup_dropin_guard < backup_dropin_copy
+    assert backup_state_call < install_dashboard_unit < cleanup_log < cleanup_dropin < reload_before_stop
     assert snapshot_authority < install_dashboard_unit < reload_before_stop < timeout_check < stop_dashboard
     assert stop_dashboard < stop_gateway < switch_current < start_dashboard
     assert "pgrep -f '[h]ermes_cli.owner_worker.entrypoint'" not in script
@@ -133,8 +155,34 @@ def test_remote_cutover_stops_before_atomic_current_switch():
     )
     rollback_authority = script.index("restore_authority_snapshot || true", rollback_stop)
     rollback_artifacts = script.index("restore_deployment_state || true", rollback_authority)
-    assert rollback_stop < rollback_authority < rollback_artifacts
-    assert "source.backup(target)" in script
+    rollback_reload = script.index("systemctl daemon-reload || true", rollback_artifacts)
+    assert rollback_stop < rollback_authority < rollback_artifacts < rollback_reload
+    restore_dropin_backup = script.index(
+        'dashboard_dropin_backup="$rollback_dir/$(printf \'%s\' "$dashboard_dropin_dir" | sed \'s#/#_#g\')"'
+    )
+    restore_dropin_if = script.index(
+        'if [ -e "$dashboard_dropin_backup" ]; then',
+        restore_dropin_backup,
+    )
+    restore_dropin_remove = script.index(
+        'rm -rf -- "$dashboard_dropin_dir"',
+        restore_dropin_if,
+    )
+    restore_dropin_copy = script.index(
+        'cp -a -- "$dashboard_dropin_backup" "$dashboard_dropin_dir"',
+        restore_dropin_remove,
+    )
+    restore_dropin_else = script.index("else", restore_dropin_copy)
+    restore_dropin_remove_absent = script.index(
+        'rm -rf -- "$dashboard_dropin_dir"',
+        restore_dropin_else,
+    )
+    assert restore_dropin_backup < restore_dropin_if
+    assert restore_dropin_if < restore_dropin_remove < restore_dropin_copy
+    assert restore_dropin_copy < restore_dropin_else < restore_dropin_remove_absent
+    assert "[ -d \"$dashboard_dropin_dir\" ]" in script
+    assert "cp -a -- \"$dashboard_dropin_dir\"" in script
+    assert "cp -a -- \"$dashboard_dropin_backup\" \"$dashboard_dropin_dir\"" in script
     assert 'mode=ro&immutable=1' in script
     assert "PRAGMA integrity_check" in script
     assert 'dashboard authority status --json' in script
