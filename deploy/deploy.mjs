@@ -1538,9 +1538,25 @@ if payload.get("state") not in {"healthy", "uninitialized"}:
 echo "HERMES_DEPLOY_STAGE authority_preflight=passed"
 
 # Stop the old release before changing any active artifact. Dashboard shutdown
-# drains and revokes its Owner Workers. A legacy standalone Gateway is retired
-# only when present; it is never installed or started by the candidate release.
+# drains and revokes its Owner Workers. Load the candidate stop policy before
+# stopping so this transition is governed by the same drain budget that will be
+# used for the candidate service; a stale unit must never turn a graceful stop
+# into an immediate SIGKILL.
 services_touched="1"
+snapshot_authority
+install -o root -g root -m 0644 "$staged_dashboard_unit" "$dashboard_unit"
+systemctl daemon-reload
+expected_stop_minutes="$((dashboard_stop_timeout / 60))"
+expected_stop_seconds="$((dashboard_stop_timeout % 60))"
+expected_stop_usec="$((dashboard_stop_timeout * 1000000))"
+effective_stop_timeout="$(systemctl show hermes-dashboard.service -p TimeoutStopUSec --value)"
+case "$effective_stop_timeout" in
+  "${dashboard_stop_timeout}s"|"${expected_stop_usec}us"|"${expected_stop_minutes}min ${expected_stop_seconds}s") ;;
+  *)
+    echo "Dashboard stop timeout is not the configured drain budget (expected=${dashboard_stop_timeout}s actual=${effective_stop_timeout})" >&2
+    exit 1
+    ;;
+esac
 systemctl stop hermes-dashboard.service
 if systemctl list-unit-files hermes-gateway.service --no-legend 2>/dev/null | grep -q '^hermes-gateway.service'; then
   systemctl stop hermes-gateway.service || true
@@ -1550,10 +1566,8 @@ if systemctl is-active --quiet hermes-dashboard.service || systemctl is-active -
   echo "Old services did not stop before release switch" >&2
   exit 1
 fi
-snapshot_authority
 rm -f -- "$gateway_unit"
 install -o root -g root -m 0755 "$staged_runner" "$runner"
-install -o root -g root -m 0644 "$staged_dashboard_unit" "$dashboard_unit"
 install -o root -g root -m 0644 "$staged_sandbox_policy" "$sandbox_policy"
 install -o root -g root -m 0444 "$staged_sandbox_seccomp" "$sandbox_seccomp"
 next_current="$current.next.$$"
