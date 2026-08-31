@@ -49,9 +49,9 @@ def _codex_image_route_payload(**overrides):
         models=["gpt-image-2"],
         default_model="gpt-image-2",
         key_env="CODEX_IMAGE_KEY",
-        executor="plugins.image_gen.openai_compatible:generate_openai_compatible_image_bytes",
+        executor="plugins.image_gen.openai_compatible:generate_codex_responses_image_bytes",
         base_urls={"openai_base_url": "https://codex.example.com/v1"},
-        executor_params={"edit_protocol": "json_images", "size_profile": "gpt-image-2"},
+        executor_params={"chat_model": "gpt-5.5", "size_profile": "gpt-image-2"},
         text_only_models=[],
     )
     payload.update(overrides)
@@ -219,7 +219,7 @@ def test_control_plane_policy_accepts_custom_codex_image_route(monkeypatch):
     route = policy.route_for("image", "custom:codex", "gpt-image-2")
     assert route is not None
     assert route.executor == (
-        "plugins.image_gen.openai_compatible:generate_openai_compatible_image_bytes"
+        "plugins.image_gen.openai_compatible:generate_codex_responses_image_bytes"
     )
     descriptor = policy.descriptor()
     payload = json.dumps(descriptor.payload())
@@ -384,9 +384,9 @@ def test_policy_execute_custom_codex_image_uses_shared_executor(monkeypatch):
             models=("gpt-image-2",), default_model="gpt-image-2",
         ),
         key_env="CODEX_IMAGE_KEY",
-        executor="plugins.image_gen.openai_compatible:generate_openai_compatible_image_bytes",
+        executor="plugins.image_gen.openai_compatible:generate_codex_responses_image_bytes",
         base_urls={"openai_base_url": "https://codex.example.com/v1"},
-        executor_params={"size_profile": "gpt-image-2"},
+        executor_params={"chat_model": "gpt-5.5", "size_profile": "gpt-image-2"},
     )
     policy = DeploymentMediaPolicy(routes=(route,), policy_id="p")
     monkeypatch.setenv("CODEX_IMAGE_KEY", "secret")
@@ -497,9 +497,9 @@ def test_policy_execute_rejects_valid_image_with_wrong_dimensions(monkeypatch):
             max_output_bytes=8192,
         ),
         key_env="TEST_MEDIA_KEY",
-        executor="plugins.image_gen.openai_compatible:generate_openai_compatible_image_bytes",
+        executor="plugins.image_gen.openai_compatible:generate_codex_responses_image_bytes",
         base_urls={"openai_base_url": "https://codex.example.com/v1"},
-        executor_params={"size_profile": "gpt-image-2"},
+        executor_params={"chat_model": "gpt-5.5", "size_profile": "gpt-image-2"},
     )
     policy = DeploymentMediaPolicy(routes=(route,), policy_id="p")
     monkeypatch.setenv("TEST_MEDIA_KEY", "secret")

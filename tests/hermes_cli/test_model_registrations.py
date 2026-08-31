@@ -360,9 +360,9 @@ def test_admin_registrations_expose_custom_codex_image_route(monkeypatch):
             "models": ["gpt-image-2"],
             "default_model": "gpt-image-2",
             "key_env": "CODEX_IMAGE_KEY",
-            "executor": "plugins.image_gen.openai_compatible:generate_openai_compatible_image_bytes",
+            "executor": "plugins.image_gen.openai_compatible:generate_codex_responses_image_bytes",
             "base_urls": {"openai_base_url": "https://codex.example.com/v1"},
-            "executor_params": {"edit_protocol": "json_images", "size_profile": "gpt-image-2"},
+            "executor_params": {"chat_model": "gpt-5.5", "size_profile": "gpt-image-2"},
         }]),
     )
     monkeypatch.setattr(
@@ -381,6 +381,7 @@ def test_admin_registrations_expose_custom_codex_image_route(monkeypatch):
     assert [(item["model"], item["use_gateway"]) for item in matches] == [
         ("gpt-image-2", False)
     ]
+    assert matches[0]["execution_mode"] == "deployment_relay"
 
 
 def test_payload_merges_admin_descriptors_with_legacy_user_registrations(monkeypatch):
