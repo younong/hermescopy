@@ -12,6 +12,11 @@ from agent.image_size import (
     resolve_image_size,
     validate_image_output,
 )
+from plugins.image_gen.codex_responses import (
+    build_responses_payload,
+    extract_image_b64,
+    iter_sse_json,
+)
 
 _REQUEST_TIMEOUT = 300.0
 
@@ -157,5 +162,146 @@ def generate_openai_compatible_image_bytes(
         "image_bytes": image_bytes,
         "mime_type": mime_type,
         "metadata": metadata,
+        "size_plan": plan,
+    }
+
+
+_CODEX_IMAGE_MODEL = "gpt-image-2"
+_CODEX_INSTRUCTIONS = (
+    "You are an assistant that must fulfill image generation and image editing "
+    "requests by using the image_generation tool when provided."
+)
+_CODEX_INPUT_MIME_TYPES = frozenset({"image/png", "image/jpeg", "image/webp"})
+_CODEX_MAX_REFERENCE_IMAGES = 16
+_CODEX_MAX_REFERENCE_BYTES = 25 * 1024 * 1024
+_CODEX_MAX_TOTAL_REFERENCE_BYTES = 48 * 1024 * 1024
+
+
+def _codex_reference_parts(references: List[Dict[str, Any]]) -> List[Dict[str, str]]:
+    """Convert relay-owned reference bytes into validated Responses inputs."""
+    from agent.image_routing import _sniff_mime_from_bytes
+
+    if len(references) > _CODEX_MAX_REFERENCE_IMAGES:
+        raise ValueError("too many reference images")
+    parts: List[Dict[str, str]] = []
+    total_bytes = 0
+    for reference in references:
+        if not isinstance(reference, dict):
+            raise ValueError("reference image is invalid")
+        raw = reference.get("data")
+        mime_type = str(reference.get("mime_type") or "").strip().lower()
+        if (
+            not isinstance(raw, bytes)
+            or not raw
+            or len(raw) > _CODEX_MAX_REFERENCE_BYTES
+            or mime_type not in _CODEX_INPUT_MIME_TYPES
+        ):
+            raise ValueError("reference image is invalid")
+        total_bytes += len(raw)
+        if total_bytes > _CODEX_MAX_TOTAL_REFERENCE_BYTES:
+            raise ValueError("reference images are too large")
+        if _sniff_mime_from_bytes(raw) != mime_type:
+            raise ValueError("reference image MIME type does not match its bytes")
+        parts.append({
+            "type": "input_image",
+            "image_url": (
+                f"data:{mime_type};base64,"
+                f"{base64.b64encode(raw).decode('ascii')}"
+            ),
+        })
+    return parts
+
+
+def generate_codex_responses_image_bytes(
+    *,
+    prompt: str,
+    aspect_ratio: str,
+    model: str,
+    references: List[Dict[str, Any]],
+    api_key: str,
+    openai_base_url: str,
+    chat_model: str = "",
+    size_profile: str = "gpt-image-2",
+    params: Optional[Dict[str, Any]] = None,
+    quality: str = "medium",
+) -> Dict[str, Any]:
+    """Call a Codex Responses image tool without OAuth or filesystem access."""
+    import requests
+
+    if model != _CODEX_IMAGE_MODEL:
+        raise ValueError("Codex Responses image model must be gpt-image-2")
+    if not str(api_key or "").strip():
+        raise ValueError("Codex Responses API key is required")
+    chat_model = str(chat_model or "").strip()
+    if not chat_model:
+        raise ValueError("Codex Responses chat_model is required")
+    base_url = str(openai_base_url or "").strip().rstrip("/")
+    if not base_url:
+        raise ValueError("Codex Responses base URL is required")
+
+    params = dict(params or {})
+    plan = resolve_image_size(
+        aspect_ratio,
+        params.get("resolution", DEFAULT_RESOLUTION),
+        profile=image_size_profile(size_profile),
+    )
+    quality = str(params.get("quality") or quality).strip().lower()
+    if quality not in {"low", "medium", "high", "auto"}:
+        raise ValueError("quality must be low, medium, high, or auto")
+    constrained_prompt = image_prompt_with_size_requirements(prompt, plan)
+    payload = build_responses_payload(
+        prompt=constrained_prompt,
+        size=plan.size,
+        quality=quality,
+        chat_model=chat_model,
+        image_model=_CODEX_IMAGE_MODEL,
+        instructions=_CODEX_INSTRUCTIONS,
+        input_images=_codex_reference_parts(references),
+    )
+
+    image_b64: Optional[str] = None
+    response = requests.post(
+        f"{base_url}/responses",
+        headers={
+            "Accept": "text/event-stream",
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        },
+        json=payload,
+        stream=True,
+        timeout=_REQUEST_TIMEOUT,
+    )
+    try:
+        response.raise_for_status()
+        for event in iter_sse_json(response):
+            found = extract_image_b64(event)
+            if found:
+                image_b64 = found
+    finally:
+        response.close()
+
+    if not image_b64:
+        raise OpenAICompatibleImageEmpty(
+            "Codex Responses response contained no image data"
+        )
+    try:
+        image_bytes = base64.b64decode(image_b64, validate=True)
+        actual = validate_image_output(
+            inspect_image_bytes(image_bytes, declared_mime_type="image/png"),
+            plan=plan,
+            require_exact_dimensions=False,
+        )
+    except Exception as exc:
+        raise ValueError("Codex Responses returned an invalid image artifact") from exc
+    return {
+        "image_bytes": image_bytes,
+        "mime_type": actual.mime_type,
+        "metadata": {
+            **plan.metadata(),
+            **actual.metadata(),
+            "quality": quality,
+            "upstream_model": _CODEX_IMAGE_MODEL,
+            "responses_model": chat_model,
+        },
         "size_plan": plan,
     }

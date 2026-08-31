@@ -143,13 +143,19 @@ class _OpenAIImageHandler(BaseHTTPRequestHandler):
         length = int(self.headers.get("Content-Length", "0"))
         body = json.loads(self.rfile.read(length))
         type(self).requests.append((self.path, body))
-        payload = json.dumps({
-            "data": [{
-                "b64_json": base64.b64encode(type(self).image_bytes).decode()
-            }]
-        }).encode()
+        event = {
+            "item": {
+                "type": "image_generation_call",
+                "result": base64.b64encode(type(self).image_bytes).decode(),
+            },
+        }
+        payload = (
+            "event: response.output_item.done\n"
+            f"data: {json.dumps(event)}\n\n"
+            "data: [DONE]\n\n"
+        ).encode()
         self.send_response(200)
-        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Type", "text/event-stream")
         self.send_header("Content-Length", str(len(payload)))
         self.end_headers()
         self.wfile.write(payload)
@@ -186,11 +192,11 @@ def _custom_codex_policy(base_url):
             key_env="TEST_MEDIA_RELAY_KEY",
             executor=(
                 "plugins.image_gen.openai_compatible:"
-                "generate_openai_compatible_image_bytes"
+                "generate_codex_responses_image_bytes"
             ),
             base_urls={"openai_base_url": base_url},
             executor_params={
-                "edit_protocol": "json_images",
+                "chat_model": "gpt-5.5",
                 "size_profile": "gpt-image-2",
             },
         ),),
@@ -253,14 +259,25 @@ def test_custom_codex_real_path_validates_then_publishes(
         assert str(owner) not in json.dumps(result)
         assert len(handler.requests) == 1
         request_path, request_payload = handler.requests[0]
-        assert request_path == "/v1/images/generations"
-        assert request_payload["model"] == "gpt-image-2"
-        assert request_payload["size"] == "1536x2048"
-        assert request_payload["n"] == 1
-        assert request_payload["quality"] == "medium"
-        assert request_payload["prompt"].startswith(
+        assert request_path == "/v1/responses"
+        assert request_payload["model"] == "gpt-5.5"
+        assert request_payload["store"] is False
+        assert request_payload["stream"] is True
+        assert request_payload["input"][0]["content"][0]["type"] == "input_text"
+        assert request_payload["input"][0]["content"][0]["text"].startswith(
             "draw a portrait\n\nOutput requirements:"
         )
+        tool = request_payload["tools"][0]
+        assert tool["type"] == "image_generation"
+        assert tool["model"] == "gpt-image-2"
+        assert tool["size"] == "1536x2048"
+        assert tool["quality"] == "medium"
+        assert tool["output_format"] == "png"
+        assert request_payload["tool_choice"] == {
+            "type": "allowed_tools",
+            "mode": "required",
+            "tools": [{"type": "image_generation"}],
+        }
         assert "Aspect ratio: exactly 3:4" in request_payload["prompt"]
         assert "Preferred pixel dimensions: 1536x2048" in request_payload["prompt"]
         assert result["requested_aspect_ratio"] == "3:4"
@@ -271,6 +288,55 @@ def test_custom_codex_real_path_validates_then_publishes(
         assert result["actual_resolution"] == "2K"
         assert result["resolution_mode"] == "native"
         assert result["actual_dimensions"] == {"width": 1536, "height": 2048}
+    finally:
+        client.close()
+        broker.close()
+        roots.close()
+
+
+def test_custom_codex_real_path_sends_reference_as_input_image(
+    tmp_path, monkeypatch, _openai_image_server
+):
+    monkeypatch.setenv("TEST_MEDIA_RELAY_KEY", "secret")
+    monkeypatch.setattr(
+        deployment_media_module,
+        "_validate_https_url",
+        lambda value, *, field: value,
+    )
+    monkeypatch.setattr(controlled_roots_module.sys, "platform", "linux")
+    monkeypatch.setattr(controlled_roots_module, "_openat2", lambda *_args: None)
+    base_url, handler = _openai_image_server
+    policy = _custom_codex_policy(base_url)
+    owner, paths, roots, descriptor, broker, client = _dispatch_runtime(
+        tmp_path, policy
+    )
+    reference = _png_bytes((16, 16))
+    reference_path = paths.default_workspace / "reference.png"
+    reference_path.write_bytes(reference)
+    try:
+        result = json.loads(dispatch_deployment_media(
+            {
+                "prompt": "edit this portrait",
+                "aspect_ratio": "3:4",
+                "resolution": "2K",
+                "reference_image_urls": [str(reference_path)],
+            },
+            kind="image",
+            model="gpt-image-2",
+            relay_client=client,
+            descriptor=descriptor,
+            workspace_context=AuthenticatedWorkspaceContext(roots),
+            owner_home=owner,
+        ))
+        assert result["success"] is True
+        assert len(handler.requests) == 1
+        _, request_payload = handler.requests[0]
+        content = request_payload["input"][0]["content"]
+        assert content[0]["type"] == "input_text"
+        assert content[1]["type"] == "input_image"
+        image_url = content[1]["image_url"]
+        assert image_url.startswith("data:image/png;base64,")
+        assert base64.b64decode(image_url.split(",", 1)[1]) == reference
     finally:
         client.close()
         broker.close()

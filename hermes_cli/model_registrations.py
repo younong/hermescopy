@@ -24,6 +24,7 @@ from hermes_cli.model_plane.kinds import (
     CODE,
     GATEWAY_KINDS,
     KINDS,
+    RELAY_KINDS,
     selection_section,
 )
 
@@ -177,6 +178,8 @@ def _admin_registrations() -> dict[str, dict[str, Any]]:
                     "scope": "admin",
                     "use_gateway": False,
                 }
+                if route.kind in RELAY_KINDS:
+                    registrations[registration_id]["execution_mode"] = "deployment_relay"
     return registrations
 
 
@@ -430,6 +433,8 @@ def _public_registration(registration_id: str, item: dict[str, Any], env: dict[s
         "mutable": scope == "user",
         "use_gateway": bool(item.get("use_gateway", False)),
     }
+    if item.get("execution_mode"):
+        result["execution_mode"] = str(item["execution_mode"])
     if item.get("migration_error"):
         result["migration_error"] = str(item["migration_error"])
     if item.get("source") == "custom":
@@ -506,6 +511,8 @@ def _resolve_registered_model(registration_id: str, *, kind: str) -> dict[str, s
         }
         if item.get("scope") == "admin":
             result["selection_source"] = "deployment"
+        if item.get("execution_mode"):
+            result["execution_mode"] = str(item["execution_mode"])
         elif source == "custom":
             providers = config.get("providers")
             provider_config = providers.get(provider) if isinstance(providers, dict) else None

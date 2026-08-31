@@ -21,7 +21,6 @@ image-to-image/editing are sent as Responses ``input_image`` content parts.
 from __future__ import annotations
 
 import base64
-import json
 import logging
 import os
 from pathlib import Path
@@ -43,6 +42,11 @@ from agent.image_size import (
     inspect_image_bytes,
     resolve_image_size,
     validate_image_output,
+)
+from plugins.image_gen.codex_responses import (
+    build_responses_payload as _build_responses_payload_impl,
+    extract_image_b64 as _extract_image_b64,
+    iter_sse_json as _iter_sse_json,
 )
 
 logger = logging.getLogger(__name__)
@@ -261,105 +265,16 @@ def _build_responses_payload(
     quality: str,
     input_images: Optional[List[Dict[str, str]]] = None,
 ) -> Dict[str, Any]:
-    """Build the Codex Responses request body for an image_generation call."""
-    content: List[Dict[str, Any]] = [{"type": "input_text", "text": prompt}]
-    if input_images:
-        content.extend(input_images)
-    return {
-        "model": _CODEX_CHAT_MODEL,
-        "store": False,
-        "instructions": _CODEX_INSTRUCTIONS,
-        "input": [{
-            "type": "message",
-            "role": "user",
-            "content": content,
-        }],
-        "tools": [{
-            "type": "image_generation",
-            "model": API_MODEL,
-            "size": size,
-            "quality": quality,
-            "output_format": "png",
-            "background": "opaque",
-            "partial_images": 1,
-        }],
-        "tool_choice": {
-            "type": "allowed_tools",
-            "mode": "required",
-            "tools": [{"type": "image_generation"}],
-        },
-        "stream": True,
-    }
-
-
-def _extract_image_b64(value: Any) -> Optional[str]:
-    """Return the newest image b64 embedded in a Responses event payload."""
-    found: Optional[str] = None
-    if isinstance(value, dict):
-        if value.get("type") == "image_generation_call":
-            result = value.get("result")
-            if isinstance(result, str) and result:
-                found = result
-        partial = value.get("partial_image_b64")
-        if isinstance(partial, str) and partial:
-            found = partial
-        for child in value.values():
-            nested = _extract_image_b64(child)
-            if nested:
-                found = nested
-    elif isinstance(value, list):
-        for child in value:
-            nested = _extract_image_b64(child)
-            if nested:
-                found = nested
-    return found
-
-
-def _iter_sse_json(response: Any):
-    """Yield JSON payloads from an SSE response without OpenAI SDK parsing.
-
-    The ChatGPT/Codex backend can emit image-generation events newer than the
-    pinned Python SDK understands. Parsing raw SSE keeps this provider tolerant
-    of those event-shape changes.
-    """
-    event_name: Optional[str] = None
-    data_lines: List[str] = []
-
-    def flush():
-        nonlocal event_name, data_lines
-        if not data_lines:
-            event_name = None
-            return None
-        raw = "\n".join(data_lines).strip()
-        event = event_name
-        event_name = None
-        data_lines = []
-        if not raw or raw == "[DONE]":
-            return None
-        payload = json.loads(raw)
-        if isinstance(payload, dict) and event and "type" not in payload:
-            payload["type"] = event
-        return payload
-
-    for line in response.iter_lines():
-        if isinstance(line, bytes):
-            line = line.decode("utf-8", errors="replace")
-        line = str(line)
-        if line == "":
-            payload = flush()
-            if payload is not None:
-                yield payload
-            continue
-        if line.startswith(":"):
-            continue
-        if line.startswith("event:"):
-            event_name = line[len("event:"):].strip()
-        elif line.startswith("data:"):
-            data_lines.append(line[len("data:"):].lstrip())
-
-    payload = flush()
-    if payload is not None:
-        yield payload
+    """Build the Codex Responses request for the OAuth-backed provider."""
+    return _build_responses_payload_impl(
+        prompt=prompt,
+        size=size,
+        quality=quality,
+        chat_model=_CODEX_CHAT_MODEL,
+        image_model=API_MODEL,
+        instructions=_CODEX_INSTRUCTIONS,
+        input_images=input_images,
+    )
 
 
 def _collect_image_b64(
