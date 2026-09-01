@@ -274,7 +274,33 @@ def _capability_catalog() -> list[dict[str, Any]]:
 def _media_catalog(kind: str) -> list[dict[str, Any]]:
     from hermes_cli.model_plane.catalog import capability_catalog
 
-    return capability_catalog(kind)
+    catalog = capability_catalog(kind)
+    admin_targets = {
+        (
+            str(item.get("kind") or ""),
+            str(item.get("provider") or "").casefold(),
+            str(item.get("model") or "").casefold(),
+        ): registration_id
+        for registration_id, item in _admin_registrations().items()
+        if isinstance(item, dict)
+    }
+    result: list[dict[str, Any]] = []
+    for provider_row in catalog:
+        row = dict(provider_row)
+        models = []
+        for model in provider_row.get("models") or []:
+            model_row = dict(model) if isinstance(model, dict) else {"id": model}
+            target = (
+                kind,
+                str(provider_row.get("provider") or "").casefold(),
+                str(model_row.get("id") or "").casefold(),
+            )
+            if model_row.get("deployment_owned") and target in admin_targets:
+                model_row["registration_id"] = admin_targets[target]
+            models.append(model_row)
+        row["models"] = models
+        result.append(row)
+    return result
 
 
 def _find_provider(catalog: list[dict[str, Any]], provider: str, *, media: bool) -> dict[str, Any]:

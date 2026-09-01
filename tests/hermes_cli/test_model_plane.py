@@ -5,6 +5,10 @@ import pytest
 from agent.image_gen_provider import ImageGenProvider
 from agent.tts_provider import TTSProvider
 from agent.transcription_provider import TranscriptionProvider
+from hermes_cli.deployment_media import (
+    DeploymentMediaDescriptor,
+    DeploymentMediaRouteDescriptor,
+)
 from hermes_cli.model_plane import capability as capability_module
 from hermes_cli.model_plane import catalog as catalog_module
 from hermes_cli.model_plane import kinds
@@ -455,7 +459,65 @@ def test_capability_catalog_rows_are_credential_safe():
         catalog_module.capability_catalog("chat")
 
 
-def test_capability_catalog_voice_rows_carry_capability_tags():
+def test_capability_catalog_merges_credential_safe_deployment_media_rows(monkeypatch):
+    capability_module.register_media_generation_provider("image", _ImageDouble())
+    monkeypatch.setattr(
+        catalog_module,
+        "_deployment_media_descriptor",
+        lambda: DeploymentMediaDescriptor(
+            policy_id="deployment-policy",
+            routes=(
+                DeploymentMediaRouteDescriptor(
+                    kind="image",
+                    provider="deployment-images",
+                    models=("managed-image", "managed-image-fast"),
+                    default_model="managed-image",
+                ),
+            ),
+        ),
+    )
+
+    rows = catalog_module.capability_catalog("image")
+    deployment = next(row for row in rows if row["provider"] == "deployment-images")
+
+    assert deployment["available"] is True
+    assert deployment["credential_configured"] is True
+    assert deployment["default_model"] == "managed-image"
+    assert [model["id"] for model in deployment["models"]] == [
+        "managed-image",
+        "managed-image-fast",
+    ]
+    assert all(model["deployment_owned"] for model in deployment["models"])
+    assert all(model["execution_mode"] == "deployment_relay" for model in deployment["models"])
+    assert "api_key" not in repr(deployment).lower()
+    assert "secret" not in repr(deployment).lower()
+
+
+def test_capability_model_catalog_includes_deployment_provider(monkeypatch):
+    monkeypatch.setattr(
+        catalog_module,
+        "_deployment_media_descriptor",
+        lambda: DeploymentMediaDescriptor(
+            policy_id="deployment-policy",
+            routes=(
+                DeploymentMediaRouteDescriptor(
+                    kind="image",
+                    provider="deployment-images",
+                    models=("managed-image",),
+                    default_model="managed-image",
+                ),
+            ),
+        ),
+    )
+
+    models, default_model = catalog_module.capability_model_catalog(
+        "image", "deployment-images"
+    )
+
+    assert models == {"managed-image": {}}
+    assert default_model == "managed-image"
+
+
     capability_module.register_voice_provider("tts", _TTSDouble())
     capability_module.register_voice_provider("asr", _ASRDouble())
 

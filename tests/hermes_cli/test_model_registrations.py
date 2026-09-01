@@ -384,7 +384,36 @@ def test_admin_registrations_expose_custom_codex_image_route(monkeypatch):
     assert matches[0]["execution_mode"] == "deployment_relay"
 
 
-def test_payload_merges_admin_descriptors_with_legacy_user_registrations(monkeypatch):
+def test_image_catalog_exposes_deployment_models_with_admin_registration_ids(monkeypatch):
+    _deployment_registrations(monkeypatch)
+
+    catalog = model_registrations.get_model_registration_catalog("image")
+    provider = next(
+        row for row in catalog["providers"] if row["provider"] == "apiyi"
+    )
+    models = {model["id"]: model for model in provider["models"]}
+    registration_id = model_registrations._admin_registration_id(
+        "image", "apiyi", "nano-banana-2"
+    )
+
+    assert models["nano-banana-2"]["deployment_owned"] is True
+    assert models["nano-banana-2"]["execution_mode"] == "deployment_relay"
+    assert models["nano-banana-2"]["registration_id"] == registration_id
+    assert "TEST_ADMIN_MEDIA_KEY" not in repr(catalog)
+    assert "executor" not in repr(catalog)
+
+
+def test_media_model_catalog_uses_deployment_route_for_selection(monkeypatch):
+    _deployment_registrations(monkeypatch)
+
+    from hermes_cli.tools_config import media_model_catalog
+
+    models, default_model = media_model_catalog("image", "apiyi")
+
+    assert "nano-banana-2" in models
+    assert default_model == "gpt-image-2-medium"
+
+
     _deployment_registrations(monkeypatch)
     config = load_config()
     config["model_registrations"] = {
