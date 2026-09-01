@@ -47,6 +47,7 @@ interface RegistrationFormState {
   model: string;
   name: string;
   provider: string;
+  registrationId: string;
   source: ModelRegistrationSource;
   useGateway: boolean;
 }
@@ -60,6 +61,7 @@ const EMPTY_FORM: RegistrationFormState = {
   model: "",
   name: "",
   provider: "",
+  registrationId: "",
   source: "catalog",
   useGateway: false,
 };
@@ -215,6 +217,7 @@ export function GuiChatModelsPane({
     return provider?.models.map((item) => ({
       id: item.id,
       label: `${item.display || item.id}${item.capability ? ` · ${String(item.capability).toUpperCase()}` : ""}`,
+      registrationId: item.registration_id,
     })) ?? [];
   }, [form.kind, form.provider, form.source, providers]);
 
@@ -258,6 +261,7 @@ export function GuiChatModelsPane({
       kind,
       model: "",
       provider: "",
+      registrationId: "",
       source: defaultSource(kind),
       useGateway: false,
     }));
@@ -265,7 +269,7 @@ export function GuiChatModelsPane({
 
   const updateSource = (source: ModelRegistrationSource) => {
     if (source === "catalog") void loadCatalog(form.kind);
-    setForm((current) => ({ ...current, model: "", provider: "", source }));
+    setForm((current) => ({ ...current, model: "", provider: "", registrationId: "", source }));
   };
 
   const updateProvider = (provider: string) => {
@@ -280,12 +284,36 @@ export function GuiChatModelsPane({
         (item) => item.provider === provider,
       );
       model = selected?.default_model || selected?.models[0]?.id || "";
+      const selectedModel = selected?.models.find((item) => item.id === model);
+      setForm((current) => ({
+        ...current,
+        model,
+        provider,
+        registrationId: selectedModel?.registration_id || "",
+      }));
+      return;
     }
-    setForm((current) => ({ ...current, model, provider }));
+    setForm((current) => ({ ...current, model, provider, registrationId: "" }));
   };
 
   const save = async (event: FormEvent) => {
     event.preventDefault();
+    if (!editing && form.registrationId) {
+      setSaving(true);
+      setError(null);
+      try {
+        await api.activateModelRegistration(form.registrationId);
+        setFormOpen(false);
+        setEditing(null);
+        setForm(EMPTY_FORM);
+        await load();
+      } catch (cause) {
+        setError(errorMessage(cause));
+      } finally {
+        setSaving(false);
+      }
+      return;
+    }
     const validationError = validateForm(form, text);
     if (validationError) {
       setError(validationError);
@@ -583,7 +611,7 @@ function RegistrationDialog({
   catalogLoading: boolean;
   editing: ModelRegistration | null;
   form: RegistrationFormState;
-  models: Array<{ id: string; label: string }>;
+  models: Array<{ id: string; label: string; registrationId?: string }>;
   onClose(): void;
   onKindChange(kind: ModelRegistrationKind): void;
   onProviderChange(provider: string): void;
@@ -676,7 +704,14 @@ function RegistrationDialog({
                   <select
                     aria-label={text.model}
                     disabled={saving || !form.provider}
-                    onChange={(event) => setForm((current) => ({ ...current, model: event.target.value }))}
+                    onChange={(event) => {
+                      const selected = models.find((item) => item.id === event.target.value);
+                      setForm((current) => ({
+                        ...current,
+                        model: event.target.value,
+                        registrationId: selected?.registrationId || "",
+                      }));
+                    }}
                     value={form.model}
                   >
                     <option value="">{text.selectModel}</option>

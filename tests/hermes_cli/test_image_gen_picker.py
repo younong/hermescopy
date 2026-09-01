@@ -10,6 +10,11 @@ from types import SimpleNamespace
 
 import pytest
 
+from hermes_cli.deployment_media import (
+    DeploymentMediaPolicy,
+    DeploymentMediaRoute,
+    DeploymentMediaRouteDescriptor,
+)
 from hermes_cli.model_plane import capability as capability_module
 from agent.image_gen_provider import ImageGenProvider
 
@@ -94,7 +99,43 @@ class TestPluginPickerInjection:
         plugin_names = [p.get("image_gen_plugin_name") for p in visible if p.get("image_gen_plugin_name")]
         assert "someimg" in plugin_names
 
-    def test_visible_providers_does_not_inject_into_other_categories(self, monkeypatch):
+    def test_visible_providers_includes_deployment_image_route(self, monkeypatch):
+        from hermes_cli import tools_config
+
+        route = DeploymentMediaRoute(
+            descriptor=DeploymentMediaRouteDescriptor(
+                kind="image",
+                provider="managed-images",
+                models=("managed-v1",),
+                default_model="managed-v1",
+            ),
+            key_env="MANAGED_IMAGE_KEY",
+            executor="plugins.image_gen.apiyi:generate_apiyi_image_bytes",
+        )
+        monkeypatch.setattr(
+            "hermes_cli.deployment_media.policy_from_control_plane_environment",
+            lambda: DeploymentMediaPolicy(routes=(route,), policy_id="test-policy"),
+        )
+
+        visible = tools_config._visible_providers(
+            tools_config.TOOL_CATEGORIES["image_gen"], {}
+        )
+        managed = next(
+            provider for provider in visible if provider["name"] == "MANAGED-IMAGES (Deployment)"
+        )
+
+        assert managed["image_gen_deployment_provider"] == "managed-images"
+        assert managed["image_gen_deployment_models"] == ["managed-v1"]
+        assert "MANAGED_IMAGE_KEY" not in repr(managed)
+
+        config = {}
+        tools_config.apply_provider_selection("image_gen", managed["name"], config)
+        assert config["image_gen"] == {
+            "provider": "managed-images",
+            "model": "managed-v1",
+            "use_gateway": False,
+        }
+
         from hermes_cli import tools_config
 
         capability_module.register_media_generation_provider("image", _FakeProvider("someimg"))

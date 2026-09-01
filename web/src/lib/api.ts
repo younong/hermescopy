@@ -2482,6 +2482,9 @@ export interface ModelRegistrationChatCatalogProvider {
 export interface ModelRegistrationMediaCatalogModel {
   id: string;
   display?: string;
+  registration_id?: string;
+  deployment_owned?: boolean;
+  execution_mode?: string;
   [key: string]: unknown;
 }
 

@@ -1992,6 +1992,43 @@ def _plugin_image_gen_providers() -> list[dict]:
     return _plugin_media_gen_providers("image")
 
 
+def _deployment_media_gen_providers(kind: str) -> list[dict]:
+    """Build picker rows for deployment-managed media routes."""
+    if kind not in {"image", "video"}:
+        return []
+    try:
+        from hermes_cli.deployment_media import (
+            deployment_media_descriptor_from_environment,
+            policy_from_control_plane_environment,
+        )
+        from hermes_cli.owner_runtime import is_owner_worker_env
+
+        if is_owner_worker_env():
+            descriptor = deployment_media_descriptor_from_environment()
+        else:
+            policy = policy_from_control_plane_environment()
+            descriptor = policy.descriptor() if policy is not None else None
+    except Exception:
+        return []
+    if descriptor is None:
+        return []
+
+    rows = []
+    for route in descriptor.routes:
+        if route.kind != kind:
+            continue
+        rows.append({
+            "name": f"{route.provider.upper()} (Deployment)",
+            "badge": "deployment",
+            "tag": "Deployment-managed route (credential held by the Control Plane)",
+            "env_vars": [],
+            f"{kind}_gen_deployment_provider": route.provider,
+            f"{kind}_gen_deployment_models": list(route.models),
+            f"{kind}_gen_deployment_default_model": route.default_model,
+        })
+    return rows
+
+
 def _plugin_video_gen_providers() -> list[dict]:
     return _plugin_media_gen_providers("video")
 
@@ -2218,14 +2255,16 @@ def _visible_providers(
             continue
         visible.append(provider)
 
-    # Inject plugin-registered image_gen backends (OpenAI today, more
-    # later) so the picker lists them alongside FAL / Nous Subscription.
+    # Inject deployment-managed and plugin-registered image_gen backends so
+    # the picker lists every route alongside FAL / Nous Subscription.
     if cat.get("name") == "Image Generation":
+        visible.extend(_deployment_media_gen_providers("image"))
         visible.extend(_plugin_image_gen_providers())
 
-    # Inject plugin-registered video_gen backends. Unlike image_gen,
-    # video_gen has NO hardcoded providers — every backend is a plugin.
+    # Inject deployment-managed video routes and plugin-registered video gen
+    # backends. Unlike image_gen, video_gen has no in-tree fallback.
     if cat.get("name") == "Video Generation":
+        visible.extend(_deployment_media_gen_providers("video"))
         visible.extend(_plugin_video_gen_providers())
 
     # Inject plugin-registered web search backends. After PR #25182, this
@@ -2347,7 +2386,9 @@ def _toolset_needs_configuration_prompt(
 
 
 def _any_media_gen_provider_available(kind: str) -> bool:
-    """True when any capability plugin for *kind* reports available."""
+    """True when any capability plugin or deployment route is available."""
+    if _deployment_media_gen_providers(kind):
+        return True
     try:
         from hermes_cli.model_plane.capability import list_capability_providers
         from hermes_cli.plugins import _ensure_plugins_discovered
@@ -2485,6 +2526,24 @@ def _is_provider_active(
     force_fresh: bool = False,
 ) -> bool:
     """Check if a provider entry matches the currently active config."""
+    deployment_provider = provider.get("image_gen_deployment_provider")
+    if deployment_provider:
+        image_cfg = config.get("image_gen", {})
+        return (
+            isinstance(image_cfg, dict)
+            and image_cfg.get("provider") == deployment_provider
+            and image_cfg.get("model") in provider.get("image_gen_deployment_models", [])
+        )
+
+    deployment_video_provider = provider.get("video_gen_deployment_provider")
+    if deployment_video_provider:
+        video_cfg = config.get("video_gen", {})
+        return (
+            isinstance(video_cfg, dict)
+            and video_cfg.get("provider") == deployment_video_provider
+            and video_cfg.get("model") in provider.get("video_gen_deployment_models", [])
+        )
+
     plugin_name = provider.get("image_gen_plugin_name")
     if plugin_name:
         image_cfg = config.get("image_gen", {})
@@ -2801,15 +2860,20 @@ def _configure_xai_imagine_storage(section_name: str, config: dict) -> None:
 
 
 def media_model_catalog(kind: str, provider_name: str) -> tuple[dict, str | None]:
-    """Return one installed media provider's public model catalog."""
-    if kind == "image":
-        return _plugin_image_gen_catalog(provider_name)
-    if kind == "video":
-        return _plugin_video_gen_catalog(provider_name)
-    if kind in ("voice", "vector"):
+    """Return one media provider's public model catalog."""
+    if kind in ("image", "video", "voice", "vector"):
         from hermes_cli.model_plane.catalog import capability_model_catalog
 
-        return capability_model_catalog(kind, provider_name)
+        try:
+            return capability_model_catalog(kind, provider_name)
+        except KeyError:
+            # Keep the legacy plugin lookup as a defensive fallback for
+            # providers registered during an in-progress discovery cycle.
+            if kind == "image":
+                return _plugin_image_gen_catalog(provider_name)
+            if kind == "video":
+                return _plugin_video_gen_catalog(provider_name)
+            raise
     raise ValueError("Media kind must be 'image', 'video', 'voice', or 'vector'")
 
 
@@ -3037,7 +3101,27 @@ def apply_provider_selection(ts_key: str, provider_name: str, config: dict) -> N
     managed_feature = provider.get("managed_nous_feature")
     _write_provider_config(provider, config, managed_feature=managed_feature)
 
-    # Plugin-registered image/video gen backends record the provider name in
+    deployment_provider = provider.get("image_gen_deployment_provider")
+    if deployment_provider:
+        img_cfg = config.setdefault("image_gen", {})
+        if isinstance(img_cfg, dict):
+            img_cfg.update({
+                "provider": deployment_provider,
+                "model": provider.get("image_gen_deployment_default_model"),
+                "use_gateway": False,
+            })
+
+    deployment_video_provider = provider.get("video_gen_deployment_provider")
+    if deployment_video_provider:
+        vid_cfg = config.setdefault("video_gen", {})
+        if isinstance(vid_cfg, dict):
+            vid_cfg.update({
+                "provider": deployment_video_provider,
+                "model": provider.get("video_gen_deployment_default_model"),
+                "use_gateway": False,
+            })
+
+    # Plugin-registered image/video gen backends record their provider name in
     # their own config section. Write that here (without the interactive
     # model picker the CLI runs afterwards — model choice is a separate GUI
     # flow).

@@ -18,10 +18,9 @@ from typing import Any, Optional
 
 from hermes_cli.model_plane.capability import (
     ensure_capability_providers,
-    get_capability_provider,
     list_capability_providers,
 )
-from hermes_cli.model_plane.kinds import CAPABILITY_KINDS, CODE
+from hermes_cli.model_plane.kinds import CAPABILITY_KINDS, RELAY_KINDS
 
 
 def _inventory_catalog() -> list[dict[str, Any]]:
@@ -89,6 +88,103 @@ def _safe_setup(setup: Any) -> dict[str, Any]:
     return safe
 
 
+def _deployment_media_descriptor() -> Any:
+    """Return the active deployment descriptor without exposing credentials."""
+    try:
+        from hermes_cli.deployment_media import (
+            deployment_media_descriptor_from_environment,
+            policy_from_control_plane_environment,
+        )
+        from hermes_cli.owner_runtime import is_owner_worker_env
+
+        if is_owner_worker_env():
+            return deployment_media_descriptor_from_environment()
+        policy = policy_from_control_plane_environment()
+        return policy.descriptor() if policy is not None else None
+    except Exception:
+        # Catalog discovery must not make local providers disappear when a
+        # deployment descriptor is absent or malformed.
+        return None
+
+
+def _deployment_catalog_rows(kind: str) -> list[dict[str, Any]]:
+    if kind not in RELAY_KINDS:
+        return []
+    descriptor = _deployment_media_descriptor()
+    if descriptor is None:
+        return []
+
+    rows: list[dict[str, Any]] = []
+    for route in descriptor.routes:
+        if route.kind != kind:
+            continue
+        models = [
+            {
+                "id": model,
+                "display": model,
+                "deployment_owned": True,
+                "execution_mode": "deployment_relay",
+            }
+            for model in route.models
+        ]
+        rows.append({
+            "provider": route.provider,
+            "name": f"{route.provider.upper()} (Deployment)",
+            "available": True,
+            "credential_configured": True,
+            "models": models,
+            "default_model": route.default_model,
+            "capabilities": route.capabilities_for(route.default_model),
+            "setup": {"env_vars": []},
+            "deployment_owned": True,
+        })
+    return rows
+
+
+def _merge_deployment_rows(
+    local_rows: list[dict[str, Any]],
+    deployment_rows: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Merge route models into local rows while preserving provider identity."""
+    result = [dict(row) for row in local_rows]
+    by_provider = {
+        str(row.get("provider") or "").casefold(): row
+        for row in result
+        if isinstance(row, dict)
+    }
+    for deployment in deployment_rows:
+        provider_key = str(deployment.get("provider") or "").casefold()
+        existing = by_provider.get(provider_key)
+        if existing is None:
+            existing = dict(deployment)
+            existing["models"] = [dict(model) for model in deployment.get("models") or []]
+            result.append(existing)
+            by_provider[provider_key] = existing
+            continue
+
+        existing_models = {
+            str(model.get("id") or ""): model
+            for model in existing.get("models") or []
+            if isinstance(model, dict) and model.get("id")
+        }
+        for model in deployment.get("models") or []:
+            model_id = str(model.get("id") or "")
+            if model_id:
+                # Deployment execution wins when a local plugin advertises the
+                # same identity, since the relay owns the active route.
+                existing_models[model_id] = dict(model)
+        existing["models"] = list(existing_models.values())
+        existing["available"] = bool(existing.get("available")) or bool(
+            deployment.get("available")
+        )
+        existing["credential_configured"] = bool(
+            existing.get("credential_configured")
+        ) or bool(deployment.get("credential_configured"))
+        existing.setdefault("deployment_owned", False)
+        existing["deployment_owned"] = True
+    return result
+
+
 def capability_catalog(kind: str) -> list[dict[str, Any]]:
     """Return credential-safe rows for one capability-owned kind."""
     if kind not in CAPABILITY_KINDS:
@@ -121,16 +217,28 @@ def capability_catalog(kind: str) -> list[dict[str, Any]]:
             "capabilities": capabilities if isinstance(capabilities, dict) else {},
             "setup": _safe_setup(setup),
         })
-    return result
+    return _merge_deployment_rows(result, _deployment_catalog_rows(kind))
 
 
 def capability_model_catalog(kind: str, provider_name: str) -> tuple[dict[str, dict], Optional[str]]:
     """Return ({model_id: {}}, default_model) for tools_config selection."""
     if kind not in CAPABILITY_KINDS:
         raise ValueError(f"kind must be one of {CAPABILITY_KINDS}, got {kind!r}")
-    ensure_capability_providers()
-    provider = get_capability_provider(kind, provider_name)
-    if provider is None:
+    rows = capability_catalog(kind)
+    provider_key = str(provider_name or "").strip().casefold()
+    row = next(
+        (
+            candidate
+            for candidate in rows
+            if str(candidate.get("provider") or "").strip().casefold() == provider_key
+        ),
+        None,
+    )
+    if row is None:
         raise KeyError(f"Unknown {kind} capability provider: {provider_name!r}")
-    models = {model.id: {} for model in provider.list_models() if model.id}
-    return models, provider.default_model()
+    models = {
+        str(model["id"]): {}
+        for model in row.get("models") or []
+        if isinstance(model, dict) and model.get("id")
+    }
+    return models, row.get("default_model")
