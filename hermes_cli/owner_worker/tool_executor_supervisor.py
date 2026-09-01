@@ -181,6 +181,7 @@ class ToolExecutorSupervisor:
             identity_validator=self._require_active_executor_identity,
             media_dispatcher=media_dispatcher,
             workspace_context=workspace_context,
+            owner_home=self.owner_home,
         )
         # Compatibility alias for callers that only knew the original web relay.
         self.web_tool_relay = self.owner_tool_relay
