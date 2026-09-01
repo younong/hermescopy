@@ -1767,6 +1767,76 @@ def test_web_direct_employee_metadata_propagates_to_compression_children():
     )
 
 
+def test_internal_collaboration_agent_disables_local_toolsets(owner_gateway, monkeypatch):
+    """Group turns must not expose terminal/file tools for ordinary replies."""
+    import run_agent
+    from types import SimpleNamespace
+    from hermes_cli.employee_policy import canonical_employee_snapshot
+
+    _db, runtime, _workspace_root = owner_gateway
+    captured = {}
+
+    class _Agent:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+            self._session_init_model_config = {}
+            self.tools = []
+            self.valid_tool_names = set()
+
+    monkeypatch.setattr(run_agent, "AIAgent", _Agent)
+    monkeypatch.setattr(server, "_load_cfg", lambda: {"agent": {}})
+    monkeypatch.setattr(
+        server,
+        "_resolve_runtime_with_fallback",
+        lambda _kwargs: {
+            "model": "test-model",
+            "provider": "openai",
+            "api_key": "test-key",
+            "base_url": "https://example.test",
+            "api_mode": "chat_completions",
+        },
+    )
+    monkeypatch.setattr(server, "_load_provider_routing", lambda: {})
+    monkeypatch.setattr(
+        server,
+        "_load_enabled_toolsets",
+        lambda: pytest.fail("internal collaboration must not use global toolsets"),
+    )
+    policy = canonical_employee_snapshot(
+        {
+            "employee_id": "employee-a",
+            "profile_revision": 1,
+            "source_profile_fingerprint": "fingerprint-a",
+            "system_prompt": "Pinned policy",
+            "model": {"provider": "openai", "model": "test-model"},
+            "toolsets": ["hermes-cli", "project"],
+            "runtime_toolsets": ["hermes-cli", "project"],
+            "skills": [],
+            "mcp_servers": [],
+            "workspace_relative_path": "employees/employee-a",
+            "knowledge_relative_paths": [],
+            "max_iterations": 90,
+            "max_tokens": None,
+        }
+    )[0]
+    context = SimpleNamespace(role="member", source_kind="feishu_group")
+
+    with server.owner_worker_gateway_runtime(runtime):
+        server._make_agent(
+            "sid",
+            "key",
+            model_override=policy["model"],
+            employee_policy=policy,
+            collaboration_context=context,
+            session_kind="internal_collaboration_member",
+            session_visibility="internal",
+            agent_callbacks={},
+        )
+
+    assert captured["enabled_toolsets"] == []
+    assert captured["session_visibility"] == "internal"
+
+
 def test_collaboration_tool_injection_requires_trusted_role_and_creation_authority():
     from hermes_cli.collaboration.agent_tools import CollaborationAgentContext
 

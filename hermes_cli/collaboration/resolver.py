@@ -252,6 +252,7 @@ class CollaborationEmployeeResolver:
             ),
             "model": model,
             "toolsets": list(BUILTIN_ASSISTANT_TOOLSETS),
+            "runtime_toolsets": list(BUILTIN_ASSISTANT_TOOLSETS),
             "skills": [],
             "mcp_servers": [],
             "workspace_relative_path": "",

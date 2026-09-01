@@ -28,6 +28,8 @@ class FakeAgent:
         self._tool_guardrail_halt_decision = None
         self._interrupt_message = None
         self._response_was_previewed = True
+        self._session_visibility = "visible"
+        self._turn_failed_file_mutations = {}
         self._skill_nudge_interval = 0
         self._iters_since_skill = 0
         self.valid_tool_names = []
@@ -57,6 +59,9 @@ class FakeAgent:
     def _file_mutation_verifier_enabled(self):
         return False
 
+    def _format_file_mutation_failure_footer(self, _failed):
+        return "⚠️ File-mutation verifier: internal diagnostic"
+
     def _turn_completion_explainer_enabled(self):
         return False
 
@@ -68,6 +73,45 @@ class FakeAgent:
 
     def _sync_external_memory_for_turn(self, **_kwargs):
         pass
+
+
+def test_internal_collaboration_response_hides_file_mutation_diagnostics(monkeypatch):
+    """Internal collaboration turns must not leak verifier details to members."""
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_a, **_kw: [])
+    agent = FakeAgent()
+    agent._session_visibility = "internal"
+    agent._turn_failed_file_mutations = {
+        "/tmp/group_chat_reply.txt": {
+            "tool": "write_file",
+            "error_preview": "path must be workspace-relative",
+        }
+    }
+    agent._file_mutation_verifier_enabled = lambda: True
+    messages = [
+        {"role": "user", "content": "哈哈"},
+        {"role": "assistant", "content": "Done."},
+    ]
+
+    result = finalize_turn(
+        agent,
+        final_response="Done.",
+        api_call_count=2,
+        interrupted=False,
+        failed=False,
+        messages=messages,
+        conversation_history=[],
+        effective_task_id="collaboration-task",
+        turn_id="turn",
+        user_message="哈哈",
+        original_user_message="哈哈",
+        _should_review_memory=False,
+        _turn_exit_reason="text_response(stop)",
+    )
+
+    assert result["final_response"] == "Done."
+    assert "File-mutation verifier" not in result["final_response"]
+    assert "/tmp/group_chat_reply.txt" not in result["final_response"]
+    assert agent.persisted_messages[-1]["content"] == "Done."
 
 
 def test_final_response_closes_tool_tail_before_persistence(monkeypatch):

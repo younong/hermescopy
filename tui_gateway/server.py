@@ -5537,7 +5537,14 @@ def _make_agent(
     if model_kind == "code":
         runtime_profile = "coding"
         runtime_toolset = "coding"
-    if employee_policy is None:
+    if collaboration_context is not None and session_visibility == "internal":
+        # Internal collaboration Agents receive only the server-bound
+        # collaboration tools injected below.  Never expose the employee's
+        # normal local/terminal toolset to a group turn: members have no
+        # user-facing workspace, and ordinary text must not be routed into
+        # file or terminal operations.
+        enabled_toolsets = []
+    elif employee_policy is None:
         enabled_toolsets = _load_enabled_toolsets()
     elif employee_policy.get("builtin_assistant") is True:
         enabled_toolsets = employee_policy.get("runtime_toolsets")
