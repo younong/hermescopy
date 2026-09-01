@@ -37,7 +37,6 @@ IMAGE_MARKER = "image-native-smoke-marker-283"
 SAFE_TOOL_MARKER = "safe-tool-ok-419"
 RESUME_MARKER = "resume-context-marker-587"
 COLLABORATION_ATTACHMENT_MARKER = "collaboration-attachment-marker-263"
-EMPLOYEE_WORKSPACE_MARKER = "employee-workspace-marker-844"
 COLLABORATION_COMPLETE_MARKER = "collaboration-readonly-ok-195"
 DEFAULT_TIMEOUT = 90.0
 STEP_TIMEOUT = 60.0
@@ -210,25 +209,16 @@ class ModelStub:
             return self._text_chunks(["resume ", status])
 
         if "collaboration-attachment-readonly" in latest_user:
-            if tool_messages:
-                if (
-                    COLLABORATION_ATTACHMENT_MARKER in latest_tool
-                    and "knowledge-write-denied" in latest_tool
-                ):
-                    return self._text_chunks([COLLABORATION_COMPLETE_MARKER])
-                return self._text_chunks(["collaboration smoke failed"])
-            command = (
-                f"printf '%s\\n' '{EMPLOYEE_WORKSPACE_MARKER}' > /workspace/collaboration-smoke.txt; "
-                "attachment=$(find /knowledge/0 -type f -print -quit); "
-                "test -n \"$attachment\"; cat \"$attachment\"; "
-                "if printf 'mutation' >> \"$attachment\" 2>/dev/null; then "
-                "printf 'knowledge-write-unexpected\\n'; else printf 'knowledge-write-denied\\n'; fi"
-            )
-            return self._tool_chunk(
-                "terminal",
-                {"command": command, "timeout": 5},
-                "call-collaboration",
-            )
+            # PR #367 makes internal collaboration members run with an empty
+            # toolset: the server-bound path (see
+            # ``hermes_cli.collaboration.agent_tools.tool_definitions``) only
+            # exposes ``source`` / ``coordinator`` schemas, and
+            # ``_make_agent`` strips ``enabled_toolsets`` for ``role="member"``
+            # so a group turn cannot route ordinary text into file or
+            # terminal operations.  Acknowledge the read-only attachment via
+            # text only; the materialized attachment not being mutated is
+            # verified server-side below.
+            return self._text_chunks([COLLABORATION_COMPLETE_MARKER])
 
         if "attachment-safe-tool" in latest_user:
             if tool_messages and SAFE_TOOL_MARKER in latest_tool:
@@ -1074,7 +1064,6 @@ def run_smoke(
         target = _wait_collaboration_target(gateway, target_id)
         result = target.get("result") or {}
         result_text = str(result.get("text") or "") if isinstance(result, dict) else ""
-        workspace_file = employee_workspace / "collaboration-smoke.txt"
         materialized_file = (
             gateway.owner_home
             / "workspaces"
@@ -1094,14 +1083,14 @@ def run_smoke(
             raise SmokeFailure(
                 "collaboration_result_missing",
                 "collaboration_attachment_readonly",
-                "Collaboration target did not confirm the read-only attachment",
+                "Collaboration member did not confirm the read-only attachment",
             )
-        if workspace_file.read_text(encoding="utf-8").strip() != EMPLOYEE_WORKSPACE_MARKER:
-            raise SmokeFailure(
-                "employee_workspace_write_failed",
-                "collaboration_attachment_readonly",
-                "Employee did not write through its private workspace capability",
-            )
+        # PR #367 strips ``enabled_toolsets`` for internal collaboration
+        # members, so the member can no longer write through its private
+        # workspace capability.  Workspace writes are covered by other
+        # smoke paths that exercise non-collaboration employee turns; the
+        # only invariant left to assert here is that the server-materialized
+        # read-only attachment was not mutated.
         if materialized_file.read_text(encoding="utf-8").strip() != COLLABORATION_ATTACHMENT_MARKER:
             raise SmokeFailure(
                 "collaboration_attachment_mutated",
