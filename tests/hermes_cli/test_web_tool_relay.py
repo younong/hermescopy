@@ -110,6 +110,11 @@ def test_web_relay_dispatches_exact_search_and_extract_invocations():
         ("skill_view", {"name": ""}),
         ("skill_view", {"name": "common-files", "preprocess": False}),
         ("skill_view", {"name": "common-files", "file_path": "bad\x00path"}),
+        ("cronjob", {"action": "list", "unexpected": True}),
+        ("cronjob", {"action": "unknown"}),
+        ("cronjob", {"action": "list", "include_disabled": "yes"}),
+        ("cronjob", {"action": "list", "skills": ["ok", 1]}),
+        ("cronjob", {"action": "list", "model": {"provider": "anthropic"}}),
     ],
 )
 def test_web_relay_rejects_noncanonical_operations_and_arguments(tool_name, arguments):
@@ -121,7 +126,7 @@ def test_web_relay_rejects_noncanonical_operations_and_arguments(tool_name, argu
 
 def test_owner_relay_allowlist_excludes_skill_manage():
     assert OWNER_RELAY_TOOL_NAMES == {
-        "web_search", "web_extract", "skills_list", "skill_view", "image_generate",
+        "web_search", "web_extract", "skills_list", "skill_view", "cronjob", "image_generate",
         "text_to_speech", "video_generate", "xai_video_edit", "xai_video_extend",
         "read_file", "write_file", "patch", "search_files",
     }
@@ -461,6 +466,43 @@ def test_owner_relay_dispatches_canonical_file_invocations():
         None,
         broker._workspace_context,
     )]
+
+
+def test_owner_relay_dispatches_cronjob_in_owner_store(tmp_path, monkeypatch):
+    from cron.jobs import current_store
+
+    owner_home = tmp_path / "owner"
+    ambient_home = tmp_path / "ambient"
+    monkeypatch.setenv("HERMES_HOME", str(ambient_home))
+    invocation = _invocation(
+        "cronjob",
+        {"action": "list"},
+        invocation_id="cronjob-list",
+    )
+    broker = OwnerToolRelayBroker(
+        identity_validator=lambda _identity: None,
+        owner_home=owner_home,
+    )
+    try:
+        result = json.loads(dispatch_owner_tool_over_relay(broker.register(invocation), invocation))
+    finally:
+        broker.close()
+
+    assert result == {"success": True, "count": 0, "jobs": []}
+    assert (owner_home / "cron").is_dir()
+    assert not (ambient_home / "cron").exists()
+    with pytest.raises(RuntimeError, match="CronStore\\(owner_home\\) must be bound"):
+        current_store()
+
+
+def test_owner_relay_rejects_cronjob_without_owner_home():
+    invocation = _invocation("cronjob", {"action": "list"}, invocation_id="cronjob-no-home")
+    broker = OwnerToolRelayBroker(identity_validator=lambda _identity: None)
+    try:
+        with pytest.raises(OwnerToolRelayError, match="rejected"):
+            dispatch_owner_tool_over_relay(broker.register(invocation), invocation)
+    finally:
+        broker.close()
 
 
 def test_owner_relay_dispatches_canonical_image_generation():

@@ -47,7 +47,7 @@ _OWNER_MEDIA_TOOL_NAMES = frozenset({
 # plugin execution with the owner's own credentials.
 _DEPLOYMENT_CAPABLE_MEDIA_TOOL_NAMES = frozenset({"image_generate", "video_generate"})
 _OWNER_ALWAYS_RELAY_TOOL_NAMES = frozenset({
-    "web_search", "web_extract", "skills_list", "skill_view",
+    "web_search", "web_extract", "skills_list", "skill_view", "cronjob",
 }) | _OWNER_MEDIA_TOOL_NAMES
 OWNER_RELAY_TOOL_NAMES = _OWNER_ALWAYS_RELAY_TOOL_NAMES | OWNER_FILE_TOOL_NAMES
 _MAX_REQUEST_BYTES = 256 * 1024
@@ -99,6 +99,68 @@ def _recv_frame(connection: socket.socket, *, limit: int) -> dict[str, Any]:
 def _validated_arguments(tool_name: str, arguments: object) -> dict[str, Any]:
     if not isinstance(arguments, dict):
         raise OwnerToolRelayError("owner tool relay arguments are invalid")
+    if tool_name == "cronjob":
+        allowed = {
+            "action", "job_id", "prompt", "schedule", "name", "repeat", "deliver",
+            "include_disabled", "skill", "skills", "model", "provider", "base_url",
+            "reason", "script", "context_from", "enabled_toolsets", "workdir", "no_agent",
+            "attach_to_session", "employee_id", "target_employee_ids",
+        }
+        if set(arguments) - allowed:
+            raise OwnerToolRelayError("owner tool relay arguments are invalid")
+        action = arguments.get("action")
+        if not isinstance(action, str) or action not in {
+            "create", "list", "update", "pause", "resume", "remove", "run", "run_now", "trigger",
+        }:
+            raise OwnerToolRelayError("owner tool relay arguments are invalid")
+        string_fields = {
+            "job_id", "prompt", "schedule", "name", "deliver", "skill", "provider",
+            "base_url", "reason", "script", "workdir", "employee_id",
+        }
+        for field in string_fields:
+            value = arguments.get(field)
+            if value is not None and (
+                not isinstance(value, str) or len(value) > 32_768 or "\x00" in value
+            ):
+                raise OwnerToolRelayError("owner tool relay arguments are invalid")
+        for field in ("include_disabled", "no_agent", "attach_to_session"):
+            value = arguments.get(field)
+            if value is not None and not isinstance(value, bool):
+                raise OwnerToolRelayError("owner tool relay arguments are invalid")
+        repeat = arguments.get("repeat")
+        if repeat is not None and (
+            not isinstance(repeat, int) or isinstance(repeat, bool) or repeat < 0
+        ):
+            raise OwnerToolRelayError("owner tool relay arguments are invalid")
+        for field in ("skills", "enabled_toolsets", "target_employee_ids"):
+            value = arguments.get(field)
+            if value is not None and (
+                not isinstance(value, list)
+                or len(value) > 32
+                or any(not isinstance(item, str) or len(item) > 1024 or "\x00" in item for item in value)
+            ):
+                raise OwnerToolRelayError("owner tool relay arguments are invalid")
+        context_from = arguments.get("context_from")
+        if context_from is not None and (
+            not isinstance(context_from, (str, list))
+            or (isinstance(context_from, str) and (not context_from or len(context_from) > 1024))
+            or (isinstance(context_from, list) and (
+                len(context_from) > 32
+                or any(not isinstance(item, str) or len(item) > 1024 or "\x00" in item for item in context_from)
+            ))
+        ):
+            raise OwnerToolRelayError("owner tool relay arguments are invalid")
+        model = arguments.get("model")
+        if model is not None:
+            if not isinstance(model, dict) or set(model) - {"model", "provider"}:
+                raise OwnerToolRelayError("owner tool relay arguments are invalid")
+            if not isinstance(model.get("model"), str) or not model["model"].strip() or len(model["model"]) > 1024:
+                raise OwnerToolRelayError("owner tool relay arguments are invalid")
+            if model.get("provider") is not None and (
+                not isinstance(model["provider"], str) or not model["provider"].strip() or len(model["provider"]) > 1024
+            ):
+                raise OwnerToolRelayError("owner tool relay arguments are invalid")
+        return dict(arguments)
     if tool_name == "web_search":
         if set(arguments) - {"query", "limit"}:
             raise OwnerToolRelayError("owner tool relay arguments are invalid")
@@ -645,7 +707,28 @@ def _dispatch_owner_tool(
     invocation: ExecutorInvocation,
     skill_dir_materializer: Callable[[Any], str] | None,
     workspace_context: Any | None = None,
+    owner_home: Path | None = None,
 ) -> str:
+    if tool_name == "cronjob":
+        if owner_home is None:
+            raise OwnerToolRelayError("owner cronjob relay home is unavailable")
+        from cron.jobs import CronStore, use_store
+        from tools import cronjob_tools
+        from tools.registry import registry
+
+        del cronjob_tools  # Importing the module registers the handler.
+        entry = registry.get_entry(tool_name)
+        if entry is None or entry.toolset != "cronjob":
+            raise OwnerToolRelayError("owner tool relay operation is not allowed")
+        with use_store(CronStore(owner_home)):
+            return str(entry.handler(
+                dict(arguments),
+                task_id=invocation.identity.task_id,
+                session_id=invocation.identity.session_id,
+                executor_identity=invocation.identity,
+                executor_invocation=invocation,
+            ))
+
     if tool_name in _OWNER_MEDIA_TOOL_NAMES:
         return _dispatch_owner_media_tool(tool_name, arguments, workspace_context)
 
@@ -741,11 +824,13 @@ class OwnerToolRelayBroker:
         dispatcher: Callable[..., str] = _dispatch_owner_tool,
         media_dispatcher: Callable[..., str] | None = None,
         workspace_context: Any | None = None,
+        owner_home: str | Path | None = None,
     ) -> None:
         self._identity_validator = identity_validator
         self._dispatcher = dispatcher
         self._media_dispatcher = media_dispatcher
         self._workspace_context = workspace_context
+        self._owner_home = Path(owner_home).resolve() if owner_home is not None else None
         self._endpoints: dict[tuple[tuple[Any, ...], str], _RelayEndpoint] = {}
         self._lock = threading.RLock()
         self._closed = False
@@ -871,6 +956,8 @@ class OwnerToolRelayBroker:
             dispatcher_args = (
                 (expected.tool_name, arguments, expected, skill_dir_materializer)
                 if use_media_dispatcher
+                else (expected.tool_name, arguments, expected, skill_dir_materializer, self._workspace_context, self._owner_home)
+                if expected.tool_name == "cronjob"
                 else (expected.tool_name, arguments, expected, skill_dir_materializer, self._workspace_context)
                 if expected.tool_name in OWNER_FILE_TOOL_NAMES | _OWNER_MEDIA_TOOL_NAMES
                 else (expected.tool_name, arguments, expected, skill_dir_materializer)
