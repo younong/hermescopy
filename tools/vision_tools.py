@@ -718,9 +718,10 @@ def _should_use_native_vision_fast_path(
     True when image routing resolves to ``native`` AND either the provider is
     known to accept images inside tool results, or the user explicitly declared
     the model vision-capable via the ``model.supports_vision`` config override.
-    The override is the escape hatch for custom/local providers that aren't in
-    the static allowlist. Best-effort: any resolution failure returns False so
-    the caller falls back to the legacy aux-LLM path.
+    A matching deployment descriptor is also trusted for deployment-managed
+    routes. These overrides are the escape hatch for custom/local providers
+    that aren't in the static allowlist. Best-effort: any resolution failure
+    returns False so the caller falls back to the legacy aux-LLM path.
     """
     try:
         from agent.auxiliary_client import _read_main_provider, _read_main_model
@@ -731,10 +732,32 @@ def _should_use_native_vision_fast_path(
         provider = str(runtime.get("provider") or "").strip() or _read_main_provider()
         model = str(runtime.get("model") or "").strip() or _read_main_model()
         cfg = load_config()
-        if decide_image_input_mode(provider, model, cfg) != "native":
+        deployment_supports_vision = None
+        try:
+            from hermes_cli.deployment_inference import (
+                deployment_descriptor_from_environment,
+            )
+
+            descriptor = deployment_descriptor_from_environment()
+            if (
+                descriptor is not None
+                and descriptor.provider == provider.strip().lower()
+                and descriptor.model == model.strip()
+            ):
+                deployment_supports_vision = descriptor.supports_vision
+        except Exception:
+            pass
+
+        if decide_image_input_mode(
+            provider,
+            model,
+            cfg,
+            deployment_supports_vision=deployment_supports_vision,
+        ) != "native":
             return False
         return (
             _supports_media_in_tool_results(provider, model)
+            or deployment_supports_vision is True
             or _lookup_supports_vision(provider, model, cfg) is True
         )
     except Exception as exc:

@@ -14,6 +14,7 @@ import json
 from unittest.mock import patch
 
 
+from hermes_cli.deployment_inference import DeploymentInferenceDescriptor
 from tools.vision_tools import (
     _build_native_vision_tool_result,
     _handle_vision_analyze,
@@ -269,6 +270,108 @@ class TestHandleVisionAnalyzeFastPath:
 
         assert isinstance(result, dict) and result.get("_multimodal") is True
         mock_aux.assert_not_called()
+
+    def test_matching_deployment_descriptor_enables_native_path(self, tmp_path):
+        """A matching deployment capability enables native vision for custom routes."""
+        img = tmp_path / "x.png"
+        img.write_bytes(_TINY_PNG)
+        descriptor = DeploymentInferenceDescriptor(
+            provider="brand-new-provider",
+            model="llava-v1.6",
+            api_mode="chat_completions",
+            policy_id="deployment-default-v1",
+            supports_vision=True,
+        )
+
+        async def _aux_sentinel(*args, **kwargs):
+            return '{"sentinel": "aux-path"}'
+
+        from agent.auxiliary_client import set_runtime_main, clear_runtime_main
+        set_runtime_main("brand-new-provider", "llava-v1.6")
+        try:
+            with patch(
+                "hermes_cli.config.load_config", return_value={}
+            ), patch(
+                "hermes_cli.deployment_inference.deployment_descriptor_from_environment",
+                return_value=descriptor,
+            ), patch(
+                "agent.image_routing._lookup_supports_vision", return_value=None
+            ), patch(
+                "tools.vision_tools._supports_media_in_tool_results", return_value=False
+            ), patch(
+                "tools.vision_tools.vision_analyze_tool", side_effect=_aux_sentinel
+            ) as mock_aux:
+                coro = _handle_vision_analyze({"image_url": str(img), "question": "?"})
+                result = asyncio.get_event_loop().run_until_complete(coro)
+        finally:
+            clear_runtime_main()
+
+        assert isinstance(result, dict) and result.get("_multimodal") is True
+        mock_aux.assert_not_called()
+
+    def test_false_deployment_descriptor_keeps_auxiliary_path(self, tmp_path):
+        """A matching deployment capability of false must not enable native vision."""
+        img = tmp_path / "x.png"
+        img.write_bytes(_TINY_PNG)
+        descriptor = DeploymentInferenceDescriptor(
+            provider="brand-new-provider",
+            model="llava-v1.6",
+            api_mode="chat_completions",
+            policy_id="deployment-default-v1",
+            supports_vision=False,
+        )
+
+        async def _aux_sentinel(*args, **kwargs):
+            return '{"sentinel": "aux-path"}'
+
+        from agent.auxiliary_client import set_runtime_main, clear_runtime_main
+        set_runtime_main("brand-new-provider", "llava-v1.6")
+        try:
+            with patch(
+                "hermes_cli.config.load_config", return_value={}
+            ), patch(
+                "hermes_cli.deployment_inference.deployment_descriptor_from_environment",
+                return_value=descriptor,
+            ), patch(
+                "agent.image_routing._lookup_supports_vision", return_value=None
+            ), patch(
+                "tools.vision_tools._supports_media_in_tool_results", return_value=False
+            ), patch(
+                "tools.vision_tools.vision_analyze_tool", side_effect=_aux_sentinel
+            ) as mock_aux:
+                coro = _handle_vision_analyze({"image_url": str(img), "question": "?"})
+                result = asyncio.get_event_loop().run_until_complete(coro)
+        finally:
+            clear_runtime_main()
+
+        assert isinstance(result, str)
+        assert json.loads(result) == {"sentinel": "aux-path"}
+        mock_aux.assert_called_once()
+
+    def test_mismatched_deployment_descriptor_is_ignored(self):
+        """A descriptor for another provider/model cannot enable native vision."""
+        from tools.vision_tools import _should_use_native_vision_fast_path
+
+        descriptor = DeploymentInferenceDescriptor(
+            provider="other-provider",
+            model="llava-v1.6",
+            api_mode="chat_completions",
+            policy_id="deployment-default-v1",
+            supports_vision=True,
+        )
+        with patch(
+            "hermes_cli.config.load_config", return_value={}
+        ), patch(
+            "hermes_cli.deployment_inference.deployment_descriptor_from_environment",
+            return_value=descriptor,
+        ), patch(
+            "agent.image_routing._lookup_supports_vision", return_value=None
+        ), patch(
+            "tools.vision_tools._supports_media_in_tool_results", return_value=False
+        ):
+            assert _should_use_native_vision_fast_path(
+                main_runtime={"provider": "brand-new-provider", "model": "llava-v1.6"}
+            ) is False
 
     def test_text_mode_wins_over_supports_vision_override(self, tmp_path):
         """Explicit text routing blocks the fast path even with supports_vision."""
