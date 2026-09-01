@@ -278,8 +278,8 @@ def test_custom_codex_real_path_validates_then_publishes(
             "mode": "required",
             "tools": [{"type": "image_generation"}],
         }
-        assert "Aspect ratio: exactly 3:4" in request_payload["prompt"]
-        assert "Preferred pixel dimensions: 1536x2048" in request_payload["prompt"]
+        assert "Aspect ratio: exactly 3:4" in request_payload["input"][0]["content"][0]["text"]
+        assert "Preferred pixel dimensions: 1536x2048" in request_payload["input"][0]["content"][0]["text"]
         assert result["requested_aspect_ratio"] == "3:4"
         assert result["effective_aspect_ratio"] == "3:4"
         assert result["actual_aspect_ratio"] == "3:4"
