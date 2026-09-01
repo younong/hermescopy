@@ -92,6 +92,7 @@ def test_builtin_resolver_composes_global_policy_and_owner_personalization(
     assert resolved.employee_policy["global_policy_revision"] == 1
     assert resolved.employee_policy["name"] == "工作助手"
     assert resolved.employee_policy["toolsets"] == ["hermes-cli", "project"]
+    assert resolved.employee_policy["runtime_toolsets"] == ["hermes-cli", "project"]
     assert resolved.employee_policy["mcp_servers"] == []
     assert resolved.employee_policy["system_prompt"].endswith(
         "Always answer with a short summary first.\n</owner_personalization>"
