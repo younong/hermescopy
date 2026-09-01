@@ -967,6 +967,36 @@ describe("guiChatReducer history image restoration", () => {
     ]));
   });
 
+  it("does not restore file links from failed assistant prose", () => {
+    const state = restoreWithMessage(
+      "图片生成失败：工具返回了[链接](sandbox:/workspace/failed-image.html)，但实际文件没有成功保存或下载失败。",
+      { cwd: "/workspace" },
+    );
+
+    expect(state.messages[0].artifactIds).toEqual([]);
+    expect(state.artifacts).toEqual({});
+  });
+
+  it("does not restore ordinary local links from assistant prose", () => {
+    const state = restoreWithMessage(
+      "参考：[讨论](sandbox:/workspace/discussion.html)",
+      { cwd: "/workspace" },
+    );
+
+    expect(state.messages[0].artifactIds).toEqual([]);
+    expect(state.artifacts).toEqual({});
+  });
+
+  it("does not turn failure explanations into generated file names", () => {
+    const state = restoreWithMessage(
+      "文件生成失败：链接，但实际文件没有成功保存或下载失败：/workspace/failed-image.html",
+      { cwd: "/workspace" },
+    );
+
+    expect(state.messages[0].artifactIds).toEqual([]);
+    expect(state.artifacts).toEqual({});
+  });
+
   it("restores a labeled inline HTML path as a download artifact", () => {
     const state = restoreWithMessage(
       "已生成互动版“乌鸦喝水”HTML：\n\n**文件路径：** `/workspace/crow-drinks-water.html`",

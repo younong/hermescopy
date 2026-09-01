@@ -523,7 +523,10 @@ function transcriptToMessageWithArtifacts(
     message.role === "assistant" && attachments.some((attachment) => attachment.kind === "file");
   const fileRefs = (hasVerifiedFileAttachment
     ? []
-    : extractGeneratedFileReferences(textFromTranscriptMessage(message))
+    : extractGeneratedFileReferences(textFromTranscriptMessage(message), {
+        rejectFailureContext: message.role === "assistant",
+        requireExplicitLinkLabel: message.role === "assistant",
+      })
   ).filter(
     (ref) =>
       !claimedSources.some((source) => attachmentSourcesMatch(source, ref.path, cwd)) &&
@@ -942,16 +945,23 @@ interface ExtractedFileReference {
   path: string;
 }
 
-function extractGeneratedFileReferences(text: string): ExtractedFileReference[] {
+function extractGeneratedFileReferences(
+  text: string,
+  options?: { rejectFailureContext?: boolean; requireExplicitLinkLabel?: boolean },
+): ExtractedFileReference[] {
   const codeRanges = rangesForFencedCodeBlocks(text);
-  const candidates: Array<{ index: number; path: string }> = [];
+  const candidates: Array<{ index: number; label?: string; path: string }> = [];
   const savedPattern = /(?:Full output saved to:|Full text saved to:)\s*([^\n]+)/gi;
   for (const match of text.matchAll(savedPattern)) {
     candidates.push({ index: match.index ?? 0, path: match[1].trim() });
   }
-  const markdownLinkPattern = /(?<!!)\[[^\]]+]\(([^)\n]+)\)/g;
+  const markdownLinkPattern = /(?<!!)\[([^\]]+)]\(([^)\n]+)\)/g;
   for (const match of text.matchAll(markdownLinkPattern)) {
-    candidates.push({ index: match.index ?? 0, path: match[1].trim().replace(/^<|>$/g, "") });
+    candidates.push({
+      index: match.index ?? 0,
+      label: match[1].trim(),
+      path: match[2].trim().replace(/^<|>$/g, ""),
+    });
   }
   const collectPathMatches = (pattern: RegExp) => {
     for (const match of text.matchAll(pattern)) {
@@ -975,6 +985,15 @@ function extractGeneratedFileReferences(text: string): ExtractedFileReference[] 
   const refs: ExtractedFileReference[] = [];
   for (const candidate of candidates) {
     if (isIndexInRanges(candidate.index, codeRanges)) continue;
+    if (
+      options?.requireExplicitLinkLabel &&
+      candidate.label !== undefined &&
+      !isExplicitGeneratedFileLabel(candidate.label)
+    ) continue;
+    if (
+      options?.rejectFailureContext &&
+      hasFailureFileReferenceContext(text, candidate.index)
+    ) continue;
     const path = normalizeSessionFileReference(candidate.path);
     if (!path || seen.has(path)) continue;
     const name = filenameFromPath(path);
@@ -983,6 +1002,21 @@ function extractGeneratedFileReferences(text: string): ExtractedFileReference[] 
     refs.push({ name, path });
   }
   return refs;
+}
+
+function isExplicitGeneratedFileLabel(label: string): boolean {
+  return /(?:附件|下载|文件|生成|输出|保存|导出|报告|attachment|download|file|generated|output|saved|export|report|pdf|html?|zip|csv|json|txt|md|docx?|xlsx?|pptx?)/i.test(
+    label,
+  );
+}
+
+function hasFailureFileReferenceContext(text: string, index: number): boolean {
+  const lineStart = text.lastIndexOf("\n", index) + 1;
+  const lineEnd = text.indexOf("\n", index);
+  const line = text.slice(lineStart, lineEnd === -1 ? text.length : lineEnd);
+  return /(?:失败|错误|未成功|没有成功|未能|无法|不存在|找不到|404|failed|failure|error|not found|does not exist|could not|unable to|not saved|not generated|not downloaded|unsuccessful)/i.test(
+    line,
+  );
 }
 
 function filenameFromPath(path: string): string {
